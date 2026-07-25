@@ -586,11 +586,16 @@ def place_on_stack(
     )
     if stage is None:
         raise Mt4ClientError(f"level {level}: no reachable hover stage")
+    # Carry to the stage point beside the column, then hop horizontally over
+    # the stack top to (sx, sy) -- both at hover height, folded into one
+    # queued mq via ``then`` so there's no stop/settle at the stage point.
+    # The hop clears the column by construction (hz = hover height, fingers
+    # already above the top cube), the same guarantee the old plain move_to
+    # relied on.
     routed_travel(
         client, calib, planner, stage[0], stage[1], hz, built,
-        j4=j4, step=f"level {level} carry",
+        j4=j4, then=[(sx, sy, hz)], step=f"level {level} carry",
     )
-    _travel(client, calib, sx, sy, hz, "hover over stack", j4=j4)
     _approach(client, calib, sx, sy, rz, "descend to stack release", j4=j4)
     _check(client.gripper(calib.grip_open_s), "stack release")
     fz = planner.free_retreat_z(level)

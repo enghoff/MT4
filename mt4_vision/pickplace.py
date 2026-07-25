@@ -268,6 +268,7 @@ def routed_travel(
     levels: int,
     *,
     j4: float | None = None,
+    then: list[tuple[float, float, float]] | None = None,
     step: str = "stack transit",
 ) -> None:
     """Travel to (x, y, z) along a StackPlanner route (direct when safe).
@@ -281,6 +282,13 @@ def routed_travel(
     ended -- the per-leg behavior the old per-waypoint _travel() fallback
     loop existed to emulate.
 
+    ``then`` appends extra waypoints AFTER the planned route, in the same
+    queued `mq` so there is no stop/settle at the route's end. These are
+    NOT run through the column-safety planner -- the caller guarantees the
+    continuation from (x, y, z) is safe (e.g. a horizontal hop over the
+    stack top at hover height, where the fingertips already clear the
+    column). Used to fold the "hover over stack" hop into the carry.
+
     Shared by stack_cubes.py (levels grows as cubes are added) and
     unstack_cubes.py (levels shrinks as cubes come off) -- both route
     around the same column, so the safety model must stay identical.
@@ -289,7 +297,9 @@ def routed_travel(
     if tcp is None:
         raise Mt4ClientError(f"{step}: could not read TCP")
     a = (float(tcp.x), float(tcp.y), float(tcp.z))
-    if math.dist(a, (x, y, z)) < 1.0:
+    tail = [(float(px), float(py), float(pz)) for px, py, pz in (then or [])]
+    final = tail[-1] if tail else (x, y, z)
+    if math.dist(a, final) < 1.0:
         return
     wps = planner.route(a, (x, y, z), levels)
     if wps is None:
@@ -299,7 +309,7 @@ def routed_travel(
         )
     _check(
         client.move_path(
-            wps, j4=j4 if j4 is not None else "wrist",
+            wps + tail, j4=j4 if j4 is not None else "wrist",
             speed_us=calib.travel_speed_us,
         ),
         step,
