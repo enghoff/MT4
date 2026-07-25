@@ -270,6 +270,7 @@ def routed_travel(
     j4: float | None = None,
     then: list[tuple[float, float, float]] | None = None,
     final_j4: float | None = None,
+    descend: tuple[float, float, float] | None = None,
     step: str = "stack transit",
 ) -> None:
     """Travel to (x, y, z) along a StackPlanner route (direct when safe).
@@ -290,10 +291,22 @@ def routed_travel(
     stack top at hover height, where the fingertips already clear the
     column). Used to fold the "hover over stack" hop into the carry.
 
-    ``final_j4`` sets the wrist (world-frame yaw, deg) on the LAST leg only
-    while the rest hold ``j4``/wrist -- so the arm ARRIVES already oriented
-    (e.g. face-aligned over a pick) and no separate wrist-rotation move is
-    needed. Only honored when the move actually runs (not on early-return).
+    ``descend`` appends a final SLOW leg (to this XYZ) run at
+    ``calib.approach_speed_us`` while every other leg runs at travel speed,
+    so the transit flows straight into the precise final descent with no
+    stop/settle at hover/safe height. The firmware ramps travel->approach as
+    it enters this leg (dda_continue_ramp is bidirectional), so the speed
+    where the gripper actually meets the cube/stack matches a standalone
+    ``_approach()`` -- only the fast upper part of the drop is saved. Like
+    ``then``, it is NOT column-checked: the caller guarantees a pure
+    vertical drop straight below the arrival XY.
+
+    ``final_j4`` sets the wrist (world-frame yaw, deg) from the leg that
+    ARRIVES at (x, y, z) onward (that arrival leg plus any ``then``/
+    ``descend`` legs) while earlier transit legs hold ``j4``/wrist -- so the
+    arm is already oriented before any hop or drop and no separate
+    wrist-rotation move is needed. Only honored when the move actually runs
+    (not on early-return).
 
     Shared by stack_cubes.py (levels grows as cubes are added) and
     unstack_cubes.py (levels shrinks as cubes come off) -- both route
@@ -304,7 +317,12 @@ def routed_travel(
         raise Mt4ClientError(f"{step}: could not read TCP")
     a = (float(tcp.x), float(tcp.y), float(tcp.z))
     tail = [(float(px), float(py), float(pz)) for px, py, pz in (then or [])]
-    final = tail[-1] if tail else (x, y, z)
+    descend_wps = (
+        []
+        if descend is None
+        else [(float(descend[0]), float(descend[1]), float(descend[2]))]
+    )
+    final = descend_wps[-1] if descend_wps else (tail[-1] if tail else (x, y, z))
     if math.dist(a, final) < 1.0:
         return
     wps = planner.route(a, (x, y, z), levels)
@@ -313,18 +331,25 @@ def routed_travel(
             f"{step}: no stack-safe route from "
             f"({a[0]:.0f},{a[1]:.0f},{a[2]:.0f}) to ({x:.0f},{y:.0f},{z:.0f})"
         )
-    all_wps = wps + tail
+    all_wps = wps + tail + descend_wps
     transit_j4 = j4 if j4 is not None else "wrist"
-    if final_j4 is not None:
-        # Hold the transit wrist mode on every leg but the last, which lands
-        # the arm at final_j4 (per-leg mq j4).
-        j4_arg: object = [transit_j4] * (len(all_wps) - 1) + [float(final_j4)]
-    else:
-        j4_arg = transit_j4
-    _check(
-        client.move_path(all_wps, j4=j4_arg, speed_us=calib.travel_speed_us),
-        step,
+    arrival_j4 = float(final_j4) if final_j4 is not None else transit_j4
+    # Transit legs hold the transit wrist; the leg that ARRIVES at (x, y, z)
+    # and everything after it (then hops, the final descend) hold arrival_j4,
+    # so the wrist is settled before any hop or drop rather than turning into
+    # it (arrival_j4 == transit_j4 when no final_j4, i.e. uniform).
+    transit_legs = len(wps) - 1
+    j4_list = [transit_j4] * transit_legs + [arrival_j4] * (
+        len(all_wps) - transit_legs
     )
+    speeds = [calib.travel_speed_us] * len(all_wps)
+    if descend_wps:
+        speeds[-1] = int(calib.approach_speed_us)
+    # Collapse to a scalar when uniform (the common case) so the wire form
+    # and existing behavior are unchanged; only mixed legs go out as lists.
+    j4_arg: object = j4_list[0] if all(v == j4_list[0] for v in j4_list) else j4_list
+    speed_arg: object = speeds[0] if all(s == speeds[0] for s in speeds) else speeds
+    _check(client.move_path(all_wps, j4=j4_arg, speed_us=speed_arg), step)
 
 
 def go_camera_park(
@@ -589,21 +614,27 @@ def pick_centered(
     else:
         j4 = j4_for_face_align(yaw_deg, current_j4_deg=current_j4, x=x, y=y)
     client.gripper(calib.grip_open_s)
-    # Skip the initial safe-height align move when the arm is already there
-    # and (if face-aligning) already at that wrist -- the stack loop's routed
-    # approach delivers exactly that on its final leg (final_j4), so this is
-    # otherwise a redundant same-pose move. Guarded by the fresh read above,
-    # so any missed precondition just falls back to doing the move.
-    already_aligned = (
-        tcp is not None
-        and abs(float(tcp.x) - x) < _XY_EPS_MM
-        and abs(float(tcp.y) - y) < _XY_EPS_MM
-        and abs(float(tcp.z) - float(calib.safe_z)) < _Z_EPS_MM
-        and (j4 is None or abs(float(tcp.j4) - float(j4)) < 0.3)
-    )
-    if not already_aligned:
+    # The stack loop's routed approach can deliver the arm already
+    # face-aligned AND already descended (the descend folded into the transit
+    # mq), or just aligned at safe height, or nothing (first cube / non-stack
+    # caller). Read the fresh TCP and skip whatever is already done; any
+    # missed precondition just falls back to running the move.
+    def _here(z_target: float) -> bool:
+        return (
+            tcp is not None
+            and abs(float(tcp.x) - x) < _XY_EPS_MM
+            and abs(float(tcp.y) - y) < _XY_EPS_MM
+            and abs(float(tcp.z) - float(z_target)) < _Z_EPS_MM
+            and (j4 is None or abs(float(tcp.j4) - float(j4)) < 0.3)
+        )
+
+    if _here(calib.pick_z):
+        pass  # fused transit already descended us to the grab pose
+    elif _here(calib.safe_z):
+        _approach(client, calib, x, y, calib.pick_z, "align: descend to grab", j4=j4)
+    else:
         _travel(client, calib, x, y, calib.safe_z, "align: approach", j4=j4)
-    _approach(client, calib, x, y, calib.pick_z, "align: descend to grab", j4=j4)
+        _approach(client, calib, x, y, calib.pick_z, "align: descend to grab", j4=j4)
     _check(client.gripper(calib.grip_close_s), "align: grab")
     _check(client.gripper(calib.grip_open_s), "align: release")
     _travel(client, calib, x, y, calib.safe_z, "align: lift before rotate")

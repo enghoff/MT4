@@ -1035,8 +1035,9 @@ def main() -> int:
                 )
                 if built > 0:
                     # Column-aware transit to the pick, arriving already
-                    # face-aligned on the final leg (final_j4) so pick_centered
-                    # skips its otherwise-redundant same-pose align move.
+                    # face-aligned (final_j4) AND descended to grab height in
+                    # the same queued mq (descend leg, slow), so pick_centered
+                    # skips both its align move and its first descend.
                     approach_j4 = resolve_pick_j4(
                         client, calib, cube.yaw_deg,
                         face_align=bool(getattr(calib, "face_align_picks", True)),
@@ -1045,7 +1046,9 @@ def main() -> int:
                     routed_travel(
                         client, calib, planner,
                         float(cube.x), float(cube.y), calib.safe_z,
-                        built, final_j4=approach_j4, step="approach pick",
+                        built, final_j4=approach_j4,
+                        descend=(float(cube.x), float(cube.y), calib.pick_z),
+                        step="approach pick",
                     )
                 pick_centered(
                     client, calib, float(cube.x), float(cube.y),
