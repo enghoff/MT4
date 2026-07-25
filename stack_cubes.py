@@ -561,10 +561,13 @@ def place_on_stack(
     """Carry the held cube to the site and seat it as ``level``.
 
     Assumes ``level - 1`` cubes are already stacked and the cube is held at
-    the pick location around ``safe_z``. Sequence:
+    the pick location -- at grab height (``pick_centered(lift_after=False)``,
+    the lift folded into the carry here) or at ``safe_z`` (``lift_to`` is a
+    no-op then). Sequence:
 
-    1. carry: routed (usually one diagonal ``mp``) to a stage point
-       STAGE_OFFSET_MM beside the stack, arriving at hover height
+    1. carry: vertical lift to ``safe_z``, then routed (usually one diagonal
+       ``mp``) to a stage point STAGE_OFFSET_MM beside the stack, arriving at
+       hover height -- lift + route + hop + descend all one queued mq
     2. hop over the stack top at hover, slow descend, release
     3. retreat: lift free when the z ceiling allows the fingertips above
        the placed cube (levels <= ~8), else lift a few mm and slide out
@@ -587,17 +590,21 @@ def place_on_stack(
     )
     if stage is None:
         raise Mt4ClientError(f"level {level}: no reachable hover stage")
-    # Carry to the stage point beside the column, hop horizontally over the
-    # stack top to (sx, sy), then descend to release height -- all folded
-    # into one queued mq (``then`` hop + ``descend`` drop) so there's no
-    # stop/settle at the stage point OR at hover over the stack. The hop
-    # clears the column by construction (hz = hover height, fingers already
-    # above the top cube); the descend is a pure vertical drop straight down
-    # the column axis to rz, run slow (approach speed) like the old
-    # standalone _approach, so the cube seats at the same speed.
+    # Lift the just-gripped cube straight up to safe_z (``lift_to``, held at
+    # wrist so the gripped orientation is preserved -- a no-op if already
+    # high), route to the stage point beside the column, hop horizontally
+    # over the stack top to (sx, sy), then descend to release height -- lift +
+    # route + hop + descend all one queued mq, so there's no stop/settle
+    # after the grip, at the stage point, OR at hover over the stack. The
+    # vertical lift stays clear of pick-site neighbours (route()'s safety
+    # model covers the column, not the table); the hop clears the column by
+    # construction (hz = hover height, fingers above the top cube); the
+    # descend is a pure vertical drop down the column axis to rz, run slow
+    # (approach speed) like the old standalone _approach so the cube seats at
+    # the same speed.
     routed_travel(
         client, calib, planner, stage[0], stage[1], hz, built,
-        j4=j4, then=[(sx, sy, hz)], descend=(sx, sy, rz),
+        j4=j4, lift_to=calib.safe_z, then=[(sx, sy, hz)], descend=(sx, sy, rz),
         step=f"level {level} carry+seat",
     )
     _check(client.gripper(calib.grip_open_s), "stack release")
@@ -1052,9 +1059,11 @@ def main() -> int:
                         descend=(float(cube.x), float(cube.y), calib.pick_z),
                         step="approach pick",
                     )
+                # lift_after=False leaves the gripped cube at grab height;
+                # place_on_stack folds the lift-off into its carry mq.
                 pick_centered(
                     client, calib, float(cube.x), float(cube.y),
-                    yaw_deg=cube.yaw_deg,
+                    yaw_deg=cube.yaw_deg, lift_after=False,
                 )
                 print(
                     f"  placing at marker ({sx:.1f},{sy:.1f}) "

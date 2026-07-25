@@ -114,6 +114,38 @@ def test_final_j4_holds_from_arrival_onward():
     assert all(v == 33.0 for v in j4[n_transit:])  # arrival + then hold final_j4
 
 
+def test_lift_to_prepends_vertical_wrist_lift():
+    # Arm still down at grab height; lift_to folds a vertical lift-off into
+    # the carry -- prepended, same XY, held at wrist -- before the route
+    # plans from safe_z. Only the final drop is slow.
+    client = _RecordingClient(_Tcp(220.0, -60.0, CALIB.pick_z))
+    routed_travel(
+        client, CALIB, _planner(), 230.0, -50.0, CALIB.safe_z, 0,
+        j4=12.5, lift_to=CALIB.safe_z,
+        descend=(230.0, -50.0, CALIB.pick_z), step="t",
+    )
+    wps, j4, speed = client.calls[-1]
+    assert wps[0] == (220.0, -60.0, CALIB.safe_z)  # vertical lift-off first
+    assert wps[-1] == (230.0, -50.0, CALIB.pick_z)  # slow descend last
+    assert isinstance(j4, list)
+    assert j4[0] == "wrist"  # lift preserves the gripped orientation
+    assert all(v == 12.5 for v in j4[1:])  # route + descend hold the square
+    assert speed[0] == CALIB.travel_speed_us
+    assert speed[-1] == int(CALIB.approach_speed_us)
+
+
+def test_lift_to_noop_when_already_high():
+    # Already at safe_z: no lift leg prepended, route starts at the target.
+    client = _RecordingClient(_Tcp(200.0, 0.0, CALIB.safe_z))
+    routed_travel(
+        client, CALIB, _planner(), 230.0, -50.0, CALIB.safe_z, 0,
+        lift_to=CALIB.safe_z, step="t",
+    )
+    wps, _j4, _speed = client.calls[-1]
+    assert wps[0] == (230.0, -50.0, CALIB.safe_z)
+    assert len(wps) == 1
+
+
 def test_plain_transit_collapses_to_scalars():
     # No then/descend/final_j4: uniform wrist + travel speed collapse to
     # scalars, matching the pre-fusion wire form exactly.
