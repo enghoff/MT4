@@ -269,6 +269,7 @@ def routed_travel(
     *,
     j4: float | None = None,
     then: list[tuple[float, float, float]] | None = None,
+    final_j4: float | None = None,
     step: str = "stack transit",
 ) -> None:
     """Travel to (x, y, z) along a StackPlanner route (direct when safe).
@@ -289,6 +290,11 @@ def routed_travel(
     stack top at hover height, where the fingertips already clear the
     column). Used to fold the "hover over stack" hop into the carry.
 
+    ``final_j4`` sets the wrist (world-frame yaw, deg) on the LAST leg only
+    while the rest hold ``j4``/wrist -- so the arm ARRIVES already oriented
+    (e.g. face-aligned over a pick) and no separate wrist-rotation move is
+    needed. Only honored when the move actually runs (not on early-return).
+
     Shared by stack_cubes.py (levels grows as cubes are added) and
     unstack_cubes.py (levels shrinks as cubes come off) -- both route
     around the same column, so the safety model must stay identical.
@@ -307,11 +313,16 @@ def routed_travel(
             f"{step}: no stack-safe route from "
             f"({a[0]:.0f},{a[1]:.0f},{a[2]:.0f}) to ({x:.0f},{y:.0f},{z:.0f})"
         )
+    all_wps = wps + tail
+    transit_j4 = j4 if j4 is not None else "wrist"
+    if final_j4 is not None:
+        # Hold the transit wrist mode on every leg but the last, which lands
+        # the arm at final_j4 (per-leg mq j4).
+        j4_arg: object = [transit_j4] * (len(all_wps) - 1) + [float(final_j4)]
+    else:
+        j4_arg = transit_j4
     _check(
-        client.move_path(
-            wps + tail, j4=j4 if j4 is not None else "wrist",
-            speed_us=calib.travel_speed_us,
-        ),
+        client.move_path(all_wps, j4=j4_arg, speed_us=calib.travel_speed_us),
         step,
     )
 
@@ -569,11 +580,29 @@ def pick_centered(
     _require_mp_reachable(x, y, "pick_centered target")
     if face_align is None:
         face_align = bool(getattr(calib, "face_align_picks", True))
-    j4 = resolve_pick_j4(
-        client, calib, yaw_deg, face_align=face_align, x=x, y=y,
-    )
+    # One TCP read, reused for both the face-align wrist (same result
+    # resolve_pick_j4 would give) and the skip check below.
+    tcp = client.get_tcp()
+    current_j4 = tcp.j4 if tcp is not None else None
+    if not face_align or yaw_deg is None:
+        j4 = None
+    else:
+        j4 = j4_for_face_align(yaw_deg, current_j4_deg=current_j4, x=x, y=y)
     client.gripper(calib.grip_open_s)
-    _travel(client, calib, x, y, calib.safe_z, "align: approach", j4=j4)
+    # Skip the initial safe-height align move when the arm is already there
+    # and (if face-aligning) already at that wrist -- the stack loop's routed
+    # approach delivers exactly that on its final leg (final_j4), so this is
+    # otherwise a redundant same-pose move. Guarded by the fresh read above,
+    # so any missed precondition just falls back to doing the move.
+    already_aligned = (
+        tcp is not None
+        and abs(float(tcp.x) - x) < _XY_EPS_MM
+        and abs(float(tcp.y) - y) < _XY_EPS_MM
+        and abs(float(tcp.z) - float(calib.safe_z)) < _Z_EPS_MM
+        and (j4 is None or abs(float(tcp.j4) - float(j4)) < 0.3)
+    )
+    if not already_aligned:
+        _travel(client, calib, x, y, calib.safe_z, "align: approach", j4=j4)
     _approach(client, calib, x, y, calib.pick_z, "align: descend to grab", j4=j4)
     _check(client.gripper(calib.grip_close_s), "align: grab")
     _check(client.gripper(calib.grip_open_s), "align: release")

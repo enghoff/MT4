@@ -58,6 +58,7 @@ from mt4_vision.pickplace import (
     pick,
     pick_centered,
     place,
+    resolve_pick_j4,
     retreat_for_camera,
     routed_travel,
 )
@@ -1033,11 +1034,18 @@ def main() -> int:
                     cube, f"Level {level}/{target_levels}: picking {cube.color}",
                 )
                 if built > 0:
-                    # Column-aware transit to the pick before descending.
+                    # Column-aware transit to the pick, arriving already
+                    # face-aligned on the final leg (final_j4) so pick_centered
+                    # skips its otherwise-redundant same-pose align move.
+                    approach_j4 = resolve_pick_j4(
+                        client, calib, cube.yaw_deg,
+                        face_align=bool(getattr(calib, "face_align_picks", True)),
+                        x=float(cube.x), y=float(cube.y),
+                    )
                     routed_travel(
                         client, calib, planner,
                         float(cube.x), float(cube.y), calib.safe_z,
-                        built, step="approach pick",
+                        built, final_j4=approach_j4, step="approach pick",
                     )
                 pick_centered(
                     client, calib, float(cube.x), float(cube.y),
