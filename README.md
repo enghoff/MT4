@@ -144,6 +144,7 @@ Full reference lives in the header comment of
 | `j4zero` | Rewrite J4 steps so current pose reports world J4 = 0 (no motion; survives home) |
 | `m <dj1> <dj2> <dj3> <dj4> [dg]` | Bounded relative move; all axes finish together |
 | `mp <x> <y> <z> <j4> <g> [speed_us]` | Absolute move: TCP position (mm) + world-frame J4 (deg) + gripper S + optional step period. XYZ interpolated along straight world-frame lines in short segments with closed-form IK per segment; when the commanded J4 matches the current world-frame yaw, gripper orientation is held fixed in world space. Rejected with `err not homed` unless homed this session |
+| `mq <x> <y> <z> <j4\|h\|w> <g> [speed_us]` | Queued absolute move: same args as `mp`. If idle, behaves like `mp` (cold start). If an `mp`/`mq` move is already executing, the waypoint is appended to a pending queue (depth `MQ_QUEUE_CAPACITY`; `err mq full N` beyond that) and spliced in without stopping when the running leg finishes — no per-waypoint stop/settle/reaccel or serial round trip |
 | `home [j1 j2]` | On-device homing (see below) |
 | `g o\|c\|stop\|<120-285>` | Gripper open / close / stop / set; bare `g` queries |
 | `?` / `s` | Status |
