@@ -595,13 +595,18 @@ def place_on_stack(
     _check(client.gripper(calib.grip_open_s), "stack release")
     fz = planner.free_retreat_z(level)
     if fz is not None:
-        _travel(client, calib, sx, sy, fz, "retreat lift", j4=j4)
+        # Lift straight up clear of the placed cube, then traverse out, as
+        # one queued mq (vertical then horizontal) rather than two blocking
+        # move_to's that stop and settle at the top of the lift. Same fixed
+        # world j4 on both legs as before.
+        retreat = [(sx, sy, fz)]
         exit_pt = planner.stage_point(fz, level, prefer_xy=park_xy)
         if exit_pt is not None:
-            _travel(
-                client, calib, exit_pt[0], exit_pt[1], fz,
-                "retreat clear", j4=j4,
-            )
+            retreat.append((exit_pt[0], exit_pt[1], fz))
+        _check(
+            client.move_path(retreat, j4=j4, speed_us=calib.travel_speed_us),
+            f"level {level} retreat",
+        )
     else:
         sz = planner.slide_z(level)
         exits = planner.slide_exits(j4, level, prefer_xy=park_xy)
