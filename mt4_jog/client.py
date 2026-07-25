@@ -87,6 +87,26 @@ def _j4_wire_token(j4: float | str | None) -> str:
     return f"{float(j4):.2f}"
 
 
+def _per_waypoint(value: object, n: int, name: str) -> list:
+    """Normalize a move_path field to one value per waypoint (length ``n``).
+
+    A ``list``/``tuple`` is taken as an explicit per-waypoint sequence (its
+    length must match the waypoint count); anything else -- including a bare
+    ``"wrist"``/``"hold"`` sentinel or ``None`` -- is a single value
+    broadcast to every leg. The firmware carries speed and J4 mode on each
+    queued ``mq`` leg independently (see MpWaypoint in motion.cpp), so this
+    is what lets one queued path mix, e.g., fast transit legs with a slow
+    final descent, or a per-leg wrist mode.
+    """
+    if isinstance(value, (list, tuple)):
+        if len(value) != n:
+            raise Mt4ClientError(
+                f"move_path: {name} has {len(value)} value(s) for {n} waypoint(s)"
+            )
+        return list(value)
+    return [value] * n
+
+
 class Mt4Client:
     """Thread-safe owner of the MT4 serial connection."""
 
@@ -452,9 +472,9 @@ class Mt4Client:
     def move_path(
         self,
         waypoints: list[tuple[float, float, float]],
-        j4: float | str | None = None,
+        j4: float | str | None | list[float | str | None] = None,
         grip: int = 0,
-        speed_us: int = 0,
+        speed_us: int | list[int] = 0,
         timeout: float = MOVE_TIMEOUT_S,
     ) -> dict[str, object]:
         """Move through a sequence of Cartesian waypoints as one continuous
@@ -490,6 +510,18 @@ class Mt4Client:
         this safe to use as the awaited finisher after raw `queue_move()`
         calls.
 
+        `j4` and `speed_us` may also be given as a per-waypoint list (same
+        length as `waypoints`) instead of one value broadcast to all legs --
+        each queued `mq` leg carries its own speed and J4 mode on the
+        firmware (MpWaypoint in motion.cpp), so a single path can run fast
+        transit legs and then a slow final descent, or vary the wrist mode
+        per leg. A scalar (or bare "hold"/"wrist"/None) still applies to
+        every leg.
+
+        `speed_us` is the per-leg step period (0 leaves the current one
+        unchanged); each list entry must be 0 or within
+        [JOG_SPEED_MIN_US, JOG_SPEED_MAX_US].
+
         `grip` (if nonzero) fires on the FIRST leg only, matching a single
         `move_to()` call's semantics -- for a gripper action partway through
         a route, call `gripper()` directly between `move_path()` calls
@@ -504,10 +536,12 @@ class Mt4Client:
                 f"move_path: at most {MQ_QUEUE_CAPACITY + 1} waypoints per "
                 f"call (firmware `mq` queue holds {MQ_QUEUE_CAPACITY})"
             )
-        if speed_us and not JOG_SPEED_MIN_US <= speed_us <= JOG_SPEED_MAX_US:
-            raise Mt4ClientError(
-                f"speed_us must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US}"
-            )
+        speeds = _per_waypoint(speed_us, len(waypoints), "speed_us")
+        for s in speeds:
+            if s and not JOG_SPEED_MIN_US <= s <= JOG_SPEED_MAX_US:
+                raise Mt4ClientError(
+                    f"speed_us must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US} (got {s})"
+                )
         if grip and not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
             raise Mt4ClientError(
                 f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
@@ -518,15 +552,17 @@ class Mt4Client:
                     f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
                 )
 
-        j4_token = _j4_wire_token(j4)
+        j4_tokens = [
+            _j4_wire_token(v) for v in _per_waypoint(j4, len(waypoints), "j4")
+        ]
 
         with self._lock:
             self._ensure_connected_unlocked()
 
-            def build_cmd(x: float, y: float, z: float, g: int) -> str:
-                cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(g)}"
-                if speed_us:
-                    cmd += f" {int(speed_us)}"
+            def build_cmd(i: int, x: float, y: float, z: float, g: int) -> str:
+                cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_tokens[i]} {int(g)}"
+                if speeds[i]:
+                    cmd += f" {int(speeds[i])}"
                 if len(cmd) >= 64:
                     raise Mt4ClientError(
                         f"mq command exceeds 64-byte firmware line buffer: {cmd!r}"
@@ -581,7 +617,7 @@ class Mt4Client:
                 return {"ok": False, "error": error, "lines": collected}
 
             for i, (x, y, z) in enumerate(waypoints):
-                cmd = build_cmd(x, y, z, grip if i == 0 else 0)
+                cmd = build_cmd(i, x, y, z, grip if i == 0 else 0)
                 batch = self._send_and_collect(cmd, wait=0.5)
                 collected.extend(batch)
                 err = scan(batch)
