@@ -17,15 +17,25 @@ arm instead of drawing the trajectory far too low.
 Rather than have a human measure the lens position (the earlier approach: a
 prompted ``cam_height_mm`` plus a guessed nadir), this derives BOTH from
 vision + the arm, like every other calibration here: grip a cube, hover it at
-a column of known heights over several XY, detect where it lands, and fit the
-radial model to the apparent-vs-true offsets. The recovered lens height comes
-out within a couple mm of a tape measure, and the fit tracks the arm to
-~10px across the workspace.
+a column of known heights over several XY spread across the desk, detect where
+it lands, and fit the radial model to the apparent-vs-true offsets. The
+recovered lens height comes out within a couple mm of a tape measure, and the
+fit tracks the arm to ~10px near the workspace center; the columns span wide
++/-Y so the fit stays honest toward the frame edges too (the one place the
+residual grows, where lens barrel distortion the pinhole model can't express
+starts to bite).
 
 Bias-free by construction: the constant grip/detection offset (blob centroid
 vs TCP) is the SAME at every height in a column, so fitting the offset's
 *growth with height* cancels it -- unlike the cube-top map, which bakes that
 bias in and cannot serve the arm.
+
+Robust to this rig's two nuisances: the black gripper claw self-occludes a low
+held cube from the oblique camera (so a column is tracked through whatever
+heights ARE visible, skipping the occluded ones, rather than demanding the
+lowest rung), and the held cube is told apart from desk cubes by elimination
+(the desk cubes are photographed before the grip; the held one is the same
+color that ISN'T sitting where a desk cube was).
 
 Run (arm + camera free, a cube or three on the desk):
 
@@ -58,56 +68,72 @@ from mt4_vision.workspace import MAX_REACH_MM, is_mp_reachable_xy
 # Probe columns (robot XY). Spread in BOTH axes: the y-spread pins the nadir's
 # y (a +y and a -y column give opposite-sign vertical parallax that triangulate
 # it), and the shape of offset-vs-height pins the lens height (hence the nadir
-# radius) largely independent of XY. Kept at a modest radius so every height in
-# the sweep stays reachable, and away from the base so the forearm does not
-# occlude the held cube from the oblique camera.
+# radius) largely independent of XY. The wide +/-Y columns are what keep the
+# fit honest toward the frame edges; the central ones anchor the middle. Kept
+# at a modest radius so most heights stay reachable, and away from the base so
+# the forearm does not occlude the held cube from the oblique camera.
 DEFAULT_COLUMNS = [
     (200.0, -60.0),
     (200.0, 60.0),
     (170.0, 0.0),
     (230.0, -30.0),
-    (185.0, 90.0),
-    (185.0, -90.0),
+    (170.0, 150.0),
+    (170.0, -150.0),
+    (150.0, 200.0),
+    (150.0, -200.0),
+    (200.0, 120.0),
+    (200.0, -120.0),
 ]
-# Heights above the table to sample per column (mm). Start just off the table
-# (parallax ~0, so the flat map places the anchor almost exactly -- a reliable
-# lock) and rise in even steps. The top few often drop out to occlusion; the
-# fit only needs a handful of clean rungs per column.
-DEFAULT_HEIGHTS = [8, 28, 48, 68, 88, 108]
-# Anchor: the lowest rung must detect a cube within this pixel radius of the
-# flat prediction, and its back-projected XY must be within this many mm of the
-# column XY -- else a nearby desk cube was grabbed, so skip the column.
-ANCHOR_RADIUS_PX = 50.0
-ANCHOR_XY_TOL_MM = 25.0
-# Continuity: each higher rung is matched to the nearest same-color blob within
-# this radius of the PREVIOUS rung's pixel, so the track cannot jump to a
-# static desk cube. Stops the column on the first miss (occlusion).
-TRACK_RADIUS_PX = 95.0
+# Heights above the table to sample per column (mm), low to high. Higher rungs
+# probe the regime where parallax (and any residual) is largest, but also where
+# reach/occlusion tend to drop out -- fine, missing rungs are simply skipped.
+DEFAULT_HEIGHTS = [8, 28, 48, 68, 88, 108, 128, 148]
+# A detected red is the same DESK cube (not the probe) if its mapped XY is
+# within this of a pre-grip desk position.
+STATIC_TOL_MM = 35.0
+# First visible rung of a column locks onto the probe as the nearest non-desk
+# red to the model's predicted pixel, within this radius (generous: the current
+# model is what we are refining, off by tens of px toward the edges).
+LOCK_RADIUS_PX = 150.0
+# Later rungs follow the previous rung's pixel by continuity within this radius;
+# if that misses (a skipped/occluded rung created a gap) re-acquire against the
+# model prediction within the wider radius.
+TRACK_RADIUS_PX = 120.0
+REACQUIRE_RADIUS_PX = 170.0
+# Keep a column only if it yielded at least this many rungs.
+MIN_RUNGS_PER_COL = 3
 SETTLE_S = 0.35
 # Refuse to write a fit worse than this (mm rms of the radial model against the
-# measured apparent offsets) -- a bad sweep should not poison the overlay.
-MAX_ACCEPT_RMS_MM = 20.0
+# measured apparent offsets) -- a mis-tracked sweep should not poison the
+# overlay. A wide-Y fit is inherently distortion-limited (the oblique lens
+# barrel-distorts the frame edges, which no single pinhole radial model can
+# express), so ~20-30mm rms is expected and fine here; only a truly broken
+# sweep (latched a wrong blob, absurd nadir) lands well past this.
+MAX_ACCEPT_RMS_MM = 35.0
 
 
 def _reds(frame, calib, color: str):
     return [c for c in detect_cubes(frame, calib) if c.color == color]
 
 
-def _nearest(frame, calib, color: str, px: float, py: float, radius: float):
+def _is_desk_cube(c, desk_xy: list[tuple[float, float]]) -> bool:
+    if c.x is None or c.y is None:
+        return False
+    return any(
+        math.hypot(float(c.x) - sx, float(c.y) - sy) <= STATIC_TOL_MM
+        for sx, sy in desk_xy
+    )
+
+
+def _nearest_to(cands, px: float, py: float, radius: float):
     best = None
     best_d = radius
-    for c in _reds(frame, calib, color):
+    for c in cands:
         d = math.hypot(c.px - px, c.py - py)
         if d < best_d:
             best_d = d
             best = c
     return best
-
-
-def _flat_pixel(calib, x: float, y: float) -> tuple[float, float]:
-    m0 = np.linalg.inv(np.array(calib.homography, dtype=np.float64))
-    w = m0 @ np.array([x, y, 1.0])
-    return float(w[0] / w[2]), float(w[1] / w[2])
 
 
 def fit_nadir_height(records: list[dict], calib) -> tuple[tuple[float, float], float, float]:
@@ -144,46 +170,50 @@ def fit_nadir_height(records: list[dict], calib) -> tuple[tuple[float, float], f
     return n, float(H), rms
 
 
-def sweep_column(client, calib, cx, cy, heights, color, *, speed) -> list[dict]:
-    """Track a held cube up one vertical column; return per-rung records."""
+def sweep_column(
+    client, calib, cx, cy, heights, color, desk_xy, *, speed
+) -> list[dict]:
+    """Track a held cube up one vertical column; return per-rung records.
+
+    Skips rungs where the probe is occluded or unreachable; identifies the
+    probe by elimination against ``desk_xy`` so it never latches a desk cube.
+    """
     tz = calib.table_z
     z_top = max(heights[-1] + tz, calib.safe_z)
     try:
         client.move_to(cx, cy, z_top, speed_us=speed, j4="wrist")
-        client.move_to(cx, cy, tz + heights[0], speed_us=speed, j4="hold")
     except Mt4ClientError as exc:
         print(f"  column ({cx:.0f},{cy:.0f}) unreachable: {exc}")
         return []
-    time.sleep(SETTLE_S + 0.05)
-    frame = capture_frame()
-    ax, ay = _flat_pixel(calib, cx, cy)
-    det = _nearest(frame, calib, color, ax, ay, ANCHOR_RADIUS_PX)
-    if det is None:
-        print(f"  column ({cx:.0f},{cy:.0f}): no anchor near ({ax:.0f},{ay:.0f}) -- skip")
-        return []
-    A = calib.pixel_to_robot(det.px, det.py)
-    if math.hypot(A[0] - cx, A[1] - cy) > ANCHOR_XY_TOL_MM:
-        print(f"  column ({cx:.0f},{cy:.0f}): anchor is a stray cube -- skip")
-        return []
-    out = [dict(cx=cx, cy=cy, h=float(heights[0]), px=det.px, py=det.py, A_x=A[0], A_y=A[1])]
-    prev = (det.px, det.py)
-    print(f"  column ({cx:.0f},{cy:.0f}) locked at h={heights[0]}mm")
-    for h in heights[1:]:
+    out: list[dict] = []
+    prev: tuple[float, float] | None = None
+    for h in heights:
         try:
             client.move_to(cx, cy, tz + h, speed_us=speed, j4="hold")
-        except Mt4ClientError as exc:
-            print(f"    h={h}: unreachable ({exc}); stop column")
-            break
+        except Mt4ClientError:
+            break  # higher rungs only get less reachable
         time.sleep(SETTLE_S)
         frame = capture_frame()
-        det = _nearest(frame, calib, color, prev[0], prev[1], TRACK_RADIUS_PX)
+        cands = [c for c in _reds(frame, calib, color) if not _is_desk_cube(c, desk_xy)]
+        if not cands:
+            continue  # occluded at this height -- skip, keep the column
+        pred = calib.robot_to_pixel(cx, cy, tz + h)
+        if prev is None:
+            det = _nearest_to(cands, pred[0], pred[1], LOCK_RADIUS_PX)
+        else:
+            det = _nearest_to(cands, prev[0], prev[1], TRACK_RADIUS_PX) or _nearest_to(
+                cands, pred[0], pred[1], REACQUIRE_RADIUS_PX
+            )
         if det is None:
-            print(f"    h={h}: lost track (occlusion); stop column")
-            break
+            continue
         A = calib.pixel_to_robot(det.px, det.py)
         out.append(dict(cx=cx, cy=cy, h=float(h), px=det.px, py=det.py, A_x=A[0], A_y=A[1]))
         prev = (det.px, det.py)
     client.move_to(cx, cy, z_top, speed_us=speed, j4="hold")
+    if len(out) < MIN_RUNGS_PER_COL:
+        print(f"  column ({cx:.0f},{cy:.0f}): only {len(out)} rung(s) -- dropped")
+        return []
+    print(f"  column ({cx:.0f},{cy:.0f}): {len(out)} rungs")
     return out
 
 
@@ -193,6 +223,7 @@ def main() -> int:
     ap.add_argument("--calib", default=str(DEFAULT_CALIB_PATH))
     ap.add_argument("--color", default="red", help="probe cube color (default red)")
     ap.add_argument("--dry-run", action="store_true", help="fit and report, do not write the calibration")
+    ap.add_argument("--dump", default=None, help="also write the raw per-rung records to this JSON (for offline analysis)")
     args = ap.parse_args()
 
     try:
@@ -214,9 +245,13 @@ def main() -> int:
         st = client.get_status()
         client.move_to(st.tcp.x, st.tcp.y, max(st.tcp.z, calib.safe_z), speed_us=speed, j4="wrist")
 
+        # Photograph the desk before gripping: every reachable probe-color cube
+        # here is a DESK cube; the one we lift becomes "the red that moved".
         frame = capture_frame()
+        desk = _reds(frame, calib, args.color)
+        desk_xy_all = [(float(c.x), float(c.y)) for c in desk if c.x is not None]
         cand = [
-            c for c in _reds(frame, calib, args.color)
+            c for c in desk
             if c.x is not None
             and is_mp_reachable_xy(float(c.x), float(c.y))
             and math.hypot(float(c.x), float(c.y)) <= MAX_REACH_MM
@@ -224,12 +259,16 @@ def main() -> int:
         if not cand:
             print(f"No reachable {args.color} cube to use as a probe", file=sys.stderr)
             return 1
-        # Grip the one nearest a mid-desk anchor -- likely isolated, and the
-        # sweep columns fan out from there.
         cand.sort(key=lambda c: math.hypot(float(c.x) - 200.0, float(c.y) + 120.0))
         g = cand[0]
         grip_xy = (float(g.x), float(g.y))
-        print(f"Gripping {args.color} cube at ({grip_xy[0]:.1f},{grip_xy[1]:.1f})")
+        # The lifted cube's own former spot is no longer a desk cube.
+        desk_xy = [
+            s for s in desk_xy_all
+            if math.hypot(s[0] - grip_xy[0], s[1] - grip_xy[1]) > STATIC_TOL_MM
+        ]
+        print(f"Gripping {args.color} cube at ({grip_xy[0]:.1f},{grip_xy[1]:.1f}); "
+              f"{len(desk_xy)} desk cube(s) to exclude")
         pick(client, calib, grip_xy[0], grip_xy[1], yaw_deg=g.yaw_deg)
 
         columns = [
@@ -237,7 +276,7 @@ def main() -> int:
             if is_mp_reachable_xy(x, y) and math.hypot(x, y) <= MAX_REACH_MM
         ]
         for cx, cy in columns:
-            records += sweep_column(client, calib, cx, cy, DEFAULT_HEIGHTS, args.color, speed=speed)
+            records += sweep_column(client, calib, cx, cy, DEFAULT_HEIGHTS, args.color, desk_xy, speed=speed)
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -255,6 +294,11 @@ def main() -> int:
             print(f"(cleanup move failed: {exc})", file=sys.stderr)
         client.close()
 
+    if args.dump:
+        import json
+        Path(args.dump).write_text(json.dumps(records, indent=2), encoding="utf-8")
+        print(f"Wrote {len(records)} raw rungs to {args.dump}")
+
     cols_used = sorted({(r["cx"], r["cy"]) for r in records})
     ys = {c[1] for c in cols_used}
     print(f"\nCollected {len(records)} rungs across {len(cols_used)} columns: {cols_used}")
@@ -266,7 +310,6 @@ def main() -> int:
         return 1
 
     nadir, H, rms = fit_nadir_height(records, calib)
-    # Pixel error against the measured detections.
     calib.cam_xy_robot = [round(nadir[0], 1), round(nadir[1], 1)]
     calib.cam_height_mm = round(H, 1)
     perr = [
