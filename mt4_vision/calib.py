@@ -63,10 +63,12 @@ def _warn_no_cube_top_correction() -> None:
 class Calibration:
     # Row-major 3x3 pixel -> robot-XY homography (table plane).
     homography: list[list[float]]
-    # Robot-frame Z of the table surface under the camera (mm).
+    # Robot-frame Z of the table surface under the camera (mm). Also the TCP Z
+    # for gripping a cube sitting on the table -- the gripper straddles the
+    # cube's lower faces, so grip height and table height coincide here (the
+    # former separate ``pick_z`` was always set equal to this and was folded
+    # in).
     table_z: float
-    # TCP Z for gripping a cube sitting on the table (mm).
-    pick_z: float
     # Travel height between moves (mm). Keep modest -- the arm should stay
     # low over the desk, well inside its envelope.
     safe_z: float
@@ -80,7 +82,7 @@ class Calibration:
     grip_open_s: int = 140
     grip_close_s: int = 240
     # Cube edge length (mm), used for the parallax correction and place height.
-    cube_height_mm: float = 30.0
+    cube_height_mm: float = 20.0
     # Preferred cube-top correction: a second pixel -> robot-XY homography
     # fit directly at cube-top height (see calibrate_height.py) from
     # arm-placed probe cubes -- the arm's commanded place position is the
@@ -155,6 +157,72 @@ class Calibration:
         elif on_cube_top:
             _warn_no_cube_top_correction()
         return x, y
+
+    def robot_to_pixel(self, x: float, y: float, z: float | None = None) -> tuple[float, float]:
+        """Robot XY(Z) -> pixel, height-corrected for camera parallax.
+
+        With no z (or z at table_z) this is the flat table-plane inverse --
+        exact for a point on the table, off by the parallax amount for
+        anything above it.
+
+        With z given, the primary correction is the true pinhole geometry of
+        the *arm's TCP*: a point at height h projects, through the flat table
+        homography, onto the table-plane intersection of its camera ray, which
+        sits radially outward from the camera nadir by
+
+            scale = cam_height / (cam_height - h)
+
+        (isotropic scaling of (x, y) about ``cam_xy_robot``). This is exact
+        given the arm's true height -- no cube involved -- and both parameters
+        are measured directly against the arm (calibrate_camera_nadir.py:
+        grip a cube, sweep it through known heights, fit nadir + cam_height to
+        where it lands). On this rig the camera is steeply *oblique*, so the
+        nadir is far off to one side (well outside the workspace) and raising
+        the TCP shifts its image a lot along the camera azimuth -- which the
+        earlier cube-top model badly under-corrected (drew the trajectory too
+        low). The direct fit recovers cam_height within ~2mm of the physical
+        measurement and tracks the arm to <~15px at any operating height.
+
+        Falls back, only when ``cam_xy_robot`` is unset, to scaling the
+        cube-top homography's parallax offset by ``h/cube_height`` -- the
+        cube-detection map carries a direction-dependent centroid bias and a
+        sub-cube effective height, so it is anisotropic and under-shifts with
+        height; usable near the cube-top baseline, not at travel/hover. Then
+        to no correction at all. Fine for overlay/debug drawing; do not use
+        this for anything that drives a pick.
+        """
+        m0 = np.linalg.inv(np.array(self.homography, dtype=np.float64))
+
+        def flat_pixel(rx: float, ry: float) -> tuple[float, float]:
+            w = m0 @ np.array([rx, ry, 1.0])
+            return float(w[0] / w[2]), float(w[1] / w[2])
+
+        px, py = flat_pixel(x, y)
+        if z is None:
+            return px, py
+        height_mm = z - self.table_z
+        if abs(height_mm) < 1e-6:
+            return px, py
+        if (
+            self.cam_xy_robot
+            and self.cam_height_mm
+            and self.cam_height_mm - height_mm > 1e-6
+        ):
+            # Primary: measured camera geometry (nadir + lens height). Exact
+            # pinhole parallax of the TCP at its true height.
+            cx, cy = self.cam_xy_robot
+            scale = self.cam_height_mm / (self.cam_height_mm - height_mm)
+            return flat_pixel(cx + (x - cx) * scale, cy + (y - cy) * scale)
+        if self.cube_top_homography:
+            # Fallback (no measured nadir): scale the cube-top parallax offset
+            # linearly with height off its cube-top baseline. Anisotropic and
+            # low above the baseline (see docstring) -- overlay-only stopgap.
+            m_ct = np.linalg.inv(np.array(self.cube_top_homography, dtype=np.float64))
+            pc = m_ct @ np.array([x, y, 1.0])
+            qx, qy = self.pixel_to_robot(float(pc[0] / pc[2]), float(pc[1] / pc[2]))
+            ratio = height_mm / self.cube_height_mm
+            return flat_pixel(x + (qx - x) * ratio, y + (qy - y) * ratio)
+        return px, py
 
     def _residual_correction(self, x: float, y: float) -> tuple[float, float]:
         r = self.cube_top_residual

@@ -211,7 +211,7 @@ def test_pick_missed_detects_shoved_cube():
 
 
 def test_release_z_steps_by_cube_height():
-    calib = SimpleNamespace(pick_z=150.0, safe_z=185.0, cube_height_mm=20.0)
+    calib = SimpleNamespace(table_z=150.0, safe_z=185.0, cube_height_mm=20.0)
     # 4mm above stack top: empty / 1-cube / 2-cube
     assert release_z_for_level(calib, 1) == 154.0
     assert release_z_for_level(calib, 2) == 174.0

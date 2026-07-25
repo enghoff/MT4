@@ -20,7 +20,7 @@ from mt4_vision.stackpath import (
 
 # Live calibration values (vision_calibration.json, 2026-07): 20mm cubes,
 # pick at 127.2. Marker 3 is a real stack site (~220mm from the base).
-CALIB = SimpleNamespace(pick_z=127.2, cube_height_mm=20.0, safe_z=155.0)
+CALIB = SimpleNamespace(table_z=127.2, cube_height_mm=20.0, safe_z=155.0)
 MARKER3 = (153.6, 156.9)
 
 

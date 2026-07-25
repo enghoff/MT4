@@ -542,11 +542,11 @@ def release_z_for_level(calib, level: int) -> float:
     """TCP release height: 4mm above the current stack top.
 
     Stack top before placing ``level`` (1-based) is the top of the uppermost
-    cube already seated -- ``pick_z + (level-1)*cube_height_mm`` in the same
+    cube already seated -- ``table_z + (level-1)*cube_height_mm`` in the same
     TCP frame as table grips (empty marker when level==1). Mirrors
     ``StackPlanner.release_z``.
     """
-    stack_top = float(calib.pick_z) + (level - 1) * float(calib.cube_height_mm)
+    stack_top = float(calib.table_z) + (level - 1) * float(calib.cube_height_mm)
     return stack_top + 4.0
 
 
@@ -751,6 +751,7 @@ def main() -> int:
         if stream is not None
         else None
     )
+    client.trajectory_sink = live_feed
 
     def snap_scene(stage: str) -> Scene:
         if live_feed is not None:
@@ -1056,7 +1057,7 @@ def main() -> int:
                         client, calib, planner,
                         float(cube.x), float(cube.y), calib.safe_z,
                         built, final_j4=approach_j4,
-                        descend=(float(cube.x), float(cube.y), calib.pick_z),
+                        descend=(float(cube.x), float(cube.y), calib.table_z),
                         step="approach pick",
                     )
                 # lift_after=False leaves the gripped cube at grab height;

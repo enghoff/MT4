@@ -6,7 +6,7 @@ firmware ``mp`` moves.
 Two obstacle models guard a stack of ``levels`` cubes at (sx, sy):
 
 * **Column cylinder** -- fingertips reach roughly table level when the TCP
-  is at ``pick_z``, so below ``grip-top + clearance`` the TCP must stay
+  is at ``table_z``, so below ``grip-top + clearance`` the TCP must stay
   ``COLUMN_AVOID_MM`` from the stack axis in XY.
 * **Forearm wedge** -- every arm link sits on the base side of the TCP
   (HEAD_OFFSET points the head away from the wrist), so the forearm can
@@ -15,10 +15,10 @@ Two obstacle models guard a stack of ``levels`` cubes at (sx, sy):
   enough; ``FOREARM_RISE_PER_MM`` is a conservative slope taken from FK
   poses (TCP at r=260, z=155 puts the forearm at ~179mm over r=211).
 
-Heights are TCP-frame like the calibration: ``pick_z`` grips a cube on the
-table, so a TCP at ``pick_z + k*cube_height`` grips cube ``k`` of a stack,
+Heights are TCP-frame like the calibration: ``table_z`` grips a cube on the
+table, so a TCP at ``table_z + k*cube_height`` grips cube ``k`` of a stack,
 and fingertips clear an ``L``-cube stack once the TCP is above
-``pick_z + L*cube_height`` plus margin.
+``table_z + L*cube_height`` plus margin.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ class StackPlanner:
     def __init__(self, calib, sx: float, sy: float) -> None:
         self.sx = float(sx)
         self.sy = float(sy)
-        self.pick_z = float(calib.pick_z)
+        self.table_z = float(calib.table_z)
         self.cube_h = float(calib.cube_height_mm)
         self.safe_z = float(calib.safe_z)
         self.site_max_z = max_z_at(self.sx, self.sy) or GROUND_Z_MM
@@ -126,7 +126,7 @@ class StackPlanner:
 
     def grip_top_z(self, levels: int) -> float:
         """TCP height whose fingertips sit level with a ``levels``-cube top."""
-        return self.pick_z + levels * self.cube_h
+        return self.table_z + levels * self.cube_h
 
     def release_z(self, level: int) -> float:
         return self.grip_top_z(level - 1) + RELEASE_ABOVE_MM

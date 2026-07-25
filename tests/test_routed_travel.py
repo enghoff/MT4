@@ -18,7 +18,7 @@ from mt4_vision.stackpath import StackPlanner
 
 # Live calibration values (vision_calibration.json, 2026-07).
 CALIB = SimpleNamespace(
-    pick_z=127.2,
+    table_z=127.2,
     cube_height_mm=20.0,
     safe_z=155.0,
     travel_speed_us=700,
@@ -55,10 +55,10 @@ def test_descend_leg_appended_and_slow():
     client = _RecordingClient(_Tcp(200.0, 0.0, 260.0))
     routed_travel(
         client, CALIB, _planner(), 220.0, -60.0, CALIB.safe_z, 0,
-        descend=(220.0, -60.0, CALIB.pick_z), step="t",
+        descend=(220.0, -60.0, CALIB.table_z), step="t",
     )
     wps, _j4, speed = client.calls[-1]
-    assert wps[-1] == (220.0, -60.0, CALIB.pick_z)  # descend appended last
+    assert wps[-1] == (220.0, -60.0, CALIB.table_z)  # descend appended last
     assert len(speed) == len(wps)
     assert speed[-1] == int(CALIB.approach_speed_us)  # only the drop is slow
     assert all(s == CALIB.travel_speed_us for s in speed[:-1])
@@ -69,11 +69,11 @@ def test_then_and_descend_both_appended():
     routed_travel(
         client, CALIB, _planner(), 220.0, -60.0, CALIB.safe_z, 0,
         then=[(230.0, -50.0, CALIB.safe_z)],
-        descend=(230.0, -50.0, CALIB.pick_z), step="t",
+        descend=(230.0, -50.0, CALIB.table_z), step="t",
     )
     wps, _j4, speed = client.calls[-1]
     assert wps[-2] == (230.0, -50.0, CALIB.safe_z)  # then hop
-    assert wps[-1] == (230.0, -50.0, CALIB.pick_z)  # slow descend
+    assert wps[-1] == (230.0, -50.0, CALIB.table_z)  # slow descend
     assert speed[-1] == int(CALIB.approach_speed_us)
     assert all(s == CALIB.travel_speed_us for s in speed[:-1])
 
@@ -86,7 +86,7 @@ def test_place_shape_holds_j4_with_slow_descend():
     routed_travel(
         client, CALIB, _planner(), 220.0, -60.0, CALIB.safe_z, 0,
         j4=12.5, then=[(230.0, -50.0, CALIB.safe_z)],
-        descend=(230.0, -50.0, CALIB.pick_z), step="t",
+        descend=(230.0, -50.0, CALIB.table_z), step="t",
     )
     _wps, j4, speed = client.calls[-1]
     assert j4 == 12.5  # every leg holds the square wrist (scalar, collapsed)
@@ -118,15 +118,15 @@ def test_lift_to_prepends_vertical_wrist_lift():
     # Arm still down at grab height; lift_to folds a vertical lift-off into
     # the carry -- prepended, same XY, held at wrist -- before the route
     # plans from safe_z. Only the final drop is slow.
-    client = _RecordingClient(_Tcp(220.0, -60.0, CALIB.pick_z))
+    client = _RecordingClient(_Tcp(220.0, -60.0, CALIB.table_z))
     routed_travel(
         client, CALIB, _planner(), 230.0, -50.0, CALIB.safe_z, 0,
         j4=12.5, lift_to=CALIB.safe_z,
-        descend=(230.0, -50.0, CALIB.pick_z), step="t",
+        descend=(230.0, -50.0, CALIB.table_z), step="t",
     )
     wps, j4, speed = client.calls[-1]
     assert wps[0] == (220.0, -60.0, CALIB.safe_z)  # vertical lift-off first
-    assert wps[-1] == (230.0, -50.0, CALIB.pick_z)  # slow descend last
+    assert wps[-1] == (230.0, -50.0, CALIB.table_z)  # slow descend last
     assert isinstance(j4, list)
     assert j4[0] == "wrist"  # lift preserves the gripped orientation
     assert all(v == 12.5 for v in j4[1:])  # route + descend hold the square

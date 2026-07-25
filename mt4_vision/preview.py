@@ -7,6 +7,7 @@ the planner works without touching the pick/place logic itself.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -26,6 +27,12 @@ MARKER_FREE_BGR = (0, 200, 0)
 MARKER_OCCUPIED_BGR = (0, 0, 255)
 MARKER_UNKNOWN_BGR = (0, 200, 255)
 TARGET_BGR = (255, 0, 255)
+# move_to (a single target point) vs move_path/mq (a queued multi-waypoint
+# path) -- distinct colors so a queued path is visible at a glance, decided
+# by the command that was sent, NOT by how many legs it happens to bend into
+# (a direct 1-waypoint move_path is still an mq, so still cyan).
+TRAJECTORY_SINGLE_BGR = (0, 140, 255)  # orange -- move_to
+TRAJECTORY_MULTI_BGR = (255, 255, 0)  # cyan -- move_path / mq
 
 
 _OUTLINE_OFFSETS = [
@@ -91,6 +98,51 @@ def draw_lock_ring(img: np.ndarray, px: float, py: float, color_bgr: tuple[int, 
     cv2.drawMarker(img, (cx, cy), color_bgr, cv2.MARKER_CROSS, 16, 2)
 
 
+# cv2.arrowedLine's tipLength is a fraction of that leg's OWN length, applied
+# to the shortest leg to get an absolute arrowhead pixel size, then reused
+# (as a length-scaled fraction) on every other leg -- otherwise a long
+# diagonal leg and a short leg in the same path get visibly different-sized
+# arrowheads under one shared fraction.
+_ARROWHEAD_TIP_FRACTION = 0.075
+_ARROWHEAD_UNIFORM_SCALE = 0.8
+
+
+def draw_trajectory(
+    img: np.ndarray,
+    points_px: list[tuple[float, float]],
+    multi: bool = False,
+) -> None:
+    """Draw an in-flight move_to/move_path request: arrowed legs between
+    waypoints, a dot at each intermediate one, and a cross at the end (the
+    single-point move_to case is just that end cross, no legs). Color follows
+    the command, not the leg count: ``multi`` False (move_to) draws orange,
+    True (any move_path/mq) draws cyan even when it bends into a single leg.
+    Every arrowhead is the same absolute size regardless of leg length (see
+    _ARROWHEAD_TIP_FRACTION).
+    """
+    if not points_px:
+        return
+    pts = [(int(px), int(py)) for px, py in points_px]
+    color_bgr = TRAJECTORY_MULTI_BGR if multi else TRAJECTORY_SINGLE_BGR
+    legs = list(zip(pts, pts[1:]))
+    leg_lengths = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in legs]
+    positive_lengths = [length for length in leg_lengths if length > 1e-6]
+    tip_px = (
+        _ARROWHEAD_UNIFORM_SCALE * _ARROWHEAD_TIP_FRACTION * min(positive_lengths)
+        if positive_lengths
+        else 0.0
+    )
+    for (a, b), length in zip(legs, leg_lengths):
+        if length <= 1e-6:
+            continue
+        cv2.arrowedLine(
+            img, a, b, color_bgr, 2, cv2.LINE_AA, tipLength=min(tip_px / length, 1.0),
+        )
+    for p in pts[:-1]:
+        cv2.circle(img, p, 4, color_bgr, -1)
+    cv2.drawMarker(img, pts[-1], color_bgr, cv2.MARKER_TILTED_CROSS, 14, 2)
+
+
 def annotate_scene(
     frame: np.ndarray,
     scene: Scene,
@@ -98,6 +150,8 @@ def annotate_scene(
     *,
     target: CubeDetection | None = None,
     status_lines: list[str] | None = None,
+    trajectory_px: list[tuple[float, float]] | None = None,
+    trajectory_multi: bool = False,
 ) -> np.ndarray:
     """Return a copy of ``frame`` with cubes, markers, and a status header."""
     out = frame.copy()
@@ -121,6 +175,9 @@ def annotate_scene(
         draw_outlined_text(
             out, str(m.marker_id), (int(m.px) + 10, int(m.py) - 10), scale=0.6, color=color,
         )
+
+    if trajectory_px:
+        draw_trajectory(out, trajectory_px, trajectory_multi)
 
     if target is not None:
         draw_lock_ring(out, target.px, target.py, TARGET_BGR)
@@ -244,6 +301,8 @@ class LiveFeed:
         self._live_preview = LivePreview() if show_preview else None
         self._status_lines: list[str] = []
         self._target: tuple[str, float, float] | None = None
+        self._trajectory: list[tuple[float, float, float]] | None = None
+        self._trajectory_multi = False
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self.stopped_by_user = threading.Event()
@@ -262,6 +321,26 @@ class LiveFeed:
         with self._lock:
             self._target = None
 
+    def set_trajectory(
+        self, waypoints: list[tuple[float, float, float]], multi: bool = False,
+    ) -> None:
+        """Show a move_to/move_path request as an overlay -- robot-frame
+        (x, y, z) waypoints, projected to pixels every tick via
+        Calibration.robot_to_pixel (height-corrected, not flattened to the
+        table plane) (Mt4Client sets this when it sends the move, via its
+        ``trajectory_sink`` hook, and clears it once the call returns,
+        success or failure). ``multi`` colors the overlay by command:
+        False for move_to, True for any move_path/mq (see draw_trajectory).
+        """
+        with self._lock:
+            self._trajectory = [(float(x), float(y), float(z)) for x, y, z in waypoints]
+            self._trajectory_multi = multi
+
+    def clear_trajectory(self) -> None:
+        with self._lock:
+            self._trajectory = None
+            self._trajectory_multi = False
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             tick_start = time.monotonic()
@@ -274,6 +353,8 @@ class LiveFeed:
             with self._lock:
                 status_lines = list(self._status_lines)
                 target_spec = self._target
+                trajectory = self._trajectory
+                trajectory_multi = self._trajectory_multi
             target = None
             if target_spec is not None:
                 color, tx, ty = target_spec
@@ -281,8 +362,12 @@ class LiveFeed:
                     scene.raw_cubes if scene.raw_cubes is not None else scene.cubes,
                     color, tx, ty,
                 )
+            trajectory_px = None
+            if trajectory:
+                trajectory_px = [self._calib.robot_to_pixel(x, y, z) for x, y, z in trajectory]
             annotated = annotate_scene(
                 frame, scene, markers_px, target=target, status_lines=status_lines,
+                trajectory_px=trajectory_px, trajectory_multi=trajectory_multi,
             )
             if self._recorder is not None:
                 self._recorder.write(annotated)

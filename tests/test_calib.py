@@ -17,7 +17,7 @@ IDENTITY = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 
 def make_calib(**overrides) -> Calibration:
     return Calibration(
-        homography=IDENTITY, table_z=144.0, pick_z=154.0, safe_z=185.0, **overrides
+        homography=IDENTITY, table_z=144.0, safe_z=185.0, **overrides
     )
 
 

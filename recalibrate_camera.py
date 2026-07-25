@@ -214,7 +214,6 @@ def main() -> int:
     new_calib = Calibration(
         homography=matrix,
         table_z=prev.table_z,
-        pick_z=prev.pick_z,
         safe_z=prev.safe_z,
         travel_speed_us=prev.travel_speed_us,
         approach_speed_us=prev.approach_speed_us,

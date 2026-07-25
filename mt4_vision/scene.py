@@ -155,7 +155,7 @@ class Scene:
         """Tag visible, place-clearance free, reachable at travel height.
 
         Matches pick/slot filtering: keep-out cylinder *and* MAX_REACH_MM.
-        Keep-out alone is not enough -- a marker can be placeable at pick_z
+        Keep-out alone is not enough -- a marker can be placeable at table_z
         but outside the two-link envelope at safe_z, where every transit goes
         first (firmware ``err mp unreachable``).
         """

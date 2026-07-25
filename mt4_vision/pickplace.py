@@ -478,7 +478,7 @@ def pick(
     )
     client.gripper(calib.grip_open_s)
     _travel(client, calib, x, y, calib.safe_z, "move to safe height", j4=j4)
-    _approach(client, calib, x, y, calib.pick_z, "descend to pick height", j4=j4)
+    _approach(client, calib, x, y, calib.table_z, "descend to pick height", j4=j4)
     result = client.gripper(calib.grip_close_s)
     if not result.get("ok"):
         # Lift clear anyway so a failed grip doesn't leave the TCP parked
@@ -549,7 +549,7 @@ def place(
     (see ``j4_for_face_align``).
 
     ``release_z`` overrides the table release height (stacking uses
-    ``pick_z + (level-1)*cube_height_mm``). ``travel_z`` overrides the
+    ``table_z + (level-1)*cube_height_mm``). ``travel_z`` overrides the
     transit height (defaults to ``max(safe_z, release_z)``).
 
     When ``axis_clear_mm`` is set (stacking), approach and depart use
@@ -568,7 +568,7 @@ def place(
         j4 = j4_for_face_align(0.0, current_j4_deg=None, x=x, y=y)
     else:
         j4 = resolve_place_j4(client, calib, axis_align=axis_align, x=x, y=y)
-    rz = calib.pick_z + 3.0 if release_z is None else float(release_z)
+    rz = calib.table_z + 3.0 if release_z is None else float(release_z)
     tz = max(float(calib.safe_z), rz) if travel_z is None else float(travel_z)
     tcp0 = client.get_tcp()
     if tcp0 is None:
@@ -654,18 +654,18 @@ def pick_centered(
             and (j4 is None or abs(float(tcp.j4) - float(j4)) < 0.3)
         )
 
-    if _here(calib.pick_z):
+    if _here(calib.table_z):
         pass  # fused transit already descended us to the grab pose
     elif _here(calib.safe_z):
-        _approach(client, calib, x, y, calib.pick_z, "align: descend to grab", j4=j4)
+        _approach(client, calib, x, y, calib.table_z, "align: descend to grab", j4=j4)
     else:
         _travel(client, calib, x, y, calib.safe_z, "align: approach", j4=j4)
-        _approach(client, calib, x, y, calib.pick_z, "align: descend to grab", j4=j4)
+        _approach(client, calib, x, y, calib.table_z, "align: descend to grab", j4=j4)
     _check(client.gripper(calib.grip_close_s), "align: grab")
     _check(client.gripper(calib.grip_open_s), "align: release")
     _travel(client, calib, x, y, calib.safe_z, "align: lift before rotate")
     _rotate_j4_90_in_place(client)
-    _approach(client, calib, x, y, calib.pick_z, "align: descend to re-grip")
+    _approach(client, calib, x, y, calib.table_z, "align: descend to re-grip")
     _check(client.gripper(calib.grip_close_s), "align: grip")
     if lift_after:
         _travel(client, calib, x, y, calib.safe_z, "align: lift after grip")
@@ -743,7 +743,7 @@ def center_placed_cube(
             "center: lift before rotate",
         )
     _rotate_j4_90_in_place(client)
-    _approach(client, calib, x, y, calib.pick_z, "center: descend to cube")
+    _approach(client, calib, x, y, calib.table_z, "center: descend to cube")
     _check(client.gripper(calib.grip_close_s), "center: grip")
     _check(client.gripper(calib.grip_open_s), "center: release")
     tcp = client.get_tcp()

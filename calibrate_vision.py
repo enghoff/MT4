@@ -226,7 +226,7 @@ def main() -> int:
     poll_s = args.poll_ms / 1000.0
     buf: list[str] = [""]
     recorded: dict[int, tuple[float, float, float]] = {}
-    grip_pose: tuple[float, float] | None = None  # (pick_z, grip_close_s)
+    grip_pose: tuple[float, float] | None = None  # (grip_z, grip_close_s)
     saved = False
 
     with open_serial(port, args.baud) as ser:
@@ -336,7 +336,7 @@ def main() -> int:
                         print("Grip record failed: no TCP pose in status reply")
                     else:
                         grip_pose = (status.tcp.z, status.tcp.grip)
-                        print(f"Grip pose recorded: pick_z {grip_pose[0]:.1f}, "
+                        print(f"Grip pose recorded: grip_z {grip_pose[0]:.1f}, "
                               f"gripper S {grip_pose[1]:.0f}")
                 g_was_down = g_down
 
@@ -481,13 +481,24 @@ def main() -> int:
 
         # TCP Z while touching a marker IS the table height at that spot.
         table_z_default = round(statistics.median(z for _x, _y, z in recorded.values()), 1)
-        cube_default = prev.cube_height_mm if prev else 30.0
+        cube_default = prev.cube_height_mm if prev else 20.0
         print("\nHeights (robot-frame Z, mm) and gripper -- Enter accepts defaults")
+        # table_z and the cube edge length are prompted first: safe_z's default
+        # (table_z + 1.5*cube) and the parallax model both depend on them.
         table_z = prompt_float("table_z", table_z_default)
         cube = prompt_float("cube edge length", cube_default)
-        pick_z_default = round(grip_pose[0], 1) if grip_pose else round(table_z + cube / 2, 1)
-        pick_z = prompt_float("pick_z", pick_z_default)
-        safe_z = prompt_float("safe_z", prev.safe_z if prev else round(table_z + cube + 40.0, 1))
+        safe_z = prompt_float("safe_z", prev.safe_z if prev else round(table_z + 1.5 * cube, 1))
+        cam_height_default = (
+            prev.cam_height_mm if prev and prev.cam_height_mm is not None else 240.0
+        )
+        # Camera lens height above the table -- a starting value for the overlay
+        # parallax model (calib.robot_to_pixel). For an accurate overlay run
+        # calibrate_camera_nadir.py afterwards: it derives BOTH this height and
+        # the camera nadir (cam_xy_robot) from vision + the arm (grip a cube,
+        # sweep heights, fit), no tape measure needed, and overwrites this. This
+        # prompt only seeds a plausible value / bootstraps setups without the
+        # nadir fit yet.
+        cam_height = prompt_float("camera height above table", cam_height_default)
         grip_close_default = int(grip_pose[1]) if grip_pose else (prev.grip_close_s if prev else 240)
         grip_close = int(prompt_float("grip_close_s", grip_close_default))
         grip_open = int(prompt_float("grip_open_s", prev.grip_open_s if prev else 140))
@@ -501,14 +512,13 @@ def main() -> int:
         calib = Calibration(
             homography=matrix,
             table_z=table_z,
-            pick_z=pick_z,
             safe_z=safe_z,
             grip_open_s=grip_open,
             grip_close_s=grip_close,
             cube_height_mm=cube,
             bundle_homography=report.bundle_h,
             cam_xy_robot=prev.cam_xy_robot if prev else None,
-            cam_height_mm=prev.cam_height_mm if prev else None,
+            cam_height_mm=cam_height,
             color_ranges=prev.color_ranges if prev else {},
             workspace_hull_px=hull.tolist(),
             raw_marker_observations={

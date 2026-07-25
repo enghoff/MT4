@@ -32,7 +32,7 @@ class _StubClient:
 def _calib(**kw) -> Calibration:
     return Calibration(
         homography=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-        table_z=0.0, pick_z=10.0, safe_z=80.0, **kw,
+        table_z=0.0, safe_z=80.0, **kw,
     )
 
 
