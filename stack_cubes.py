@@ -600,17 +600,34 @@ def place_on_stack(
     _check(client.gripper(calib.grip_open_s), "stack release")
     fz = planner.free_retreat_z(level)
     if fz is not None:
-        # Lift straight up clear of the placed cube, then traverse out, as
-        # one queued mq (vertical then horizontal) rather than two blocking
-        # move_to's that stop and settle at the top of the lift. Same fixed
-        # world j4 on both legs as before.
-        retreat = [(sx, sy, fz)]
+        # Retreat AND transit to the camera park in one queued mq: lift
+        # straight up clear of the placed cube, hop off-axis to the stage
+        # exit, then route column-aware to the park pose -- no stop/settle at
+        # the top of the lift, the exit, or (crucially) between the retreat
+        # and the park transit. Folding the transit in here leaves the arm
+        # already parked, so the next capture's go_camera_park() is a
+        # get_tcp + early return instead of a whole separate move.
+        retreat: list[tuple[float, float, float]] = [(sx, sy, fz)]
         exit_pt = planner.stage_point(fz, level, prefer_xy=park_xy)
         if exit_pt is not None:
             retreat.append((exit_pt[0], exit_pt[1], fz))
+        from_xy = exit_pt if exit_pt is not None else (sx, sy)
+        park_route = planner.route(
+            (from_xy[0], from_xy[1], fz),
+            (CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z),
+            level,
+        )
+        if park_route is not None:
+            retreat += park_route
+        # "wrist" holds the J4 *joint* angle across the big base swing to the
+        # park (a fixed world yaw would drive J4 past its soft limits there);
+        # the cube is already released, so wrist orientation is free, and the
+        # short lift/hop legs have no swing so it holds them steady too. If
+        # the park route came back empty, the arm just stops at the exit and
+        # the next go_camera_park() does the transit as before.
         _check(
-            client.move_path(retreat, j4=j4, speed_us=calib.travel_speed_us),
-            f"level {level} retreat",
+            client.move_path(retreat, j4="wrist", speed_us=calib.travel_speed_us),
+            f"level {level} retreat to park",
         )
     else:
         sz = planner.slide_z(level)
