@@ -323,7 +323,6 @@ def main() -> int:
     report: dict = {
         "calib_path": str(Path(args.calib).resolve()),
         "cube_top_homography": "set" if calib.cube_top_homography else "NULL",
-        "pick_z": calib.pick_z,
         "table_z": calib.table_z,
         "cube_height_mm": calib.cube_height_mm,
     }

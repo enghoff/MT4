@@ -87,6 +87,26 @@ def _j4_wire_token(j4: float | str | None) -> str:
     return f"{float(j4):.2f}"
 
 
+def _per_waypoint(value: object, n: int, name: str) -> list:
+    """Normalize a move_path field to one value per waypoint (length ``n``).
+
+    A ``list``/``tuple`` is taken as an explicit per-waypoint sequence (its
+    length must match the waypoint count); anything else -- including a bare
+    ``"wrist"``/``"hold"`` sentinel or ``None`` -- is a single value
+    broadcast to every leg. The firmware carries speed and J4 mode on each
+    queued ``mq`` leg independently (see MpWaypoint in motion.cpp), so this
+    is what lets one queued path mix, e.g., fast transit legs with a slow
+    final descent, or a per-leg wrist mode.
+    """
+    if isinstance(value, (list, tuple)):
+        if len(value) != n:
+            raise Mt4ClientError(
+                f"move_path: {name} has {len(value)} value(s) for {n} waypoint(s)"
+            )
+        return list(value)
+    return [value] * n
+
+
 class Mt4Client:
     """Thread-safe owner of the MT4 serial connection."""
 
@@ -102,6 +122,18 @@ class Mt4Client:
         # (to default J4 / check homed) while already holding the lock.
         self._lock = threading.RLock()
         self._interrupt = threading.Event()
+        # Optional duck-typed sink (e.g. mt4_vision.preview.LiveFeed) a
+        # caller can point at to get every move_to()/move_path() drawn as a
+        # live overlay: set_trajectory(waypoints) when the move is sent,
+        # clear_trajectory() once the call returns. No import here so
+        # mt4_jog stays independent of mt4_vision.
+        self.trajectory_sink = None
+        # Last robot-frame TCP (x, y, z) this client has seen reported by
+        # firmware (status probe or a move's own final "tcp ..." line).
+        # Prepended to the trajectory_sink overlay so it shows the leg from
+        # wherever the arm actually is, not just the requested waypoints.
+        # None until the first status read or completed move this session.
+        self._last_tcp: tuple[float, float, float] | None = None
 
     @property
     def connected(self) -> bool:
@@ -197,7 +229,9 @@ class Mt4Client:
             status = parse_status_lines(lines)
             status.parse_failed = status.tcp is None and not status.joints
             if not status.parse_failed:
-                return status
+                break
+        if status.tcp is not None:
+            self._last_tcp = (status.tcp.x, status.tcp.y, status.tcp.z)
         return status
 
     def get_status(self) -> Mt4Status:
@@ -390,6 +424,26 @@ class Mt4Client:
                         return {"ok": False, "error": line, "lines": collected}
             return {"ok": False, "error": "Homing timed out", "lines": collected}
 
+    def _notify_trajectory(
+        self, waypoints: list[tuple[float, float, float]], multi: bool,
+    ) -> None:
+        sink = self.trajectory_sink
+        if sink is None:
+            return
+        # Lead with the arm's last known position (if any) so the overlay
+        # draws the whole path starting from wherever it actually is, not
+        # just the requested waypoints.
+        points = [self._last_tcp, *waypoints] if self._last_tcp is not None else list(waypoints)
+        # `multi` is the command kind (move_to vs move_path/mq), not the leg
+        # count -- so a 1-waypoint move_path still colors as a queued path,
+        # and the prepended start point can't flip a move_to's color.
+        sink.set_trajectory(points, multi)
+
+    def _clear_trajectory(self) -> None:
+        sink = self.trajectory_sink
+        if sink is not None:
+            sink.clear_trajectory()
+
     def move_to(
         self,
         x: float,
@@ -427,34 +481,49 @@ class Mt4Client:
             )
         j4_token = _j4_wire_token(j4)
 
-        with self._lock:
-            self._ensure_connected_unlocked()
-            # Firmware line_buf is 64 bytes; full Python float repr of
-            # detection XY + j4 + speed easily overflows and truncates mid-
-            # token (parse fails with the usage string). Match the firmware's
-            # own 0.1mm / 0.1deg reporting precision.
-            cmd = f"mp {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(grip)}"
-            if speed_us:
-                cmd += f" {int(speed_us)}"
-            if len(cmd) >= 64:
-                raise Mt4ClientError(
-                    f"mp command exceeds 64-byte firmware line buffer: {cmd!r}"
+        self._notify_trajectory([(x, y, z)], multi=False)
+        try:
+            with self._lock:
+                self._ensure_connected_unlocked()
+                # Firmware line_buf is 64 bytes; full Python float repr of
+                # detection XY + j4 + speed easily overflows and truncates mid-
+                # token (parse fails with the usage string). Match the firmware's
+                # own 0.1mm / 0.1deg reporting precision.
+                cmd = f"mp {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(grip)}"
+                if speed_us:
+                    cmd += f" {int(speed_us)}"
+                if len(cmd) >= 64:
+                    raise Mt4ClientError(
+                        f"mp command exceeds 64-byte firmware line buffer: {cmd!r}"
+                    )
+                collected = self._send_and_collect(cmd, wait=1.0)
+                if any(line.startswith("err not homed") for line in collected):
+                    raise Mt4ClientError(
+                        "Arm has not homed this session -- call home() first"
+                    )
+                result = self._await_completion(
+                    done_prefix="mp done", timeout=timeout, collected=collected
                 )
-            collected = self._send_and_collect(cmd, wait=1.0)
-            if any(line.startswith("err not homed") for line in collected):
-                raise Mt4ClientError(
-                    "Arm has not homed this session -- call home() first"
-                )
-            return self._await_completion(
-                done_prefix="mp done", timeout=timeout, collected=collected
-            )
+                if result.get("ok"):
+                    # The arm is now at the commanded target, so anchor the
+                    # next overlay's origin there directly. _await_completion's
+                    # "tcp" is unreliable for this -- the firmware prints the
+                    # "tcp ..." pose a few ms AFTER "mp done", usually in a
+                    # later read than the one that satisfies completion, so it
+                    # is typically absent here; depending on it left _last_tcp
+                    # frozen and every following move_to drew from the same
+                    # stale point.
+                    self._last_tcp = (x, y, z)
+                return result
+        finally:
+            self._clear_trajectory()
 
     def move_path(
         self,
         waypoints: list[tuple[float, float, float]],
-        j4: float | str | None = None,
+        j4: float | str | None | list[float | str | None] = None,
         grip: int = 0,
-        speed_us: int = 0,
+        speed_us: int | list[int] = 0,
         timeout: float = MOVE_TIMEOUT_S,
     ) -> dict[str, object]:
         """Move through a sequence of Cartesian waypoints as one continuous
@@ -490,6 +559,18 @@ class Mt4Client:
         this safe to use as the awaited finisher after raw `queue_move()`
         calls.
 
+        `j4` and `speed_us` may also be given as a per-waypoint list (same
+        length as `waypoints`) instead of one value broadcast to all legs --
+        each queued `mq` leg carries its own speed and J4 mode on the
+        firmware (MpWaypoint in motion.cpp), so a single path can run fast
+        transit legs and then a slow final descent, or vary the wrist mode
+        per leg. A scalar (or bare "hold"/"wrist"/None) still applies to
+        every leg.
+
+        `speed_us` is the per-leg step period (0 leaves the current one
+        unchanged); each list entry must be 0 or within
+        [JOG_SPEED_MIN_US, JOG_SPEED_MAX_US].
+
         `grip` (if nonzero) fires on the FIRST leg only, matching a single
         `move_to()` call's semantics -- for a gripper action partway through
         a route, call `gripper()` directly between `move_path()` calls
@@ -504,10 +585,12 @@ class Mt4Client:
                 f"move_path: at most {MQ_QUEUE_CAPACITY + 1} waypoints per "
                 f"call (firmware `mq` queue holds {MQ_QUEUE_CAPACITY})"
             )
-        if speed_us and not JOG_SPEED_MIN_US <= speed_us <= JOG_SPEED_MAX_US:
-            raise Mt4ClientError(
-                f"speed_us must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US}"
-            )
+        speeds = _per_waypoint(speed_us, len(waypoints), "speed_us")
+        for s in speeds:
+            if s and not JOG_SPEED_MIN_US <= s <= JOG_SPEED_MAX_US:
+                raise Mt4ClientError(
+                    f"speed_us must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US} (got {s})"
+                )
         if grip and not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
             raise Mt4ClientError(
                 f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
@@ -518,15 +601,31 @@ class Mt4Client:
                     f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
                 )
 
-        j4_token = _j4_wire_token(j4)
+        j4_tokens = [
+            _j4_wire_token(v) for v in _per_waypoint(j4, len(waypoints), "j4")
+        ]
 
+        self._notify_trajectory(waypoints, multi=True)
+        try:
+            return self._move_path_locked(waypoints, j4_tokens, grip, speeds, timeout)
+        finally:
+            self._clear_trajectory()
+
+    def _move_path_locked(
+        self,
+        waypoints: list[tuple[float, float, float]],
+        j4_tokens: list[str],
+        grip: int,
+        speeds: list[int],
+        timeout: float,
+    ) -> dict[str, object]:
         with self._lock:
             self._ensure_connected_unlocked()
 
-            def build_cmd(x: float, y: float, z: float, g: int) -> str:
-                cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(g)}"
-                if speed_us:
-                    cmd += f" {int(speed_us)}"
+            def build_cmd(i: int, x: float, y: float, z: float, g: int) -> str:
+                cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_tokens[i]} {int(g)}"
+                if speeds[i]:
+                    cmd += f" {int(speeds[i])}"
                 if len(cmd) >= 64:
                     raise Mt4ClientError(
                         f"mq command exceeds 64-byte firmware line buffer: {cmd!r}"
@@ -581,7 +680,7 @@ class Mt4Client:
                 return {"ok": False, "error": error, "lines": collected}
 
             for i, (x, y, z) in enumerate(waypoints):
-                cmd = build_cmd(x, y, z, grip if i == 0 else 0)
+                cmd = build_cmd(i, x, y, z, grip if i == 0 else 0)
                 batch = self._send_and_collect(cmd, wait=0.5)
                 collected.extend(batch)
                 err = scan(batch)
@@ -624,6 +723,12 @@ class Mt4Client:
                 tcp = parse_tcp_line(line)
                 if tcp is not None:
                     break
+            # Anchor the next overlay's origin at the commanded endpoint (the
+            # arm is now there), matching move_to and staying correct even if
+            # the trailing "tcp ..." line above was dropped or garbled. The
+            # parsed tcp is still returned below for callers that want the
+            # firmware-reported pose.
+            self._last_tcp = waypoints[-1]
             return {
                 "ok": True,
                 "lines": collected,

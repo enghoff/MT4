@@ -58,6 +58,7 @@ from mt4_vision.pickplace import (
     pick,
     pick_centered,
     place,
+    resolve_pick_j4,
     retreat_for_camera,
     routed_travel,
 )
@@ -541,11 +542,11 @@ def release_z_for_level(calib, level: int) -> float:
     """TCP release height: 4mm above the current stack top.
 
     Stack top before placing ``level`` (1-based) is the top of the uppermost
-    cube already seated -- ``pick_z + (level-1)*cube_height_mm`` in the same
+    cube already seated -- ``table_z + (level-1)*cube_height_mm`` in the same
     TCP frame as table grips (empty marker when level==1). Mirrors
     ``StackPlanner.release_z``.
     """
-    stack_top = float(calib.pick_z) + (level - 1) * float(calib.cube_height_mm)
+    stack_top = float(calib.table_z) + (level - 1) * float(calib.cube_height_mm)
     return stack_top + 4.0
 
 
@@ -560,10 +561,13 @@ def place_on_stack(
     """Carry the held cube to the site and seat it as ``level``.
 
     Assumes ``level - 1`` cubes are already stacked and the cube is held at
-    the pick location around ``safe_z``. Sequence:
+    the pick location -- at grab height (``pick_centered(lift_after=False)``,
+    the lift folded into the carry here) or at ``safe_z`` (``lift_to`` is a
+    no-op then). Sequence:
 
-    1. carry: routed (usually one diagonal ``mp``) to a stage point
-       STAGE_OFFSET_MM beside the stack, arriving at hover height
+    1. carry: vertical lift to ``safe_z``, then routed (usually one diagonal
+       ``mp``) to a stage point STAGE_OFFSET_MM beside the stack, arriving at
+       hover height -- lift + route + hop + descend all one queued mq
     2. hop over the stack top at hover, slow descend, release
     3. retreat: lift free when the z ceiling allows the fingertips above
        the placed cube (levels <= ~8), else lift a few mm and slide out
@@ -586,22 +590,55 @@ def place_on_stack(
     )
     if stage is None:
         raise Mt4ClientError(f"level {level}: no reachable hover stage")
+    # Lift the just-gripped cube straight up to safe_z (``lift_to``, held at
+    # wrist so the gripped orientation is preserved -- a no-op if already
+    # high), route to the stage point beside the column, hop horizontally
+    # over the stack top to (sx, sy), then descend to release height -- lift +
+    # route + hop + descend all one queued mq, so there's no stop/settle
+    # after the grip, at the stage point, OR at hover over the stack. The
+    # vertical lift stays clear of pick-site neighbours (route()'s safety
+    # model covers the column, not the table); the hop clears the column by
+    # construction (hz = hover height, fingers above the top cube); the
+    # descend is a pure vertical drop down the column axis to rz, run slow
+    # (approach speed) like the old standalone _approach so the cube seats at
+    # the same speed.
     routed_travel(
         client, calib, planner, stage[0], stage[1], hz, built,
-        j4=j4, step=f"level {level} carry",
+        j4=j4, lift_to=calib.safe_z, then=[(sx, sy, hz)], descend=(sx, sy, rz),
+        step=f"level {level} carry+seat",
     )
-    _travel(client, calib, sx, sy, hz, "hover over stack", j4=j4)
-    _approach(client, calib, sx, sy, rz, "descend to stack release", j4=j4)
     _check(client.gripper(calib.grip_open_s), "stack release")
     fz = planner.free_retreat_z(level)
     if fz is not None:
-        _travel(client, calib, sx, sy, fz, "retreat lift", j4=j4)
+        # Retreat AND transit to the camera park in one queued mq: lift
+        # straight up clear of the placed cube, hop off-axis to the stage
+        # exit, then route column-aware to the park pose -- no stop/settle at
+        # the top of the lift, the exit, or (crucially) between the retreat
+        # and the park transit. Folding the transit in here leaves the arm
+        # already parked, so the next capture's go_camera_park() is a
+        # get_tcp + early return instead of a whole separate move.
+        retreat: list[tuple[float, float, float]] = [(sx, sy, fz)]
         exit_pt = planner.stage_point(fz, level, prefer_xy=park_xy)
         if exit_pt is not None:
-            _travel(
-                client, calib, exit_pt[0], exit_pt[1], fz,
-                "retreat clear", j4=j4,
-            )
+            retreat.append((exit_pt[0], exit_pt[1], fz))
+        from_xy = exit_pt if exit_pt is not None else (sx, sy)
+        park_route = planner.route(
+            (from_xy[0], from_xy[1], fz),
+            (CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z),
+            level,
+        )
+        if park_route is not None:
+            retreat += park_route
+        # "wrist" holds the J4 *joint* angle across the big base swing to the
+        # park (a fixed world yaw would drive J4 past its soft limits there);
+        # the cube is already released, so wrist orientation is free, and the
+        # short lift/hop legs have no swing so it holds them steady too. If
+        # the park route came back empty, the arm just stops at the exit and
+        # the next go_camera_park() does the transit as before.
+        _check(
+            client.move_path(retreat, j4="wrist", speed_us=calib.travel_speed_us),
+            f"level {level} retreat to park",
+        )
     else:
         sz = planner.slide_z(level)
         exits = planner.slide_exits(j4, level, prefer_xy=park_xy)
@@ -714,6 +751,7 @@ def main() -> int:
         if stream is not None
         else None
     )
+    client.trajectory_sink = live_feed
 
     def snap_scene(stage: str) -> Scene:
         if live_feed is not None:
@@ -1006,15 +1044,27 @@ def main() -> int:
                     cube, f"Level {level}/{target_levels}: picking {cube.color}",
                 )
                 if built > 0:
-                    # Column-aware transit to the pick before descending.
+                    # Column-aware transit to the pick, arriving already
+                    # face-aligned (final_j4) AND descended to grab height in
+                    # the same queued mq (descend leg, slow), so pick_centered
+                    # skips both its align move and its first descend.
+                    approach_j4 = resolve_pick_j4(
+                        client, calib, cube.yaw_deg,
+                        face_align=bool(getattr(calib, "face_align_picks", True)),
+                        x=float(cube.x), y=float(cube.y),
+                    )
                     routed_travel(
                         client, calib, planner,
                         float(cube.x), float(cube.y), calib.safe_z,
-                        built, step="approach pick",
+                        built, final_j4=approach_j4,
+                        descend=(float(cube.x), float(cube.y), calib.table_z),
+                        step="approach pick",
                     )
+                # lift_after=False leaves the gripped cube at grab height;
+                # place_on_stack folds the lift-off into its carry mq.
                 pick_centered(
                     client, calib, float(cube.x), float(cube.y),
-                    yaw_deg=cube.yaw_deg,
+                    yaw_deg=cube.yaw_deg, lift_after=False,
                 )
                 print(
                     f"  placing at marker ({sx:.1f},{sy:.1f}) "

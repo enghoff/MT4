@@ -72,7 +72,7 @@ def test_beyond_max_reach_marker_not_placeable():
     """Markers past MAX_REACH_MM must not be place targets.
 
     Keep-out alone is insufficient: live marker 1 (~354mm) is reachable at
-    pick_z but not at safe_z, so every transit failed with mp unreachable.
+    table_z but not at safe_z, so every transit failed with mp unreachable.
     """
     from mt4_vision.workspace import MAX_REACH_MM
 

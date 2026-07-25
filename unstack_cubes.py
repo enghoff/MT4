@@ -256,7 +256,7 @@ def pick_from_stack(
     Mirrors ``place_on_stack`` (stack_cubes.py) in reverse: hover in over
     the column at the same clearance height that cube was placed at,
     descend to the same grip line stack_cubes.py used to seat it
-    (``grip_top_z(level - 1)`` -- identical to a table ``pick_z`` shifted
+    (``grip_top_z(level - 1)`` -- identical to a table ``table_z`` grip shifted
     up by the cubes still below it), close the gripper, then lift straight
     back out along the column axis before transiting away. Column obstacle
     height is ``level`` (this cube hasn't left yet) for the approach and
@@ -385,6 +385,7 @@ def main() -> int:
         if stream is not None
         else None
     )
+    client.trajectory_sink = live_feed
 
     def snap_obstacles(levels: int) -> list[tuple[float, float]]:
         """Pre-existing loose cubes to steer clear of, from one clear-view scan."""
