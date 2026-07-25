@@ -78,6 +78,22 @@ def test_then_and_descend_both_appended():
     assert all(s == CALIB.travel_speed_us for s in speed[:-1])
 
 
+def test_place_shape_holds_j4_with_slow_descend():
+    # place_on_stack carry+seat shape: an explicit square wrist on every leg,
+    # a hop over the stack top, then a slow vertical descend to release. The
+    # uniform wrist collapses to a scalar; only the drop is slow.
+    client = _RecordingClient(_Tcp(200.0, 0.0, 260.0))
+    routed_travel(
+        client, CALIB, _planner(), 220.0, -60.0, CALIB.safe_z, 0,
+        j4=12.5, then=[(230.0, -50.0, CALIB.safe_z)],
+        descend=(230.0, -50.0, CALIB.pick_z), step="t",
+    )
+    _wps, j4, speed = client.calls[-1]
+    assert j4 == 12.5  # every leg holds the square wrist (scalar, collapsed)
+    assert speed[-1] == int(CALIB.approach_speed_us)
+    assert all(s == CALIB.travel_speed_us for s in speed[:-1])
+
+
 def test_final_j4_holds_from_arrival_onward():
     # a->b detours around the level-6 column, so the route has a genuine
     # transit leg (wrist) distinct from the arrival leg (final_j4).
