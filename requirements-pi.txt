@@ -1,0 +1,16 @@
+# Optional: pi0.5 (OpenPI) remote-inference client for mt4_pi/.
+# Not required for arm/vision/MCP core use -- see docs/pi0.5-integration.md.
+#
+# openpi-client declares numpy<2.0.0, which is incompatible with this
+# project's numpy>=1.26 (opencv-python needs numpy 2.x here). Its actual code
+# only uses stable ndarray/dtype APIs, so install its other deps normally and
+# add the package itself with --no-deps to avoid a numpy downgrade:
+#
+#   pip install -r requirements-pi.txt
+#   pip install --no-deps -e ./openpi-client
+
+dm-tree>=0.1.8
+msgpack>=1.0.5
+pillow>=9.0.0
+websockets>=11.0
+typing_extensions>=4.0
