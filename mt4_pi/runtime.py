@@ -3,11 +3,9 @@
 https://github.com/enghoff/pi0.5-server/blob/master/docs/mt4-client-integration.md,
 "Reference loop".
 
-Execution is deliberately inert. The server currently runs pi05_droid, a
-7-DoF Franka policy that has never seen an MT4 -- its outputs are
-dimensionally valid and finite but are not real MT4 commands.
-`client.queue_move()` must stay commented out below until an MT4-specific
-fine-tune exists (see that doc's "Cutover to the MT4 fine-tune").
+MEDIA now serves pi05_mt4_lora_merged (LoRA fine-tuned on real MT4
+cube-shuffle demonstrations, see docs/PI05_FINETUNING_PIPELINE.md) rather
+than the stock pi05_droid Franka policy, so client.queue_move() is enabled.
 """
 
 from __future__ import annotations
@@ -34,8 +32,8 @@ INFERENCE_TIMEOUT_S = 5.0
 
 
 def run(client: Mt4Client, policy: PolicyClient, prompt: str, *, max_ticks: int | None = None) -> None:
-    """One control-loop pass per action chunk. Logs every proposed waypoint;
-    never calls client.queue_move().
+    """One control-loop pass per action chunk. Logs and executes every
+    waypoint that passes safety.validate().
     """
     tick = 0
     while max_ticks is None or tick < max_ticks:
@@ -77,8 +75,8 @@ def run(client: Mt4Client, policy: PolicyClient, prompt: str, *, max_ticks: int 
                 break
 
             waypoint = adapter.to_waypoint(target, grip)
-            logger.info("proposed waypoint (not executed): %s", waypoint)
-            # client.queue_move(waypoint.x, waypoint.y, waypoint.z, waypoint.j4, waypoint.grip)
+            logger.info("executing waypoint: %s", waypoint)
+            client.queue_move(waypoint.x, waypoint.y, waypoint.z, waypoint.j4, waypoint.grip)
             q = target
 
         tick += 1
