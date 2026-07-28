@@ -33,6 +33,7 @@ import random
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from jog import console_focused, flush_console_input, key_down
@@ -42,6 +43,7 @@ from mt4_vision.camera import FrameStream, capture_frame
 from mt4_vision.pickplace import (
     CAMERA_PARK_X,
     CAMERA_PARK_Y,
+    MoveEvent,
     _approach,
     _travel,
     ensure_homed,
@@ -250,6 +252,7 @@ def pick_from_stack(
     level: int,
     *,
     approach_prefer_xy: tuple[float, float],
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> None:
     """Take the level-``level`` cube off the top of the column.
 
@@ -261,6 +264,10 @@ def pick_from_stack(
     back out along the column axis before transiting away. Column obstacle
     height is ``level`` (this cube hasn't left yet) for the approach and
     grasp, dropping to ``level - 1`` once it's lifted clear.
+
+    ``on_waypoint``, when given, is called once per leg of every queued move
+    below plus once for each gripper open/close -- see ``place_on_stack``'s
+    docstring for why (mirrors ``pick()``'s convention).
     """
     sx, sy = planner.sx, planner.sy
     ensure_homed(client)
@@ -275,21 +282,34 @@ def pick_from_stack(
     stage = planner.stage_point(hz, level, prefer_xy=(float(tcp.x), float(tcp.y)))
     if stage is None:
         raise Mt4ClientError(f"level {level}: no reachable hover stage")
+    open_started = time.monotonic()
     client.gripper(calib.grip_open_s)
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "open before descend", grip=calib.grip_open_s, started_at=open_started,
+        ))
     routed_travel(
         client, calib, planner, stage[0], stage[1], hz, level,
-        j4=j4, step=f"level {level} approach",
+        j4=j4, step=f"level {level} approach", on_waypoint=on_waypoint,
     )
-    _travel(client, calib, sx, sy, hz, "hover over stack", j4=j4)
-    _approach(client, calib, sx, sy, grip_z, "descend to stack grip", j4=j4)
+    _travel(client, calib, sx, sy, hz, "hover over stack", j4=j4, on_waypoint=on_waypoint)
+    _approach(client, calib, sx, sy, grip_z, "descend to stack grip", j4=j4, on_waypoint=on_waypoint)
+    close_started = time.monotonic()
     result = client.gripper(calib.grip_close_s)
     if not result.get("ok"):
         _travel(client, calib, sx, sy, hz, "lift after failed grip")
         raise Mt4ClientError(f"stack gripper close failed: {result}")
-    _travel(client, calib, sx, sy, hz, "lift clear of stack", j4=j4)
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "grip", grip=calib.grip_close_s, started_at=close_started,
+        ))
+    _travel(client, calib, sx, sy, hz, "lift clear of stack", j4=j4, on_waypoint=on_waypoint)
     exit_pt = planner.stage_point(hz, level - 1, prefer_xy=approach_prefer_xy)
     if exit_pt is not None:
-        _travel(client, calib, exit_pt[0], exit_pt[1], hz, "exit stack hover", j4=j4)
+        _travel(
+            client, calib, exit_pt[0], exit_pt[1], hz, "exit stack hover",
+            j4=j4, on_waypoint=on_waypoint,
+        )
 
 
 def main() -> int:

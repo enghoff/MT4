@@ -32,6 +32,7 @@ import math
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -48,8 +49,10 @@ from mt4_vision.pickplace import (
     CAMERA_PARK_X,
     CAMERA_PARK_Y,
     CAMERA_PARK_Z,
+    MoveEvent,
     _approach,
     _check,
+    _emit_path_waypoints,
     _travel,
     go_camera_park,
     home_arm,
@@ -557,6 +560,7 @@ def place_on_stack(
     level: int,
     *,
     park_xy: tuple[float, float],
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> None:
     """Carry the held cube to the site and seat it as ``level``.
 
@@ -573,6 +577,11 @@ def place_on_stack(
        the placed cube (levels <= ~8), else lift a few mm and slide out
        perpendicular to the jaw axis so the open fingers sweep off the
        cube faces without pushing it (level 9's only option)
+
+    ``on_waypoint``, when given, is called once per leg of every queued move
+    below (see ``_emit_path_waypoints``) and once for the release -- mirrors
+    ``place()``'s convention so ``mt4_pi.collect`` can record a stacking
+    episode exactly like a table pick/place.
     """
     sx, sy = planner.sx, planner.sy
     built = level - 1
@@ -605,9 +614,14 @@ def place_on_stack(
     routed_travel(
         client, calib, planner, stage[0], stage[1], hz, built,
         j4=j4, lift_to=calib.safe_z, then=[(sx, sy, hz)], descend=(sx, sy, rz),
-        step=f"level {level} carry+seat",
+        step=f"level {level} carry+seat", on_waypoint=on_waypoint,
     )
+    release_started = time.monotonic()
     _check(client.gripper(calib.grip_open_s), "stack release")
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "release", grip=calib.grip_open_s, started_at=release_started,
+        ))
     fz = planner.free_retreat_z(level)
     if fz is not None:
         # Retreat AND transit to the camera park in one queued mq: lift
@@ -635,21 +649,29 @@ def place_on_stack(
         # short lift/hop legs have no swing so it holds them steady too. If
         # the park route came back empty, the arm just stops at the exit and
         # the next go_camera_park() does the transit as before.
+        retreat_started = time.monotonic()
         _check(
             client.move_path(retreat, j4="wrist", speed_us=calib.travel_speed_us),
             f"level {level} retreat to park",
         )
+        if on_waypoint is not None:
+            _emit_path_waypoints(
+                on_waypoint, f"level {level} retreat to park",
+                (sx, sy, rz), retreat, ["wrist"] * len(retreat),
+                [calib.travel_speed_us] * len(retreat),
+                retreat_started, time.monotonic(),
+            )
     else:
         sz = planner.slide_z(level)
         exits = planner.slide_exits(j4, level, prefer_xy=park_xy)
         if not exits:
             raise Mt4ClientError(f"level {level}: no jaw-safe slide retreat")
         if sz > rz + 0.5:
-            _travel(client, calib, sx, sy, sz, "slide lift", j4=j4)
+            _travel(client, calib, sx, sy, sz, "slide lift", j4=j4, on_waypoint=on_waypoint)
         # Slow and wrist-locked: the fingers still straddle the placed cube.
         _approach(
             client, calib, exits[0][0], exits[0][1], sz,
-            "slide clear of stack", j4=j4,
+            "slide clear of stack", j4=j4, on_waypoint=on_waypoint,
         )
 
 

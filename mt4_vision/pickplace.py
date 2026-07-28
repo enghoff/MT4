@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_jog.joints import JOINT_SOFT_MAX_STEPS, JOINT_SOFT_MIN_STEPS, JOG_SPEED_MIN_US
@@ -96,6 +98,43 @@ def _check(result: dict[str, object], step: str) -> dict[str, object]:
     return result
 
 
+@dataclass(frozen=True)
+class MoveEvent:
+    """One completed client.move_to()/gripper() call within pick()/place().
+
+    Fired via ``on_waypoint`` for callers (e.g. mt4_pi.collect) that want
+    the actual commanded waypoints instead of reconstructing them after the
+    fact. Any field left None means "unchanged from the previous event" --
+    the same convention Mt4Client.move_to's own ``grip=0`` already uses.
+
+    ``started_at`` is ``time.monotonic()`` sampled immediately *before* the
+    blocking call, so a consumer can tell motion apart from the dead time
+    that precedes it. That dead time is not small: place() alone spends
+    ensure_homed + resolve_place_j4 + get_tcp -- up to three ``?`` round
+    trips at ~200ms each (mt4_jog.serial.send: 50ms write settle + reply +
+    100ms quiet gap) -- standing still before its first move goes out.
+    Without this field a consumer interpolating between event *arrival*
+    times smears that stall across the leg as if the arm were flying.
+
+    ``ended_at`` is when this waypoint was actually reached. It is None for
+    a plain blocking move -- the consumer can use its own receive time,
+    which is the same instant. It is set only when several waypoints are
+    reported after ONE queued call (move_path/mq): those all return
+    together, so without an explicit per-leg end time a consumer would see
+    the arm teleport through the whole route at the moment the call
+    returned. See ``_emit_path_waypoints``.
+    """
+
+    step: str
+    x: float | None = None
+    y: float | None = None
+    z: float | None = None
+    j4: float | None = None
+    grip: int | None = None
+    started_at: float | None = None
+    ended_at: float | None = None
+
+
 def _travel(
     client: Mt4Client,
     calib: Calibration,
@@ -105,15 +144,92 @@ def _travel(
     step: str,
     *,
     j4: float | str | None = None,
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> dict[str, object]:
     """Horizontal or lift move at safe travel speed (firmware mp ramp active)."""
-    return _check(
+    started = time.monotonic()
+    result = _check(
         client.move_to(
             x, y, z, j4=_resolve_travel_j4(j4),
             speed_us=calib.travel_speed_us,
         ),
         step,
     )
+    if on_waypoint is not None:
+        # j4 may be the "hold"/"wrist" firmware sentinel (None or "wrist"),
+        # resolved on-device -- only report it when the caller gave us a
+        # concrete world-frame angle.
+        on_waypoint(MoveEvent(
+            step, x, y, z,
+            j4 if isinstance(j4, (int, float)) else None,
+            started_at=started,
+        ))
+    return result
+
+
+def _emit_path_waypoints(
+    on_waypoint: Callable[[MoveEvent], None],
+    step: str,
+    start_xyz: tuple[float, float, float],
+    wps: list[tuple[float, float, float]],
+    j4_list: list[object],
+    speeds: list[int],
+    started: float,
+    ended: float,
+) -> None:
+    """Report one MoveEvent per leg of a completed queued (mq) path.
+
+    A queued path is ONE blocking call covering several legs, so there is no
+    per-leg completion time to observe. Reporting a single event at the end
+    would make a consumer interpolate a straight line from the start pose to
+    the final pose -- but these routes are deliberately non-straight (lift
+    up, route across, hop over the column, descend down its axis), so that
+    line runs through poses the arm was never at, and any frame captured
+    mid-carry gets labelled with one. That is worse than coarse: it is
+    confidently wrong, in a way a model trained on it would learn.
+
+    So split the measured wall duration across legs by ``length * speed_us``
+    -- speed_us is microseconds per step, so a leg's time scales with both
+    how far it goes and how slow it is run. That matters here because the
+    final ``descend`` leg runs at approach speed (several times slower than
+    travel), and weighting by distance alone would give that leg a small
+    slice of time it does not take. Still an approximation: the firmware's
+    accel ramp across the queue is not modeled, same caveat as
+    WaypointLog.state_at.
+    """
+    legs: list[tuple[tuple[float, float, float], float]] = []
+    prev = start_xyz
+    for i, wp in enumerate(wps):
+        speed = float(speeds[i]) if i < len(speeds) else 1.0
+        legs.append((wp, math.dist(prev, wp) * max(speed, 1.0)))
+        prev = wp
+    total = sum(w for _, w in legs)
+    span = max(ended - started, 0.0)
+    # Degenerate (zero-length path): report the endpoint once rather than
+    # dividing by zero or emitting nothing at all.
+    if total <= 0.0:
+        wp = wps[-1]
+        j4 = j4_list[-1] if j4_list else None
+        on_waypoint(MoveEvent(
+            step, wp[0], wp[1], wp[2],
+            j4 if isinstance(j4, (int, float)) else None,
+            started_at=started, ended_at=ended,
+        ))
+        return
+    elapsed = 0.0
+    leg_start = started
+    for i, (wp, weight) in enumerate(legs):
+        elapsed += weight
+        leg_end = started + span * (elapsed / total)
+        j4 = j4_list[i] if i < len(j4_list) else None
+        on_waypoint(MoveEvent(
+            f"{step} leg {i + 1}/{len(legs)}", wp[0], wp[1], wp[2],
+            # "wrist"/None are firmware sentinels resolved on-device -- only
+            # report a concrete world-frame angle.
+            j4 if isinstance(j4, (int, float)) else None,
+            started_at=leg_start, ended_at=leg_end,
+        ))
+        leg_start = leg_end
 
 
 # Within this radius of a stack axis, motion must be pure horizontal or pure
@@ -157,6 +273,7 @@ def travel_orthogonal(
     step: str,
     *,
     j4: float | None = None,
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> None:
     """Reach (x, y, z) via vertical-then-horizontal segments (no XYZ diagonal).
 
@@ -172,6 +289,7 @@ def travel_orthogonal(
     if same_xy and same_z:
         return
     if not same_z and not same_xy:
+        started = time.monotonic()
         _check(
             client.move_path(
                 [(float(tcp.x), float(tcp.y), z), (x, y, z)],
@@ -180,14 +298,23 @@ def travel_orthogonal(
             ),
             step,
         )
+        if on_waypoint is not None:
+            _emit_path_waypoints(
+                on_waypoint, step,
+                (float(tcp.x), float(tcp.y), float(tcp.z)),
+                [(float(tcp.x), float(tcp.y), z), (x, y, z)],
+                [j4 if isinstance(j4, (int, float)) else None] * 2,
+                [calib.travel_speed_us, calib.travel_speed_us],
+                started, time.monotonic(),
+            )
         return
     if not same_z:
         _travel(
             client, calib, float(tcp.x), float(tcp.y), z,
-            f"{step}: vertical", j4=j4,
+            f"{step}: vertical", j4=j4, on_waypoint=on_waypoint,
         )
     else:
-        _travel(client, calib, x, y, z, f"{step}: horizontal", j4=j4)
+        _travel(client, calib, x, y, z, f"{step}: horizontal", j4=j4, on_waypoint=on_waypoint)
 
 
 def _approach(
@@ -199,15 +326,24 @@ def _approach(
     step: str,
     *,
     j4: float | str | None = None,
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> dict[str, object]:
     """Slow final descent near the table (firmware ramp off)."""
-    return _check(
+    started = time.monotonic()
+    result = _check(
         client.move_to(
             x, y, z, j4=_resolve_travel_j4(j4),
             speed_us=calib.approach_speed_us,
         ),
         step,
     )
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            step, x, y, z,
+            j4 if isinstance(j4, (int, float)) else None,
+            started_at=started,
+        ))
+    return result
 
 
 # Camera-clear parking spot for between-move captures: the homed TCP pose.
@@ -273,6 +409,7 @@ def routed_travel(
     lift_to: float | None = None,
     descend: tuple[float, float, float] | None = None,
     step: str = "stack transit",
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> None:
     """Travel to (x, y, z) along a StackPlanner route (direct when safe).
 
@@ -322,6 +459,11 @@ def routed_travel(
     Shared by stack_cubes.py (levels grows as cubes are added) and
     unstack_cubes.py (levels shrinks as cubes come off) -- both route
     around the same column, so the safety model must stay identical.
+
+    ``on_waypoint``, when given, fires once per leg of the resulting queued
+    path (lift + route + then + descend), NOT once for the whole call -- see
+    ``_emit_path_waypoints`` for why a single end-of-call event would be
+    actively misleading for a route this shaped.
     """
     tcp = client.get_tcp()
     if tcp is None:
@@ -369,7 +511,13 @@ def routed_travel(
     # and existing behavior are unchanged; only mixed legs go out as lists.
     j4_arg: object = j4_list[0] if all(v == j4_list[0] for v in j4_list) else j4_list
     speed_arg: object = speeds[0] if all(s == speeds[0] for s in speeds) else speeds
+    started = time.monotonic()
     _check(client.move_path(all_wps, j4=j4_arg, speed_us=speed_arg), step)
+    if on_waypoint is not None:
+        _emit_path_waypoints(
+            on_waypoint, step, cur, all_wps, j4_list, speeds,
+            started, time.monotonic(),
+        )
 
 
 def go_camera_park(
@@ -461,6 +609,7 @@ def pick(
     *,
     yaw_deg: float | None = None,
     face_align: bool | None = None,
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> dict[str, object]:
     """Grip a cube at robot-frame (x, y): open, descend, close, lift.
 
@@ -468,6 +617,10 @@ def pick(
     face-align is enabled, world-frame J4 is commanded so the jaws meet a
     face rather than a corner. Face-align defaults on and assumes firmware
     ``j4zero`` (``calibrate_j4.py``): world J4 = 0 means jaws along the arm.
+
+    ``on_waypoint``, when given, is called with a ``MoveEvent`` after every
+    completed move/grip in the sequence -- see that class for the "None
+    means unchanged" convention.
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "pick target")
@@ -476,16 +629,26 @@ def pick(
     j4 = resolve_pick_j4(
         client, calib, yaw_deg, face_align=face_align, x=x, y=y,
     )
+    open_started = time.monotonic()
     client.gripper(calib.grip_open_s)
-    _travel(client, calib, x, y, calib.safe_z, "move to safe height", j4=j4)
-    _approach(client, calib, x, y, calib.table_z, "descend to pick height", j4=j4)
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "open before descend", grip=calib.grip_open_s, started_at=open_started,
+        ))
+    _travel(client, calib, x, y, calib.safe_z, "move to safe height", j4=j4, on_waypoint=on_waypoint)
+    _approach(client, calib, x, y, calib.table_z, "descend to pick height", j4=j4, on_waypoint=on_waypoint)
+    close_started = time.monotonic()
     result = client.gripper(calib.grip_close_s)
     if not result.get("ok"):
         # Lift clear anyway so a failed grip doesn't leave the TCP parked
         # against the cube.
         _travel(client, calib, x, y, calib.safe_z, "lift after failed grip")
         raise Mt4ClientError(f"gripper close failed: {result}")
-    _travel(client, calib, x, y, calib.safe_z, "lift after grip")
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "grip", grip=calib.grip_close_s, started_at=close_started,
+        ))
+    _travel(client, calib, x, y, calib.safe_z, "lift after grip", on_waypoint=on_waypoint)
     out: dict[str, object] = {"ok": True, "picked_at": [x, y]}
     if j4 is not None:
         out["j4"] = round(j4, 2)
@@ -499,6 +662,7 @@ def pick_cube(
     cube: CubeDetection,
     *,
     face_align: bool | None = None,
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> dict[str, object]:
     """Vision pick from a ``CubeDetection`` (central entry for shuffle/MCP/etc.)."""
     if cube.x is None or cube.y is None:
@@ -510,6 +674,7 @@ def pick_cube(
         float(cube.y),
         yaw_deg=cube.yaw_deg,
         face_align=face_align,
+        on_waypoint=on_waypoint,
     )
     result["color"] = cube.color
     return result
@@ -529,6 +694,7 @@ def place(
     release_z: float | None = None,
     travel_z: float | None = None,
     axis_clear_mm: float | None = None,
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> dict[str, object]:
     """Release the held cube at robot-frame (x, y).
 
@@ -558,6 +724,9 @@ def place(
 
     When ``lift_after`` is False the TCP stays at release height over the
     target (for in-place centering immediately after).
+
+    ``on_waypoint``, when given, is called with a ``MoveEvent`` after every
+    completed move/release -- see that class.
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "place target")
@@ -576,19 +745,25 @@ def place(
     if axis_clear_mm is not None and axis_clear_mm > 0:
         travel_orthogonal(
             client, calib, float(tcp0.x), float(tcp0.y), tz,
-            "stack approach height", j4=j4,
+            "stack approach height", j4=j4, on_waypoint=on_waypoint,
         )
         travel_orthogonal(
             client, calib, x, y, tz, "horizontal over place XY", j4=j4,
+            on_waypoint=on_waypoint,
         )
     else:
-        _travel(client, calib, x, y, tz, "move to safe height", j4=j4)
-    _approach(client, calib, x, y, rz, "descend to release height", j4=j4)
+        _travel(client, calib, x, y, tz, "move to safe height", j4=j4, on_waypoint=on_waypoint)
+    _approach(client, calib, x, y, rz, "descend to release height", j4=j4, on_waypoint=on_waypoint)
+    release_started = time.monotonic()
     client.gripper(calib.grip_open_s)
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "release", grip=calib.grip_open_s, started_at=release_started,
+        ))
     if on_released is not None:
         on_released()
     if lift_after:
-        _travel(client, calib, x, y, tz, "lift after release")
+        _travel(client, calib, x, y, tz, "lift after release", on_waypoint=on_waypoint)
         if axis_clear_mm is not None and axis_clear_mm > 0:
             clear = stack_clear_xy(
                 x, y, float(tcp0.x), float(tcp0.y), float(axis_clear_mm),
@@ -596,7 +771,7 @@ def place(
             if clear is not None:
                 _travel(
                     client, calib, clear[0], clear[1], tz,
-                    "horizontal clear of stack axis",
+                    "horizontal clear of stack axis", on_waypoint=on_waypoint,
                 )
     return {"ok": True, "placed_at": [x, y], "release_z": rz}
 
@@ -610,6 +785,7 @@ def pick_centered(
     yaw_deg: float | None = None,
     face_align: bool | None = None,
     lift_after: bool = True,
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
 ) -> dict[str, object]:
     """Center under TCP then take the cube (calibrate_height-style align).
 
@@ -626,6 +802,11 @@ def pick_centered(
     left holding the cube at grab height -- the caller then folds the lift
     into its next transit (e.g. place_on_stack's ``lift_to`` carry mq),
     saving the stop/settle at safe_z between the grip and the carry.
+
+    ``on_waypoint``, when given, is called once per move/grip -- mirrors
+    ``pick()``'s convention, including for the ±90° rotate (see
+    ``_rotate_j4_90_in_place``, which reads back the actual resulting pose
+    since that move is joint-space, not an (x,y,z) target).
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "pick_centered target")
@@ -639,7 +820,13 @@ def pick_centered(
         j4 = None
     else:
         j4 = j4_for_face_align(yaw_deg, current_j4_deg=current_j4, x=x, y=y)
+    open_started = time.monotonic()
     client.gripper(calib.grip_open_s)
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "align: open before descend", grip=calib.grip_open_s,
+            started_at=open_started,
+        ))
     # The stack loop's routed approach can deliver the arm already
     # face-aligned AND already descended (the descend folded into the transit
     # mq), or just aligned at safe height, or nothing (first cube / non-stack
@@ -657,18 +844,42 @@ def pick_centered(
     if _here(calib.table_z):
         pass  # fused transit already descended us to the grab pose
     elif _here(calib.safe_z):
-        _approach(client, calib, x, y, calib.table_z, "align: descend to grab", j4=j4)
+        _approach(
+            client, calib, x, y, calib.table_z, "align: descend to grab",
+            j4=j4, on_waypoint=on_waypoint,
+        )
     else:
-        _travel(client, calib, x, y, calib.safe_z, "align: approach", j4=j4)
-        _approach(client, calib, x, y, calib.table_z, "align: descend to grab", j4=j4)
+        _travel(client, calib, x, y, calib.safe_z, "align: approach", j4=j4, on_waypoint=on_waypoint)
+        _approach(
+            client, calib, x, y, calib.table_z, "align: descend to grab",
+            j4=j4, on_waypoint=on_waypoint,
+        )
+    close1_started = time.monotonic()
     _check(client.gripper(calib.grip_close_s), "align: grab")
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "align: grab", grip=calib.grip_close_s, started_at=close1_started,
+        ))
+    open2_started = time.monotonic()
     _check(client.gripper(calib.grip_open_s), "align: release")
-    _travel(client, calib, x, y, calib.safe_z, "align: lift before rotate")
-    _rotate_j4_90_in_place(client)
-    _approach(client, calib, x, y, calib.table_z, "align: descend to re-grip")
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "align: release", grip=calib.grip_open_s, started_at=open2_started,
+        ))
+    _travel(client, calib, x, y, calib.safe_z, "align: lift before rotate", on_waypoint=on_waypoint)
+    _rotate_j4_90_in_place(client, on_waypoint=on_waypoint)
+    _approach(
+        client, calib, x, y, calib.table_z, "align: descend to re-grip",
+        on_waypoint=on_waypoint,
+    )
+    close2_started = time.monotonic()
     _check(client.gripper(calib.grip_close_s), "align: grip")
+    if on_waypoint is not None:
+        on_waypoint(MoveEvent(
+            "align: grip", grip=calib.grip_close_s, started_at=close2_started,
+        ))
     if lift_after:
-        _travel(client, calib, x, y, calib.safe_z, "align: lift after grip")
+        _travel(client, calib, x, y, calib.safe_z, "align: lift after grip", on_waypoint=on_waypoint)
     out: dict[str, object] = {"ok": True, "picked_at": [x, y], "centered": True}
     if yaw_deg is not None:
         out["yaw_deg"] = round(float(yaw_deg), 2)
@@ -681,8 +892,13 @@ def place_here(client: Mt4Client, calib: Calibration) -> dict[str, object]:
     return place(client, calib, tcp.x, tcp.y)
 
 
-def _rotate_j4_90_in_place(client: Mt4Client) -> None:
+def _rotate_j4_90_in_place(
+    client: Mt4Client,
+    *,
+    on_waypoint: Callable[[MoveEvent], None] | None = None,
+) -> None:
     """Rotate J4 ±90° via ``m``, picking the direction with more soft-limit headroom."""
+    started = time.monotonic()
     dj4_90 = round(90.0 * STEPS_PER_DEG[3])
     j4_min, j4_max = JOINT_SOFT_MIN_STEPS[3], JOINT_SOFT_MAX_STEPS[3]
     j4 = client.get_status().joints.get("j4", 0)
@@ -705,6 +921,19 @@ def _rotate_j4_90_in_place(client: Mt4Client) -> None:
         for _, dj4 in options:
             result = client.move_relative(0, 0, 0, dj4)
             if result.get("ok"):
+                if on_waypoint is not None:
+                    # A joint-space move (relative J4 steps), not an (x,y,z)
+                    # target like every other leg here -- read back the
+                    # resulting world-frame pose rather than compute it, so
+                    # the reported j4 is what the arm actually reached, not
+                    # what was commanded.
+                    tcp = client.get_tcp()
+                    if tcp is not None:
+                        on_waypoint(MoveEvent(
+                            "align: rotate j4 90",
+                            float(tcp.x), float(tcp.y), float(tcp.z),
+                            float(tcp.j4), started_at=started,
+                        ))
                 return
             last_err = result.get("error", result)
         raise Mt4ClientError(f"center: rotate j4 ±90° failed: {last_err}")
