@@ -31,16 +31,21 @@ class Waypoint:
 
 
 def integrate_joint_target(q_deg: JointAnglesDeg, action: np.ndarray, *, dt: float = DT_S) -> JointAnglesDeg:
-    """Clip a DROID action to [-1, 1] and integrate columns 0:4 (q1..q4
+    """Clip a DROID action to [-1, 1] rad/s and integrate columns 0:4 (q1..q4
     velocities) against the current joint state.
+
+    The clip is only a sane per-joint speed cap (~57 deg/s) if the raw action
+    is radians/s -- matching mt4_pi.collect.convert_to_lerobot's action
+    labels -- so the integrated delta must convert to degrees before adding
+    onto a degrees-native JointAnglesDeg.
     """
     clipped = np.clip(action, -1.0, 1.0)
-    dq = clipped[:MT4_NUM_JOINTS] * dt
+    dq_deg = np.degrees(clipped[:MT4_NUM_JOINTS] * dt)
     return JointAnglesDeg(
-        q_deg.j1 + float(dq[0]),
-        q_deg.j2 + float(dq[1]),
-        q_deg.j3 + float(dq[2]),
-        q_deg.j4 + float(dq[3]),
+        q_deg.j1 + float(dq_deg[0]),
+        q_deg.j2 + float(dq_deg[1]),
+        q_deg.j3 + float(dq_deg[2]),
+        q_deg.j4 + float(dq_deg[3]),
     )
 
 

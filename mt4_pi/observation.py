@@ -9,6 +9,8 @@ https://github.com/enghoff/pi0.5-server/blob/master/docs/mt4-client-integration.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from openpi_client import image_tools
 
@@ -22,12 +24,20 @@ IMAGE_SIZE = 224
 
 
 def mt4_state_to_droid(q_deg: JointAnglesDeg, gripper_position: float) -> tuple[np.ndarray, np.ndarray]:
-    """Pad MT4's 4 joints into pi05_droid's 7-DoF Franka layout. Columns 4:7
-    have no MT4 counterpart and are dropped on the way back out in
+    """Pad MT4's 4 joints into pi05_droid's 7-DoF Franka layout, in RADIANS.
+    Columns 4:7 have no MT4 counterpart and are dropped on the way back out in
     adapter.py.
+
+    Radians, not the degrees JointAnglesDeg carries natively, to match the
+    training labels written by
+    mt4_pi.collect.convert_to_lerobot._pad_joint_position_rad. Norm stats are
+    fit on that dataset, so emitting degrees here would put the state ~57x out
+    of distribution at serve time -- the same units trap already caught on the
+    action path in adapter.integrate_joint_target, which the state path
+    originally missed.
     """
     joints = np.zeros(DROID_NUM_JOINTS, dtype=np.float32)
-    joints[:MT4_NUM_JOINTS] = [q_deg.j1, q_deg.j2, q_deg.j3, q_deg.j4]
+    joints[:MT4_NUM_JOINTS] = [math.radians(v) for v in (q_deg.j1, q_deg.j2, q_deg.j3, q_deg.j4)]
     return joints, np.asarray([gripper_position], dtype=np.float32)
 
 
