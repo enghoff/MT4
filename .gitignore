@@ -25,3 +25,6 @@ Desktop.ini
 markers_frame.jpg
 scene_frame.jpg
 vision_calibration.json
+
+# pi0.5 demonstration collection + converted dataset output (images -- not for git)
+data/
