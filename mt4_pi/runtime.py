@@ -16,11 +16,10 @@ import time
 import numpy as np
 
 from mt4_jog.client import Mt4Client
-from mt4_jog.kinematics import JointAnglesDeg
 from mt4_vision.camera import capture_frame
 
 from mt4_pi import adapter, safety
-from mt4_pi.observation import build_observation
+from mt4_pi.observation import build_observation, joint_state_from_status
 from mt4_pi.policy_client import PolicyClient
 
 logger = logging.getLogger(__name__)
@@ -62,9 +61,10 @@ def run(client: Mt4Client, policy: PolicyClient, prompt: str, *, max_ticks: int 
             client.stop()
             return
 
-        q = JointAnglesDeg.from_steps(
-            (status.joints["j1"], status.joints["j2"], status.joints["j3"], status.joints["j4"])
-        )
+        # j4 here is the WORLD-FRAME wrist angle (status.tcp.j4), not the raw
+        # joint -- same convention as the training labels and as the j4
+        # queue_move() consumes. See observation.joint_state_from_status.
+        q = joint_state_from_status(status)
         for action in chunk[:EXECUTION_HORIZON]:
             target = adapter.integrate_joint_target(q, action)
             grip = adapter.gripper_target(action)

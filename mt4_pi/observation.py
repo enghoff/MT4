@@ -18,6 +18,11 @@ from mt4_jog.joints import GRIPPER_S_CLOSED, GRIPPER_S_OPEN
 from mt4_jog.kinematics import JointAnglesDeg
 from mt4_jog.status import Mt4Status
 
+# Re-exported for existing callers (runtime.py, safety.py's docstring): the
+# convention is the arm's, not pi0.5's, so it lives in a module the ACT path
+# can import without dragging in openpi_client.
+from mt4_pi.jointstate import joint_state_from_status  # noqa: F401
+
 MT4_NUM_JOINTS = 4
 DROID_NUM_JOINTS = 7
 IMAGE_SIZE = 224
@@ -41,6 +46,8 @@ def mt4_state_to_droid(q_deg: JointAnglesDeg, gripper_position: float) -> tuple[
     return joints, np.asarray([gripper_position], dtype=np.float32)
 
 
+
+
 def build_observation(
     frame_bgr: np.ndarray,
     status: Mt4Status,
@@ -50,14 +57,11 @@ def build_observation(
 ) -> dict[str, object]:
     """Assemble a pi05_droid observation dict from a camera frame + MT4 status.
 
-    `status.joints` holds firmware step counters, not degrees -- converted
-    via JointAnglesDeg.from_steps() to match what fk_tcp() expects elsewhere
-    in the adapter chain.
+    `status.joints` holds firmware step counters, not degrees, and its j4 is
+    a raw joint rather than the world-frame angle the model was trained on --
+    both handled by joint_state_from_status().
     """
-    if status.joints.keys() != {"j1", "j2", "j3", "j4"}:
-        raise ValueError(f"incomplete joint status: {status.joints}")
-    steps = (status.joints["j1"], status.joints["j2"], status.joints["j3"], status.joints["j4"])
-    q_deg = JointAnglesDeg.from_steps(steps)
+    q_deg = joint_state_from_status(status)
 
     gripper_position = _gripper_fraction(status.tcp.grip if status.tcp else GRIPPER_S_OPEN)
     joints, gripper = mt4_state_to_droid(q_deg, gripper_position)

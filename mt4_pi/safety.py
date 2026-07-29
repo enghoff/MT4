@@ -43,7 +43,14 @@ def validate(current: JointAnglesDeg, target: JointAnglesDeg, grip: int) -> None
     if not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
         raise SafetyViolation(f"gripper target {grip} outside servo range")
 
-    if not joints_within_soft_limits(steps_from_angles(target)):
+    # JointAnglesDeg carries j4 as the WORLD-FRAME wrist angle throughout
+    # mt4_pi (see observation.joint_state_from_status), but the firmware's J4
+    # soft limit is on the RAW joint, which under ORIENT=hold sits at
+    # `tcp_j4 - j1`. Converting here keeps the limit check on the quantity the
+    # limit actually describes -- otherwise it is wrong by up to the full J1
+    # range (~137 deg) and would wave through a real J4 limit violation.
+    raw = JointAnglesDeg(target.j1, target.j2, target.j3, target.j4 - target.j1)
+    if not joints_within_soft_limits(steps_from_angles(raw)):
         raise SafetyViolation(f"joint target {target} outside soft limits / coupled J2+J3 range")
 
     tcp = fk_tcp(target)
