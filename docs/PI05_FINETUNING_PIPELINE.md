@@ -6,9 +6,18 @@ the `MEDIA` inference server. Companion to
 [`PI05_DEPLOYMENT.md`](PI05_DEPLOYMENT.md) (which covers the already-solved
 serving side); this doc covers data → training.
 
-**Status (2026-07-28): first real-hardware validation done — grasp
-targeting/timing is not yet reliable. Round 2 (combined shuffle+stack data,
-4000 steps) is underway to address it.** The round-1 2000-step run
+**Status (2026-07-29): round-2 training finished (4000/4000, checkpoint
+3999); merge + deploy to MEDIA in progress, real-arm re-validation still
+pending.** Round 2 trained on the combined shuffle+stack corpus
+(`senghoff/mt4-cube-shuffle-v3`, 225 episodes / 37,852 frames) for 4000
+steps, ~6h20m wall at ~7.5s/step on an AWS `g6.2xlarge` (L4). It was
+interrupted once at step ~1500 by an instance wedge during a checkpoint
+save and resumed from step 1000 (§4b/§4c-bis); net cost was ~500 repeated
+steps. The open question — whether more data fixes the grasp
+targeting/timing failures below — is not answered until §7a's tests are
+re-run on the arm.
+
+Round 1 for contrast: the 2000-step run
 (resumed once after an instance outage, see §4a) finished cleanly — loss
 dropped from ~1.6 to ~0.02, no errors — and the merged/deployed checkpoint
 served correctly (27s first-call compile, then steady ~285ms, matching
@@ -18,11 +27,8 @@ full descent to table height that never grasped and drifted to a location
 matching none of the actual cube positions. Motion quality itself (smooth,
 continuous, safety-clean) is good — targeting/grasp-timing is not, which
 reads as a data-volume/diversity problem more than a wiring bug (see §7a
-for what was ruled out). Round 2 combines the original
-`data/pi_demos` shuffle demos with a new `data/pi_stack_demos` stacking set
-into one corpus (`senghoff/mt4-cube-shuffle-v3`) and doubles training to
-4000 steps. See §0 for the default procedure this and future training
-requests follow.
+for what was ruled out) — which is the hypothesis round 2 tests. See §0
+for the default procedure this and future training requests follow.
 
 ---
 
@@ -464,6 +470,79 @@ Launch it detached, never over a live pipe (§6c):
 setsid nohup bash ~/setup_openpi.sh </dev/null >~/setup.log 2>&1 & disown
 ```
 
+### 4c-bis. Add swap before training. Every time.
+
+Round 2's AWS box went `UNHEALTHY` **during the step-1500 checkpoint save**
+— the giveaway was a leftover `1500.orbax-checkpoint-tmp-N/` directory and
+an intact `1000/`. A save is the peak-memory moment of the whole run:
+orbax pulls every param from GPU to host memory ("Transferring arrays to
+host memory" in the log) on top of the training process's own footprint.
+With 30GB RAM and **no swap**, that spike has nowhere to go and can wedge
+the box hard enough that `sshd` stops completing handshakes.
+
+Both instances used in this project shipped swap-less, and both wedged
+under memory pressure (round 1 from a concurrent merge, round 2 from a
+checkpoint save). Treat swap as part of setup, not a remedy:
+
+```bash
+sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+swapon --show    # confirm
+```
+
+**`dmesg` will not confirm the diagnosis after the fact** — a stop/start
+clears the ring buffer, so post-recovery "no OOM lines" is not evidence of
+innocence. The surviving-checkpoint-plus-orphaned-tmp-dir pattern is the
+real fingerprint. Monitoring swap *usage* afterward is the way to confirm
+the theory prospectively.
+
+**It did confirm.** After adding swap, the resumed run used **0G through
+the step-1500 save but 2G by the step-2000 save** — i.e. the box genuinely
+does exceed 30GB of demand as the run progresses, and on the original
+swap-less configuration that 2GB had nowhere to go. Note the first save
+after resume looked clean, so *one* successful checkpoint is not proof the
+problem is gone; the pressure builds over the run.
+
+Recovery, once wedged, is §4b's stop/start (the disk and its checkpoints
+survive) followed by:
+
+```bash
+# Delete the crashed atomic write first -- it is not a usable checkpoint
+# and wastes ~8.7GB.
+rm -rf <ckpt-dir>/*.orbax-checkpoint-tmp-*
+```
+
+then resume per §6c. Round 2 lost only the ~500 steps since its last
+completed checkpoint.
+
+### 4d. Picking oversight back up after a dropped session
+
+The training run is detached on the instance and does **not** depend on any
+local session staying alive — but the local monitoring does. To re-attach
+from a cold start (all paths are on the WSL side unless noted):
+
+```bash
+# 1. Where is it? (numeric dirs are finalized; *-tmp-* are mid-write)
+ssh mt4-pi05-r2 'ls -1 /home/ubuntu/openpi/checkpoints/pi05_mt4_lora_v3/full_run_v3/'
+ssh mt4-pi05-r2 'pgrep -f "train.py pi05_mt4_lora_v3" >/dev/null && echo alive || echo DEAD'
+ssh mt4-pi05-r2 'df -h / | tail -1'
+
+# 2. Re-arm the watcher (checkpoint-dir based, see the tilde warning below)
+bash ~/watch_train3.sh
+
+# 3. When 3999 exists: pull -> merge on MEDIA -> place norm stats -> deploy
+bash ~/deploy_r2.sh
+```
+
+**Remote paths must be absolute in any command sent over `ssh`.** A watcher
+that used `CKDIR=~/openpi/...` had the tilde expanded by the *local* WSL
+shell (`/home/enghoff`) and sent verbatim to the instance, whose user is
+`ubuntu` (`/home/ubuntu`). Every check silently hit a nonexistent path, so
+progress read "none yet" **and the completion test could never fire** — the
+run would have finished with the monitor still reporting normally. Wrong
+path plus a `test -d` that only ever returns false is indistinguishable
+from a healthy in-progress run; hardcode absolute remote paths.
+
 ---
 
 ## 5. TrainConfig, norm stats, and training
@@ -677,11 +756,146 @@ machine → MEDIA. Only the `params/` subdirectory is needed for
 merging/serving (skip `train_state/`, which is ~2x larger and holds
 optimizer momentum you don't need outside of resuming training) —
 `du -sh .../params` vs `train_state` before copying anything. The
-Brev→local hop rode the user's home internet connection (~4-40MB/s,
-climbing over the transfer — watch this like the earlier dataset-copy
-"is it stalled?" check, since this link has been slow before); the
-local→MEDIA hop is LAN-speed (~30-40MB/s), effectively instant for a few
-GB.
+Brev→local hop rides the user's home internet connection and is the slow
+leg (round 2, measured: **4.5G in 32 min = 2.34 MB/s ≈ 19 Mbit/s**, for
+~42 min total on 5.9G); the local→MEDIA hop is LAN-speed (~30-40MB/s),
+effectively instant for a few GB. Watch this like the earlier dataset-copy
+"is it stalled?" check — the rate has varied a lot between runs.
+
+**This relay is the part of the pipeline most worth replacing — see
+§6a-bis.**
+
+### 6a-bis. Don't pay the instance to be a file server (HF hand-off)
+
+The 2-hop relay above has the instance sitting billable for ~40 minutes
+doing nothing but serving a file over a slow home link. Worse, the laptop
+is structurally in the path only because the cloud box can't route to
+MEDIA's LAN address — it contributes nothing but a bottleneck.
+
+**Better shape: the training box pushes `params/` to HF; the instance
+stops immediately; MEDIA pulls from HF on its own time.** The laptop drops
+out of the path entirely, and the download is no longer on the clock. We
+already trust HF with the dataset going *in* (37,852 frames); this is the
+same channel on the way out.
+
+```bash
+# On the training box, right after the run finishes.
+# upload_large_folder is the right call at this size -- it is chunked,
+# parallel and resumable. Plain upload_folder is unhappy with ~6GB.
+uv run python -c "
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo('senghoff/mt4-pi05-lora-v3-ckpt', repo_type='model',
+                private=True, exist_ok=True)
+api.upload_large_folder(
+    repo_id='senghoff/mt4-pi05-lora-v3-ckpt', repo_type='model',
+    folder_path='<ckpt>/3999/params')
+"
+```
+
+```bash
+# On MEDIA, later, with the instance already stopped.
+hf download senghoff/mt4-pi05-lora-v3-ckpt --repo-type model \
+  --local-dir /root/mt4_merge/checkpoints/pi05_mt4_lora_v3_raw/3999/params
+```
+
+**Measured on round 2 (2026-07-29), and the gap is enormous:**
+
+| Leg | Size | Time | Rate |
+|---|---|---|---|
+| Brev → laptop (rsync, current path) | 5.9 GiB | ~42 min | 2.34 MB/s (19 Mbit/s) |
+| Brev → HF (`upload_large_folder`, 8 workers) | 6.324 GB | **24 s** | **263 MB/s (~2.1 Gbit/s)** |
+
+**~110× faster**, and it takes the ~40 minutes of billable instance time to
+near zero. The upload leg runs from an AWS host to HF's storage backend
+rather than to a residential connection, and a `g6.2xlarge` has multi-Gbit
+egress to spend.
+
+Verified, not just self-reported: `model_info(..., files_metadata=True)`
+returned 14 files totalling 6.324 GB, byte-exact against the local
+`du -sb` of 6,324,430,992 — a 24-second 6GB upload is surprising enough to
+be worth confirming rather than trusting the "UPLOAD_OK" print. (Single
+measurement; the MEDIA-side download leg is still unbenchmarked, but it's
+off the clock so it matters much less.)
+
+The stronger version, which is what actually removes the babysitting:
+**make the job self-terminating.** Chain the upload onto the training
+launch so the sequence completes unattended —
+
+```bash
+setsid nohup bash -c 'uv run scripts/train.py ... && python ~/upload_ckpt.py' \
+  </dev/null >>~/full_run_v3.log 2>&1 & disown
+```
+
+— and have the local watcher fire `brev stop` when it sees the
+upload-complete marker. Training ends → weights land on HF → instance
+stops, with nobody watching.
+
+Keep the stop on the *laptop* side. A guest-initiated `sudo poweroff` is
+tempting but unverified: it's not established that Brev records that as a
+clean `STOPPED` that will restart, and this project has already lost an
+instance to a start failure (§4b). `brev stop`/`brev start` is the path
+known to work on these boxes.
+
+Two things not to change while doing this:
+
+- **Merge still happens on MEDIA, not on the training box.** The merge
+  peaks around 23GB on a 30GB box, and that class of memory pressure has
+  wedged an instance twice (§4a, §4c-bis). Upload the *raw* LoRA
+  checkpoint and merge downstream.
+- **Keep skipping `train_state/`** — 2.9G of optimizer momentum that only
+  matters for resuming training.
+
+#### Why HF and not an object-storage bucket
+
+Asked and checked, because "big binary blobs belong in a bucket, not a
+git-backed hub" is a reasonable prior. It doesn't hold here, for two
+different reasons on the two artifact types.
+
+**Data → HF, not close.** `TrainConfig` takes a `repo_id` and
+`LeRobotDataset` resolves it from the Hub natively; that is the path
+openpi actually tests. A bucket would mean staging to a local dir and
+pointing `root=` at it — more plumbing, no gain, and it perturbs the one
+part of this pipeline with a documented fragility record (the lerobot
+commit pin + `datasets`/`pyarrow` pins, §3). You'd also give up the
+dataset viewer and revision pinning.
+
+**Weights → HF too, at current cadence.** The obvious argument for a
+bucket is that HF handles thousands-of-small-files repos badly and an
+orbax checkpoint dir looks like it should be one. **It isn't.** Orbax
+writes OCDBT, which packs the whole checkpoint into a handful of large
+files — measured on round 2's `3999/params`:
+
+```
+total files: 10      <1KB:   2
+total dirs:  5       <1MB:   5
+                     >100MB: 3     (2.998G, 2.146G, 350M)
+```
+
+Three multi-GB LFS objects is an unremarkable model repo. No per-file
+commit storm, so the main technical objection evaporates. What's left is a
+straight infra trade: a bucket wins on lifecycle rules (auto-expiring old
+checkpoints turns hygiene-by-discipline into config), no storage quota,
+and free intra-region upload from the AWS box; HF wins on **already being
+authenticated on all three machines** (`~/.hf_token` is staged by
+`setup_openpi.sh`, and local + MEDIA both work), no egress charge, and
+commit SHAs that pin exactly which weights are deployed.
+
+One ~6GB checkpoint per training round does not justify provisioning
+credentials on three boxes. Note also that `max_to_keep=1` (§5) makes
+checkpoint accumulation a non-issue by force — only the latest ever exists
+on the training box.
+
+**What would flip it:** retaining every 500-step save for comparison, or
+hyperparameter sweeps. Once many checkpoints are in play, lifecycle expiry
+and per-GB pricing beat manual repo cleanup. At that point prefer
+**Cloudflare R2** over S3 — S3-compatible API with zero egress fees, which
+removes the only real objection to S3 (MEDIA paying ~$0.09/GB on every
+pull). Roughly $0.09/mo at this size.
+
+Until then, apply to checkpoint repos the same hygiene the datasets
+already get (§5: superseded `-vN` repos are deleted once the successor is
+confirmed live).
 
 ### 6b. Deploying the merged checkpoint — the norm_stats trap
 
@@ -792,6 +1006,16 @@ rounds to end billing while preserving the environment.
    steps on the same data — loss was already down to ~0.02 in round 1,
    so the model fit the training distribution fine; the failure is
    generalization/precision, not underfitting.
+3. **Replace the Brev→laptop→MEDIA relay with an HF hand-off (§6a-bis).**
+   Benchmarked on round 2: the rsync relay took ~42 min at 19 Mbit/s,
+   the same payload to HF took **24 s at ~2.1 Gbit/s** — ~110×, and it
+   frees ~40 min of billable instance time per round. The round-2
+   checkpoint is already on HF at
+   `senghoff/mt4-pi05-lora-v3-ckpt` (private) as a side effect of the
+   benchmark. Wire it in: chain the upload onto `train.py`, have the
+   watcher fire `brev stop` on the upload marker, and pull to MEDIA with
+   `hf download` off the clock. This is the single highest-leverage
+   pipeline change outstanding.
 
 ### 7a. Real-hardware validation results (round 1, 2026-07-28)
 
@@ -834,6 +1058,147 @@ corpus) that hasn't seen enough visual/spatial diversity to generalize
 precisely. This is the direct motivation for round 2 (§0, §5): more data
 (stacking demos added), doubled step count.
 
+**Caveat added 2026-07-29:** §7b found a j4 convention bug in the runtime
+that was present for these round-1 runs too. Some of what is attributed to
+"not enough data" above may have been that bug. Treat §7a's *diagnosis* as
+provisional; the *observations* still stand.
+
+### 7b. The j4 conventions bug, and the J4-alignment prerequisite (2026-07-29)
+
+Round-2 validation found a real defect in our own code before it could say
+anything about the model. **Two separate j4 problems, one in software and
+one in operating procedure.**
+
+**1. Software: raw joint j4 ≠ world-frame j4.** The firmware runs
+`ORIENT=hold`, so the wrist counter-rotates 1:1 with the base to hold an
+absolute heading. Measured directly — command `j4=0` and sweep the base:
+
+```
+ azimuth       x       y  J1 steps  j4 steps  read j4  tcp.j4
+       0   200.0     0.0         0         0     0.00     0.0
+      20   187.9    68.4       700      -900   -20.00     0.0
+      40   153.2   128.6      1400     -1800   -40.00     0.0
+```
+
+`tcp.j4` stays 0; the *raw joint* tracks azimuth exactly. The relation is
+`raw_j4 = tcp_j4 - j1`. Both the training labels
+(`convert_to_lerobot._solve_joint_track` takes j4 straight from the logged
+world-frame angle) and `queue_move()` use the **TCP** convention — raw joint
+j4 is the odd one out, and `observation.py`/`runtime.py` were reading
+exactly that. So the model saw a state off by `-j1`, and integrating an
+action onto it then re-commanding the result as a TCP angle drove the wrist
+a further `-j1` every tick.
+
+Signature to recognise: **j4 jumps only at tick boundaries.**
+`integrate_joint_target` caps one waypoint at
+`degrees(1.0 rad/s × 1/15 s) = 3.82°`, so the observed 12-20° steps could
+not come from the model — only from re-reading state. It compounded to
+**-134° over 7 ticks**. Fixed via
+`observation.joint_state_from_status()` (j1..j3 from steps, j4 from
+`status.tcp.j4`), used by both modules; `safety.validate` converts back to
+raw for the J4 soft-limit check, since that limit is on the real joint.
+After the fix, tick-boundary continuity is clean (…3.63→3.03,
+-0.32→-0.99, -30.7→-31.1).
+
+Worth checking the other joints rather than assuming: FK round-trip on
+`from_steps` is 0.02 mm and `ik_position` agrees within 0.01° on j1/j2/j3,
+so j4 was the only one.
+
+**2. Procedure: J4 has no home switch, and an MCU reset silently destroys
+its zero.** From `calibrate_j4.py`: *"J4 has no home switch: its step
+counter starts at 0 wherever the wrist sat at boot… The zero survives
+`home`. It is lost on power cycle / reflash until this script is run
+again."*
+
+This is a **hard prerequisite for any policy validation**: the training data
+was collected with J4 manually aligned, so an unaligned J4 puts an unknown
+constant offset on the channel and no run is interpretable. Worse, the
+board reset **twice mid-session** (see the `homed=False` @
+`(124.6, 0, 156.6)` / `speed=1524` fingerprint), each time re-zeroing J4 at
+whatever arbitrary angle the wrist happened to hold.
+
+That is the likely explanation for otherwise baffling run-to-run variance
+on 2026-07-29 — with identical prompt and scene, one 30-tick run finished
+**5.6 mm** in XY from the target blue cube, and the next ended **158 mm**
+away on the far side of the workspace. Do not read a model result out of
+runs like these.
+
+**Protocol for the next validation attempt:**
+
+1. Run `calibrate_j4.py` and manually align the jaws — this needs an
+   operator at the gamepad; it cannot be automated.
+2. Confirm `homed=True` and record `tcp.j4` at park.
+3. Run the policy test.
+4. **Re-check for the MCU-reset fingerprint afterwards.** If the board
+   reset during the run, J4's zero died with it and the result is void —
+   re-align and re-run rather than interpreting it.
+
+Everything else in the round-2 stack verified clean beforehand: merge (10
+LoRA pairs, no `lora_a`/`lora_b` remaining), norm stats in
+`assets/droid/`, and serving at `(15,8)` finite chunks / 296 ms steady
+state.
+
+### 7c. Round-2 result from the one valid run (2026-07-29)
+
+After the operator manually aligned J4 (visually confirmed: at `j4=0` the
+jaws image edge-on along the arm axis, at `j4=90` broadside; 0 -> 4050
+steps -> 0, exactly 45 steps/deg, repeatable), **one run passed the §7b
+validity check** — `homed=True`, no reset fingerprint afterwards.
+
+30 ticks / 200 executed waypoints, prompt "put the blue cube on the
+marker", 7 safety rejections:
+
+- Motion smooth and continuous; **no premature mid-air grasp** (round-1
+  run 1's failure mode is gone).
+- Descended to **z = 155.5 mm** (table ~115 mm) and was *still descending*
+  when ticks ran out: 182→181→179→176→172→167→162→158.
+- **Zero grasp attempts** in 200 waypoints.
+- Finished 74.9 mm in XY from the nearest blue cube; nudged one cube
+  ~12 mm, so it did make contact with the scene.
+- **j4 rotated -1.1° → -186.9°, 92% monotonically decreasing** — with
+  correct alignment and the §7b fix in place, so this is real model
+  behaviour, not an artifact.
+
+**Rejected hypothesis, recorded so it isn't re-run:** the adapter clips
+actions to ±1.0 rad/s and safety caps 5°/waypoint, and `norm_stats`'
+`q99` for j2/j3 (+3.23 / +4.12 rad/s) makes it look like the descent is
+being throttled 3-4×. **It isn't.** Measured over 9,926 frames (26% of the
+dataset):
+
+```
+  j1 |a| p50=0.00 p95=0.73 p99=0.94   >1.0 rad/s: 0.7%
+  j2 |a| p50=0.21 p95=0.72 p99=1.10   >1.0 rad/s: 1.4%
+  j3 |a| p50=0.16 p95=0.65 p99=0.86   >1.0 rad/s: 0.5%
+  j4 |a| p50=0.00 p95=0.53 p99=0.87   >1.0 rad/s: 0.4%
+```
+
+98.6-99.6% of training actions already fit inside the clip, and over-cap
+samples are mostly *isolated single frames* (median run length 1.0;
+53-78% are length-1) — interpolation spikes at `WaypointLog` leg
+boundaries, not sustained fast motion. Do not widen the safety envelope to
+chase them; `norm_stats`' q99 disagrees with the measured distribution and
+the measured one is what matters.
+
+Timing is not the constraint either: 37,852 frames / 225 episodes ≈ 168
+frames ≈ 11.2 s per demonstration, and 30 ticks gives 240 steps ≈ 16 s.
+
+**Still open**, and the next thing to test: the gripper channel never
+crosses the 0.5 binarisation threshold despite a training mean of 0.427
+(i.e. ~43% of training frames have it closed). Log the raw action chunks
+during a run and compare their per-channel distribution against the table
+above — if the served model's outputs don't look like training actions,
+the problem is serving/normalisation, not data volume; if they do, it is
+execution. That single comparison separates the two.
+
+### 7d. The MCU reset is now the dominant obstacle
+
+The board reset **three times** on 2026-07-29 — twice mid-run, once while
+the arm sat idle. Each reset destroys the J4 zero (§7b), which requires a
+manual operator to restore. That makes validation runs expensive and
+easily invalidated, and it is the bottleneck to resolve before further
+model iteration: a reset mid-run silently converts a real experiment into
+noise, and the only way to know is the post-run fingerprint check.
+
 ---
 
 ## See also
@@ -844,7 +1209,10 @@ precisely. This is the direct motivation for round 2 (§0, §5): more data
 - `mt4_pi/runtime.py` — the control loop that actually drives the arm
 - `mt4_pi/collect/recorder.py`, `mt4_pi/collect/convert_to_lerobot.py`,
   `mt4_pi/collect/prompts.py` — collection + conversion
-- `mt4_pi/collect/openpi_patches/add_mt4_config.py` — the remote
-  `TrainConfig` patch, committed here instead of re-derived per instance
+- `mt4_pi/collect/openpi_patches/` — `add_mt4_config.py` (remote
+  `TrainConfig` patch, committed here instead of re-derived per instance),
+  `setup_openpi.sh` (unattended environment rebuild, §4c),
+  `finish_pipeline.sh` (norm stats → smoke → gate → full run),
+  `merge_lora.py` (LoRA merge, run on MEDIA — §6a)
 - `collect_shuffle.py`, `collect_stack.py` — the two demo collectors
 - `tests/test_collect_waypoints.py` — `WaypointLog` interpolation behavior
