@@ -63,6 +63,50 @@ HULL_OUTSIDE_MARGIN_MM = 55.0
 # the parallax-predicted pixel (measured 54px off prediction; the radius
 # covers that systematic error plus a few-mm grip offset at ~0.6mm/px).
 HELD_CUBE_RADIUS_PX = 90.0
+# Minimum saturation (0-255) at the top-face centroid for a blob to be a
+# physical object at all. A laminated ArUco pad reflecting the room lights
+# throws a specular highlight whose faintly-tinted rim clips the blue band
+# (H 90-128) and survives every geometric gate -- the pad is inside the
+# marker hull, reachable, and the blob is cube-sized and square. Measured
+# over 377 recorded episodes: 28 picks were sent at such a highlight, all
+# blue, all ending grasp_failed or lost. Verified-real cubes bottom out at
+# S=211 (blue), 201 (red), 100 (green); on-marker glare runs a median of 37.
+# 90 leaves green a 10-point margin and rejects nothing that was ever
+# successfully picked. See also is_on_visible_marker, which catches the
+# minority of highlights bright enough to clear this floor.
+MIN_CUBE_SATURATION = 90.0
+
+
+def is_on_visible_marker(
+    cube: CubeDetection, marker_quads: list[list[list[float]]]
+) -> bool:
+    """True when the blob's centroid sits inside a *detected* marker outline.
+
+    A cube resting on a marker occludes its pattern, so the marker is not
+    decodable -- that is exactly what ``unknown_markers`` means elsewhere in
+    this module. The contrapositive is the useful direction: if the marker
+    decoded this frame, nothing is standing on it, so any cube-coloured blob
+    inside its outline is a reflection off the laminate. Measured across 360
+    frames, red and green never once landed inside a visible marker quad
+    while blue did 67 times, every one of them glare.
+    """
+    for quad in marker_quads:
+        pts = np.asarray(quad, dtype=np.float32)
+        if cv2.pointPolygonTest(pts, (float(cube.px), float(cube.py)), True) >= 0:
+            return True
+    return False
+
+
+def is_glare_blob(
+    cube: CubeDetection, marker_quads: list[list[list[float]]]
+) -> bool:
+    """True when a detection is a specular highlight rather than an object.
+
+    Unlike ``is_phantom_detection`` (which only demotes a blob from being a
+    *pick* target while still letting it occupy markers and slots), glare is
+    not there at all -- so callers drop it from the raw list entirely.
+    """
+    return cube.sat < MIN_CUBE_SATURATION or is_on_visible_marker(cube, marker_quads)
 
 
 def is_held_cube_blob(
@@ -270,15 +314,22 @@ def capture_scene(
     currently in the gripper (captures taken while holding). The matching
     detection is dropped from the raw list so the held cube cannot occupy
     markers or slots.
+
+    Specular glare off the laminated marker pads is dropped from the raw
+    list too, for the same reason and before anything else looks at it: it
+    is not an object, so it must neither be picked nor count as occupancy.
     """
     markers = marker_slots_from_calibration(calib)
     raw = cubes_with_robot_coords(detect_cubes(frame, calib))
+    marker_dets = detect_markers(frame, MARKER_DICT)
+    quads = [m.corners for m in marker_dets if m.corners]
+    raw = [c for c in raw if not is_glare_blob(c, quads)]
     if held_cube_px is not None:
         raw = [
             c for c in raw
             if not is_held_cube_blob(c, held_cube_px, held_color)
         ]
-    visible = {m.marker_id for m in detect_markers(frame, MARKER_DICT)}
+    visible = {m.marker_id for m in marker_dets}
     state = rebuild_workspace_state(
         calib, markers, raw, visible_marker_ids=visible
     )

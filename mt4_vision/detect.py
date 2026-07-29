@@ -56,6 +56,10 @@ MAX_ASPECT = 2.0
 # connected region of similar V. A blob that is all top face (near the
 # camera nadir) is V-uniform, so the whole blob is kept and the centroid is
 # unchanged.
+# Half-width (px) of the square sampled at the top-face centroid for
+# CubeDetection.sat. Small enough to stay on a ~20px cube face, big enough
+# that JPEG chroma noise on a single pixel cannot swing the median.
+SATURATION_PATCH_PX = 4
 TOP_FACE_SEED_FRACTION = 0.2  # top rows of the blob used as the seed
 TOP_FACE_V_TOL = 35.0  # faces differ by >=40-80 V; within-face spread ~15-25
 TOP_FACE_MIN_PIXELS = 20
@@ -97,6 +101,12 @@ class CubeDetection:
     # through the cube-top (or table) homography. Squares are 90°-periodic;
     # None when the blob is too small / uncalibrated. Used for J4 face-align.
     yaw_deg: float | None = None
+    # Median HSV saturation over the blob (0-255). A painted cube is deeply
+    # saturated; a specular highlight is near-white and only clips a colour
+    # band at its fringe, so this separates the two by an order of magnitude
+    # (see scene.is_glare_blob). Defaults to a saturated value so a
+    # hand-built detection in a test is never mistaken for glare.
+    sat: float = 255.0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -106,6 +116,7 @@ class CubeDetection:
             "x": None if self.x is None else round(self.x, 1),
             "y": None if self.y is None else round(self.y, 1),
             "yaw_deg": None if self.yaw_deg is None else round(self.yaw_deg, 1),
+            "sat": round(self.sat),
         }
 
 
@@ -188,6 +199,29 @@ def _top_face_centroid(
     return bx + float(xs.mean()), by + float(ys.mean())
 
 
+def _blob_saturation(hsv: np.ndarray, px: float, py: float) -> float:
+    """Median S (0-255) in a small disc at the blob's top-face centroid.
+
+    Sampled at the centroid, NOT over the filled contour: the contour only
+    contains pixels that already passed the colour band's S floor, so its
+    median is bounded below by that floor and cannot distinguish anything
+    (measured -- on-marker glare contours median S 107, real green cubes
+    134, overlapping). A specular highlight on a laminated marker is a
+    near-white core with a faintly tinted rim; only the rim clips the band,
+    so the blob is a ring and its centre is the part that gives it away
+    (measured S 5-88 for glare vs 215-244 for real cubes).
+
+    This is also the pixel the gripper is sent to descend on, which is the
+    right place to ask "is the cube's colour actually there?".
+    """
+    r = SATURATION_PATCH_PX
+    h, w = hsv.shape[:2]
+    y0, y1 = max(0, int(py) - r), min(h, int(py) + r + 1)
+    x0, x1 = max(0, int(px) - r), min(w, int(px) + r + 1)
+    patch = hsv[y0:y1, x0:x1, 1]
+    return float(np.median(patch)) if patch.size else 255.0
+
+
 def _robot_edge_yaw_deg(
     contour: np.ndarray,
     calibration: Calibration,
@@ -267,7 +301,7 @@ def detect_cubes(
             # by MAX_BLOB_AREA, not this filter.
             if hull is not None and cv2.pointPolygonTest(hull, (px, py), True) < -80:
                 continue
-            det = CubeDetection(color, px, py, area)
+            det = CubeDetection(color, px, py, area, sat=_blob_saturation(hsv, px, py))
             if calibration is not None:
                 det.x, det.y = calibration.pixel_to_robot(px, py, on_cube_top=True)
                 off = calibration.color_xy_offset_mm.get(color)
