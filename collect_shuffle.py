@@ -71,6 +71,7 @@ SERIAL_RECOVER_TRIES = 5
 
 
 def _verify_with_recheck(
+    client: Mt4Client,
     cam: EpisodeCamera,
     calib,
     *,
@@ -82,15 +83,39 @@ def _verify_with_recheck(
 ) -> str:
     """verify_pick_place() with shuffle.py's post-move recheck.
 
-    A capture taken right after the arm clears can lag the real desk by a
-    few hundred ms (driver frame backlog after the multi-second gap during
-    arm motion), so a genuinely completed move briefly still reads as
-    "grasp_failed" -- see mt4_vision.shuffle's POST_MOVE_RECHECK_* comment.
-    shuffle.py only loses a redundant retry to that; here it would stamp
-    success=False onto an otherwise good episode's meta.json, and a
-    mislabelled demonstration hurts the fine-tune more than a missing one.
-    A real failure still reads the same way after these retries.
+    Retreats first. ``place()`` leaves the arm hovering at safe_z directly
+    over the cube it just set down -- measured, 0.0mm away in every episode
+    of a run -- and under a camera this oblique the gripper hides the
+    landing site often enough to matter. The recheck loop alone cannot
+    recover from that: the arm does not move between attempts, so all three
+    captures see the same occlusion and the verdict lands on "lost" (cube at
+    neither end) or "grasp_failed". The very next cycle then retreats,
+    spots the cube exactly where it was placed, and happily picks it up
+    again. Measured on a live run: 3 of 7 consecutive episodes were
+    mislabelled this way, and whether a given placement survives is pure
+    geometry -- which is why the verdicts looked random rather than
+    correlated with anything about the pick.
+
+    A capture taken right after the arm clears can also lag the real desk by
+    a few hundred ms (driver frame backlog after the multi-second gap during
+    arm motion) -- see mt4_vision.shuffle's POST_MOVE_RECHECK_* comment.
+    That is what the retries are for, and they stay.
+
+    shuffle.py only loses a redundant retry to either problem; here it would
+    stamp success=False onto an otherwise good episode's meta.json, and a
+    mislabelled demonstration hurts the fine-tune more than a missing one --
+    it teaches the model that a correct trajectory was a failure. A real
+    failure still reads the same way after the retreat and the retries.
+
+    The retreat is close to free: the collection loop already retreats at
+    the top of the next cycle, which now finds the arm parked and no-ops.
     """
+    try:
+        retreat_for_camera(client, calib)
+    except Mt4ClientError as exc:
+        # Verify from wherever the arm is rather than abandoning the
+        # episode -- a possibly-occluded check still beats no check.
+        print(f"  retreat before verify failed: {exc}")
     verdict = "error"
     for attempt in range(POST_MOVE_RECHECK_ATTEMPTS + 1):
         if attempt:
@@ -255,7 +280,7 @@ def _run(
                 verdict = "error"
                 if failed_exc is None:
                     verdict = _verify_with_recheck(
-                        cam, calib,
+                        client, cam, calib,
                         pick_x=float(cube.x), pick_y=float(cube.y),
                         pick_color=cube.color,
                         place_x=place_x, place_y=place_y,
