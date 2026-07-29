@@ -9,7 +9,15 @@ from dataclasses import dataclass
 
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_jog.joints import JOINT_SOFT_MAX_STEPS, JOINT_SOFT_MIN_STEPS, JOG_SPEED_MIN_US
-from mt4_jog.kinematics import STEPS_PER_DEG
+from mt4_jog.kinematics import (
+    HOME_J1_DEG,
+    HOME_J2_DEG,
+    HOME_J3_DEG,
+    HOME_J4_DEG,
+    STEPS_PER_DEG,
+    JointAnglesDeg,
+    ik_position,
+)
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import CubeDetection
 from mt4_vision.stackpath import StackPlanner
@@ -167,6 +175,67 @@ def _travel(
     return result
 
 
+def _leg_step_counts(
+    start_xyz: tuple[float, float, float],
+    wps: list[tuple[float, float, float]],
+    j4_list: list[object],
+    start_j4_world: float | None,
+) -> list[float] | None:
+    """Motor steps on the busiest axis for each leg of a queued path.
+
+    The firmware paces a leg with a DDA clocked at ``speed_us`` per step, so
+    a leg's duration is set by whichever axis has the most steps to take --
+    NOT by how far the TCP travels in millimetres. Those two disagree
+    violently for a leg that mostly rotates the wrist: measured on a live
+    level-1 carry, the 1.2mm nudge from safe_z to hover height also swings
+    J4 by 80.8 deg (the face-align angle takes effect on the leg after the
+    "wrist"-held lift). By distance it is 0.2% of the path and gets 30ms of
+    the 12s carry; by steps it is 3634 of them and takes real time. That gap
+    is what put an 80.8 deg single-tick discontinuity into every recorded
+    stacking episode.
+
+    j4 bookkeeping: a concrete world-frame angle commands joint
+    ``j4 - j1``, while the ``"wrist"`` sentinel holds the *joint* angle
+    across the leg's J1 swing (so world j4 moves with j1 and joint J4 does
+    not). Steps are counted on the joint, which is what the motor turns.
+
+    Returns None when any waypoint has no IK solution -- the caller then
+    falls back to distance weighting rather than guessing.
+    """
+    near = JointAnglesDeg(HOME_J1_DEG, HOME_J2_DEG, HOME_J3_DEG, HOME_J4_DEG)
+    start = ik_position(*start_xyz, near=near, hold_orientation=False)
+    if start is None:
+        return None
+    prev = (start.j1, start.j2, start.j3)
+    # Joint J4 at the start of the path. Unknown world j4 (no TCP read) means
+    # we cannot track the wrist at all; treat it as stationary rather than
+    # inventing a swing.
+    prev_j4_joint = (
+        0.0 if start_j4_world is None else float(start_j4_world) - start.j1
+    )
+    near = JointAnglesDeg(start.j1, start.j2, start.j3, prev_j4_joint)
+
+    counts: list[float] = []
+    for i, wp in enumerate(wps):
+        sol = ik_position(*wp, near=near, hold_orientation=False)
+        if sol is None:
+            return None
+        cmd = j4_list[i] if i < len(j4_list) else None
+        # "wrist"/None hold the joint; a number is a world angle to convert.
+        j4_joint = (
+            float(cmd) - sol.j1 if isinstance(cmd, (int, float)) else prev_j4_joint
+        )
+        deltas = (
+            abs(sol.j1 - prev[0]), abs(sol.j2 - prev[1]),
+            abs(sol.j3 - prev[2]), abs(j4_joint - prev_j4_joint),
+        )
+        counts.append(max(d * STEPS_PER_DEG[j] for j, d in enumerate(deltas)))
+        prev = (sol.j1, sol.j2, sol.j3)
+        prev_j4_joint = j4_joint
+        near = JointAnglesDeg(sol.j1, sol.j2, sol.j3, j4_joint)
+    return counts
+
+
 def _emit_path_waypoints(
     on_waypoint: Callable[[MoveEvent], None],
     step: str,
@@ -176,6 +245,7 @@ def _emit_path_waypoints(
     speeds: list[int],
     started: float,
     ended: float,
+    start_j4_world: float | None = None,
 ) -> None:
     """Report one MoveEvent per leg of a completed queued (mq) path.
 
@@ -188,20 +258,29 @@ def _emit_path_waypoints(
     mid-carry gets labelled with one. That is worse than coarse: it is
     confidently wrong, in a way a model trained on it would learn.
 
-    So split the measured wall duration across legs by ``length * speed_us``
+    So split the measured wall duration across legs by ``steps * speed_us``
     -- speed_us is microseconds per step, so a leg's time scales with both
-    how far it goes and how slow it is run. That matters here because the
-    final ``descend`` leg runs at approach speed (several times slower than
-    travel), and weighting by distance alone would give that leg a small
-    slice of time it does not take. Still an approximation: the firmware's
-    accel ramp across the queue is not modeled, same caveat as
-    WaypointLog.state_at.
+    how much the motors turn and how slow the leg is run. The speed term
+    matters because the final ``descend`` leg runs at approach speed
+    (several times slower than travel), and ignoring it would give that leg
+    a small slice of time it does not take.
+
+    Steps, not millimetres: see ``_leg_step_counts``. Distance weighting
+    silently zeroes any leg that rotates the wrist without moving the TCP,
+    and those legs are common -- ``routed_travel`` puts the face-align angle
+    on the leg *after* the wrist-held lift, which is often a 1mm height
+    adjustment. Distance falls back in only when IK cannot solve the route.
+
+    Still an approximation: the firmware's accel ramp across the queue is
+    not modeled, same caveat as WaypointLog.state_at.
     """
+    counts = _leg_step_counts(start_xyz, wps, j4_list, start_j4_world)
     legs: list[tuple[tuple[float, float, float], float]] = []
     prev = start_xyz
     for i, wp in enumerate(wps):
         speed = float(speeds[i]) if i < len(speeds) else 1.0
-        legs.append((wp, math.dist(prev, wp) * max(speed, 1.0)))
+        effort = counts[i] if counts is not None else math.dist(prev, wp)
+        legs.append((wp, effort * max(speed, 1.0)))
         prev = wp
     total = sum(w for _, w in legs)
     span = max(ended - started, 0.0)
@@ -306,6 +385,7 @@ def travel_orthogonal(
                 [j4 if isinstance(j4, (int, float)) else None] * 2,
                 [calib.travel_speed_us, calib.travel_speed_us],
                 started, time.monotonic(),
+                start_j4_world=float(tcp.j4),
             )
         return
     if not same_z:
@@ -516,7 +596,7 @@ def routed_travel(
     if on_waypoint is not None:
         _emit_path_waypoints(
             on_waypoint, step, cur, all_wps, j4_list, speeds,
-            started, time.monotonic(),
+            started, time.monotonic(), start_j4_world=float(tcp.j4),
         )
 
 
