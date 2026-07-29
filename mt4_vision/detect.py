@@ -1,4 +1,4 @@
-"""ArUco marker and colored-cube detection in overhead camera frames."""
+"""ArUco marker and colored-cube detection in the (oblique) overhead camera."""
 
 from __future__ import annotations
 
@@ -51,18 +51,23 @@ MAX_ASPECT = 2.0
 # the dominant residual in the cube-top map (marker-3 region ~10mm). The top
 # face cannot be identified by brightness alone (red's side faces are darker
 # than its top, but green's lit front face is BRIGHTER than its top --
-# observed live), so use geometry: with a downward-looking camera the blob's
-# topmost pixels always belong to the top face. Seed there, then keep the
-# connected region of similar V. A blob that is all top face (near the
-# camera nadir) is V-uniform, so the whole blob is kept and the centroid is
-# unchanged.
+# observed live), so use geometry: the top face is the blob's topmost pixels
+# for THIS mount. That is nadir-direction-dependent, not a universal top-down
+# fact: the camera is oblique with its nadir toward +x (robot), so raising a
+# point shifts its image toward -x, i.e. upward, putting the top face above
+# the visible side faces. A camera whose nadir sat on the opposite side would
+# put the top face at the BOTTOM of the blob and this seed would grab a side
+# face -- re-check the seed edge if the camera is ever remounted. Seed there,
+# then keep the connected region of similar V. A blob that is all top face
+# (viewed near-vertically) is V-uniform, so the whole blob is kept and the
+# centroid is unchanged.
+TOP_FACE_SEED_FRACTION = 0.2  # top rows of the blob used as the seed
+TOP_FACE_V_TOL = 35.0  # faces differ by >=40-80 V; within-face spread ~15-25
+TOP_FACE_MIN_PIXELS = 20
 # Half-width (px) of the square sampled at the top-face centroid for
 # CubeDetection.sat. Small enough to stay on a ~20px cube face, big enough
 # that JPEG chroma noise on a single pixel cannot swing the median.
 SATURATION_PATCH_PX = 4
-TOP_FACE_SEED_FRACTION = 0.2  # top rows of the blob used as the seed
-TOP_FACE_V_TOL = 35.0  # faces differ by >=40-80 V; within-face spread ~15-25
-TOP_FACE_MIN_PIXELS = 20
 
 ARUCO_DICTS = {
     "4x4_50": cv2.aruco.DICT_4X4_50,

@@ -19,11 +19,21 @@ instrumented runs where applicable.
 
 ## B. Camera / vision geometry
 
+> **2026-07-25 update:** the "overhead" camera is actually **steeply oblique** —
+> nadir far off-desk at ~(518, −35) robot, lens ~244 mm up, measured directly
+> against the arm (`calibrate_camera_nadir.py`). Height parallax is therefore
+> radial from that far nadir and grows with height; `Calibration.robot_to_pixel`
+> now models it (isotropic scale = `cam_height/(cam_height − h)` about the
+> nadir). The rows below were written top-down (2026-07-20) and are annotated
+> where superseded. The residual error at large ±Y is now lens barrel distortion
+> (row 9), which a single radial model cannot express — a real fix needs
+> `cv2.calibrateCamera` intrinsics + undistort.
+
 | # | Assumption | Uncertainty | Sensitivity | Notes / evidence |
 |---|---|---|---|---|
 | 8 | The camera does not move after calibration | Violated twice in two days (sun/heat); drifts of ~4px ≈ 4mm observed, shim-corrected to <0.6px | **HIGH** for absolute pick/place | Detectable only when markers are visible — parked cubes occluded 3 of 5 markers today. Anchor-relative stack logic is partially immune; picks and level-1 placement inherit the full error. |
 | 9 | Pinhole camera, planar table, exact homographies — no lens distortion | Up to several px of position-dependent error; a 720p webcam typically has 1–3% radial distortion | **MEDIUM-HIGH, hidden** | No undistortion exists anywhere in the pipeline. Corrupts *all* derived geometry (residual layer, parallax direction `u`, px→mm Jacobian) a little, rather than one thing a lot. A one-time chessboard intrinsic calibration would remove it. |
-| 10 | Camera height Hc ≈ 700mm, "self-fitting" from observations | ±10%? Fit requires ≥2 on-column observations and has effectively stayed at the seed guess in every recent run | **LOW-MEDIUM** | Scales height estimates and px→mm conversions ~proportionally; wrong Hc bends classification thresholds. |
+| 10 | ~~Camera height Hc ≈ 700mm, "self-fitting" from observations~~ **(SUPERSEDED 2026-07-25)** | The 700 mm figure was simply wrong: lens is ~**244 mm** up and the camera is oblique (nadir far off-desk), measured against the arm. No live code path uses the old self-fit; the "700" now in the code is unrelated (step-periods, blob areas, grip timing). | **LOW** | `cam_height_mm`/`cam_xy_robot` now come from `calibrate_camera_nadir.py`; the radial model lives in `calib.robot_to_pixel`. See the section-B note above. |
 | 11 | The top-face centroid is the cube's true center | ±2–5px per reading | **HIGH** | V-seeded segmentation assumes symmetric occlusion; the gripper fingers demonstrably occlude part of the held face (620px² vs ~2x expected). Likely alternative explanation for the ±5–8mm alternating hover readings currently attributed to backlash "gain 2" (#4) — currently confounded. Discriminating experiment: repeatedly measure a *static* cube through the servo path. |
 | 12 | Cubes are the only colored blobs, separable, in fixed HSV bands | Frequent, environment-dependent failures | **MEDIUM-HIGH** | The arm itself is orange (reads red; `MAX_BLOB_AREA` + keep-out/hull the guards), hand/watch enter frame, adjacent cubes merge, lighting shifts move V/S. Area caps are mount-distance-sensitive: after moving the camera closer (2026-07-20) a real cube read ~2790px² and was dropped by the old 900/650 caps while arm flecks survived. Static-lock/misidentification class (attempts 3, 6, 8) patched with motion checks/exclusions/tight radii, not better perception. |
 | 13 | A frame taken ≥0.8s after motion shows the settled scene | Unmeasured | **LOW-MEDIUM** | Vibration/pendulum sway of a held cube after a move is assumed damped within the settle sleep. Adds to #11's noise floor. |

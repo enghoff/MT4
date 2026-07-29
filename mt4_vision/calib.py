@@ -7,14 +7,19 @@ the entire camera pose, so no camera intrinsics are needed.
 
 Cubes are detected by their top face, which sits cube_height_mm above the
 table plane, so the raw table-plane homography output is off for them by a
-camera-parallax amount -- confirmed empirically (see calibrate_height.py) to
-be roughly constant across the desk for this camera's mounting, not clearly
-radial from a nadir point, so the primary correction is cube_top_homography:
-a second homography/affine fit the same way as the table-plane one, but from
-correspondences at cube-top height (an object of known height placed exactly
-at already-calibrated robot XYs, photographed, its pixel position paired with
-that XY). cam_xy_robot/cam_height_mm remain as a fallback radial-scaling
-correction for setups without a cube_top_homography.
+camera-parallax amount. This camera is steeply *oblique* (confirmed 2026-07-25
+against the arm, see calibrate_camera_nadir.py), so that parallax is radial
+from a far off-desk nadir and grows with height -- NOT the roughly-constant,
+non-radial shift an earlier single-height fit suggested. The primary cube
+correction is still cube_top_homography: a second homography/affine fit the
+same way as the table-plane one, but from correspondences at cube-top height
+(an object of known height placed exactly at already-calibrated robot XYs,
+photographed, its pixel position paired with that XY). Fit directly at 20 mm,
+it absorbs the oblique parallax AND the blob-centroid bias at that one height
+empirically, without needing the camera geometry. cam_xy_robot/cam_height_mm
+hold the measured nadir + lens height for the true radial model, used across
+all heights by robot_to_pixel (the trajectory overlay) and as the cube-top
+fallback when no cube_top_homography is set. See robot_to_pixel below.
 """
 
 from __future__ import annotations
