@@ -260,11 +260,26 @@ class OpenEpisode:
 
 
 def _next_episode_id(episodes_dir: Path) -> int:
+    """One past the highest id ever used in this corpus.
+
+    Counts quarantined episodes too (``<root>/rejected/<reason>/ep_*``, see
+    mt4_pi.collect.prune). Pruning MOVES episodes out of ``episodes/``
+    rather than deleting them, so numbering from the survivors alone
+    reissues the ids of everything that was pruned -- and restoring a
+    quarantined episode afterwards would collide with a real one. Measured
+    on the stack corpus: the highest survivor was ep_000131 while
+    rejected/label_jump held ep_000132, so the very next recording would
+    have taken a used id.
+    """
     ids = []
-    for p in episodes_dir.glob("ep_*"):
-        suffix = p.name.split("_", 1)[-1]
-        if p.is_dir() and suffix.isdigit():
-            ids.append(int(suffix))
+    roots = [episodes_dir, *(episodes_dir.parent / "rejected").glob("*")]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for p in root.glob("ep_*"):
+            suffix = p.name.split("_", 1)[-1]
+            if p.is_dir() and suffix.isdigit():
+                ids.append(int(suffix))
     return max(ids, default=-1) + 1
 
 
