@@ -58,6 +58,7 @@ from mt4_vision.stackpath import StackPlanner
 from mt4_vision.workspace import (
     MARKER_PAPER_CLEARANCE_MM,
     MAX_REACH_MM,
+    MAX_VERIFIABLE_RADIUS_MM,
     MarkerSlot,
     dist_mm,
     is_mp_reachable_xy,
@@ -75,10 +76,18 @@ DROP_SPACING_FALLBACKS_MM = (75.0, 60.0, 45.0)
 # Scatter radius band (mm, robot frame). Floor: field case 2026-07-24 (see
 # stack_cubes.py's CLEAR_MIN_RADIUS_MM) -- a cube parked close to the J1
 # keep-out was occluded by the arm's own camera-park silhouette and never
-# seen again by later scans. Ceiling: PLACEMENT_SLOTS (workspace.py) tops
-# out at ~283mm; beyond ~300mm this camera's far-field detection degrades.
+# seen again by later scans.
+#
+# Ceiling: the camera, not the arm. This was 300mm on the reasoning that
+# far-field detection only "degrades" beyond that -- but degraded detection
+# out there is indistinguishable from a lost cube, and every drop past
+# MAX_VERIFIABLE_RADIUS_MM is a one-way trip. Measured 2026-07-29 over one
+# autonomous session: unstack scattered to r = 251-279 repeatedly, two of
+# those landings were stamped "lost" despite being perfect placements, and
+# the survivors accumulated until 5 of 9 cubes sat outside the detection
+# hull and the desk needed re-scattering by hand.
 SCATTER_MIN_RADIUS_MM = 170.0
-SCATTER_MAX_RADIUS_MM = 300.0
+SCATTER_MAX_RADIUS_MM = MAX_VERIFIABLE_RADIUS_MM
 
 # Cubes this close to the unstack site are left alone -- clear of the
 # column while it's still standing, and out of the way once it's gone.
