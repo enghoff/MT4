@@ -47,6 +47,24 @@ MAX_REACH_MM = 350.0
 KEEPOUT_RADIUS_MM = 140.0
 KEEPOUT_TARGET_MARGIN_MM = 0.5  # mirrors start_absolute_move in motion.cpp
 
+# Furthest radius the camera can still confirm a cube at. The arm reaches far
+# beyond this; the camera does not, and anything put down past it is lost to
+# vision until moved by hand. Two things go wrong at once out there:
+#
+#   1. The placement cannot be verified, so a perfect demonstration gets
+#      stamped success=False and is dropped by the converter.
+#   2. The cube is now invisible to every planner, which cannot pick it
+#      again. Measured twice: four consecutive far-slot placements removed
+#      4 of 7 cubes from the table and had to be retrieved open-loop, and
+#      unstack scattering to r=300 drifted 5 of 9 cubes out of the
+#      workspace over one long session.
+#
+# 240mm sits just above the furthest reliably-detected ArUco marker
+# (r = 236mm) and leaves the near placement slots (r = 180-209mm) usable.
+# This is a limit of the camera's coverage, not of the arm -- do not raise it
+# to "reach more of the desk" without re-measuring detection out there.
+MAX_VERIFIABLE_RADIUS_MM = 240.0
+
 # Open-table placement candidates (robot frame, mm). Shared with
 # calibrate_height.py probe grid.
 PLACEMENT_SLOTS: list[tuple[float, float]] = [
