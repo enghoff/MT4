@@ -28,6 +28,7 @@ import random
 import shutil
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 from mt4_jog.client import Mt4Client, Mt4ClientError
@@ -37,9 +38,17 @@ from mt4_vision.camera import DEFAULT_CAMERA_INDEX
 from mt4_vision.pickplace import home_arm, pick_cube, place, retreat_for_camera
 from mt4_vision.policy import plan_shuffle
 from mt4_vision.scene import capture_scene, verify_pick_place
+from mt4_vision.workspace import free_placement_slots
 from unstack_cubes import random_place_j4
 from mt4_vision.shuffle import POST_MOVE_RECHECK_ATTEMPTS, POST_MOVE_RECHECK_DELAY_S
 
+from mt4_pi.collect.balance import (
+    COLLECTION_SLOTS,
+    count_cells,
+    deficits,
+    format_cells,
+    plan_balanced,
+)
 from mt4_pi.collect.prompts import build_prompt
 from mt4_pi.collect.recorder import (
     DEFAULT_HZ,
@@ -158,6 +167,8 @@ def _run(
     max_episodes: int | None,
     home_every: int,
     retry_s: float,
+    balance_target: int = 0,
+    count_roots: list[Path] | None = None,
     random_yaw_prob: float = 1.0,
     seed: int | None = None,
 ) -> None:
@@ -198,6 +209,16 @@ def _run(
 
     cam = EpisodeCamera(camera_index)
     recorder = EpisodeRecorder(out_dir, camera_index=camera_index, calib_path=calib_path)
+
+    # Balance mode counts the WHOLE corpus, not just this run's output, so a
+    # restart keeps filling the same gaps instead of re-balancing from zero.
+    cells = Counter()
+    if balance_target:
+        roots = count_roots or [out_dir]
+        cells = count_cells(*roots)
+        print(f"balance target {balance_target}/cell over {[str(r) for r in roots]}")
+        print(f"  current: {format_cells(cells, balance_target)}")
+
     last_place: tuple[float, float] | None = None
     fail_streak = 0
     picks_since_home = 0
@@ -262,7 +283,32 @@ def _run(
                     print(f"camera retreat failed: {exc}")
 
                 scene = capture_scene(calib, cam.capture_scene_frame())
-                action = plan_shuffle(scene, avoid_xy=last_place)
+                if balance_target:
+                    # Finishing is a real end state here, unlike free
+                    # shuffling: once every cell is at target the planner can
+                    # only return "wait", and the loop would spin on the
+                    # retry timer forever.
+                    if not any(deficits(cells, balance_target).values()):
+                        print(f"all cells at target {balance_target} -- collection complete")
+                        print(f"  final: {format_cells(cells, balance_target)}")
+                        return
+                    # Re-check the collection grid against this frame:
+                    # free_placement_slots drops anything unreachable, too
+                    # close to a marker's paper, or already holding a cube.
+                    # raw_cubes, not cubes: `cubes` is the phantom-filtered
+                    # pick-quality subset, and a detection dropped for being
+                    # unpickable still occupies the space. rebuild_workspace_state
+                    # uses raw for exactly this reason.
+                    occupancy = scene.raw_cubes if scene.raw_cubes is not None else scene.cubes
+                    slots = free_placement_slots(
+                        calib, scene.markers, occupancy, slots=COLLECTION_SLOTS
+                    )
+                    action = plan_balanced(
+                        scene, cells, target=balance_target,
+                        avoid_xy=last_place, slots=slots,
+                    )
+                else:
+                    action = plan_shuffle(scene, avoid_xy=last_place)
 
                 if action.kind != "pick" or action.cube is None or action.place_x is None:
                     print(f"Waiting {retry_s:.0f}s for a clearer scene ({action.reason})")
@@ -350,6 +396,11 @@ def _run(
 
                 if verdict == "placed":
                     fail_streak = 0
+                    # Only successful episodes survive conversion, so only
+                    # they may retire a cell's deficit.
+                    if balance_target:
+                        cells[(cube.color, action.place_kind)] += 1
+                        print(f"  cells: {format_cells(cells, balance_target)}")
                     last_place = (place_x, place_y)
                     if home_every and picks_since_home >= home_every:
                         rehome(f"{picks_since_home} picks since last home")
@@ -409,6 +460,18 @@ def main() -> int:
              "collecting the remainder at 1.0 yields a mixed corpus rather than a new bias.",
     )
     parser.add_argument("--seed", type=int, default=None, help="seed the placement-orientation RNG")
+    parser.add_argument(
+        "--balance", type=int, default=0, metavar="N",
+        help="collect toward N successful episodes per (colour, place-kind) cell instead of "
+             "shuffling freely. The default planner cannot produce a balanced corpus: it only "
+             "reaches to_slot when no marker is free, and picks colour uniformly over whatever "
+             "is pickable. 0 (default) keeps the original behaviour.",
+    )
+    parser.add_argument(
+        "--count-root", action="append", dest="count_roots", default=None,
+        help="collection root to count toward --balance; repeat to include earlier corpora "
+             "(default: --out only). Pass the existing roots so the run fills real gaps.",
+    )
     args = parser.parse_args()
 
     calib = load_calibration(args.calib)
@@ -427,6 +490,8 @@ def main() -> int:
             retry_s=args.retry,
             random_yaw_prob=min(1.0, max(0.0, args.random_yaw_prob)),
             seed=args.seed,
+            balance_target=max(0, args.balance),
+            count_roots=[Path(r) for r in args.count_roots] if args.count_roots else None,
         )
     except KeyboardInterrupt:
         print("\nStopped")
