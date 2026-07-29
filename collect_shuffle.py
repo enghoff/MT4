@@ -24,6 +24,7 @@ alignment drift that successful picks still accumulate.
 from __future__ import annotations
 
 import argparse
+import random
 import shutil
 import sys
 import time
@@ -36,6 +37,7 @@ from mt4_vision.camera import DEFAULT_CAMERA_INDEX
 from mt4_vision.pickplace import home_arm, pick_cube, place, retreat_for_camera
 from mt4_vision.policy import plan_shuffle
 from mt4_vision.scene import capture_scene, verify_pick_place
+from unstack_cubes import random_place_j4
 from mt4_vision.shuffle import POST_MOVE_RECHECK_ATTEMPTS, POST_MOVE_RECHECK_DELAY_S
 
 from mt4_pi.collect.prompts import build_prompt
@@ -156,7 +158,37 @@ def _run(
     max_episodes: int | None,
     home_every: int,
     retry_s: float,
+    random_yaw_prob: float = 1.0,
+    seed: int | None = None,
 ) -> None:
+    """`random_yaw_prob` is the chance each place lands at a random cube
+    orientation instead of square to the world axes.
+
+    `place()` defaults to `axis_align=True`, which squares the released cube
+    to the X/Y axes. That is right for tidy shuffling and wrong as the ONLY
+    behaviour for a dataset: every place drives the table toward yaw = 0
+    (mod 90), so the corpus concentrates near axis-aligned and the policy
+    rarely sees an angled cube. Measured over the shuffle corpus: mean |yaw|
+    at grasp 10.0 deg, 43.8% of picks within 5 deg of axis-aligned, only
+    18.6% beyond 20 deg. The already-randomising stack collector reaches
+    34.2% beyond 20 deg through the same helper.
+
+    Note the gripper alignment itself was never missing: `resolve_pick_j4`
+    estimates the cube's edge angle from detection and `j4_for_face_align`
+    squares the jaws to a face, so every demonstration does contain wrist
+    alignment. The problem is narrower -- that behaviour is only ever
+    demonstrated at angles near zero, so the j4 channel is under-exercised
+    rather than absent. Measured over 201 pre-change episodes, the commanded
+    place angle was **exactly 0.0 deg every single time** (std 0.0).
+
+    A probability rather than a flag because BOTH regimes are wanted.
+    Axis-aligned picks are cleaner and their orientation is known, which
+    makes them the easier examples worth keeping; randomised ones supply the
+    variation. Since the 210 episodes already collected are overwhelmingly
+    axis-aligned, running the remainder at 1.0 lands the *combined* corpus
+    on a mix rather than replacing one bias with another.
+    """
+    rng = random.Random(seed)
     if client.get_status().homed:
         print("Already homed")
     else:
@@ -257,7 +289,16 @@ def _run(
                 failed_exc: Mt4ClientError | None = None
                 try:
                     pick_cube(client, calib, cube, on_waypoint=episode.on_waypoint)
-                    place(client, calib, place_x, place_y, on_waypoint=episode.on_waypoint)
+                    # Land at a random orientation rather than square to the
+                    # axes -- see random_yaw in _run's signature.
+                    place_j4 = (
+                        random_place_j4(place_x, place_y, rng)
+                        if rng.random() < random_yaw_prob else None
+                    )
+                    place(
+                        client, calib, place_x, place_y,
+                        j4=place_j4, on_waypoint=episode.on_waypoint,
+                    )
                 except Mt4ClientError as exc:
                     failed_exc = exc
                 ticks = cam.end_recording()
@@ -360,6 +401,14 @@ def main() -> int:
              f"alignment drift (default {HOME_EVERY_PICKS}, 0 disables)",
     )
     parser.add_argument("--retry", type=float, default=5.0, help="seconds to wait when no valid move is visible")
+    parser.add_argument(
+        "--random-yaw-prob", type=float, default=1.0, metavar="P",
+        help="chance each place lands the cube at a random orientation rather than square "
+             "to the world axes (default 1.0; 0 restores place()'s axis-align default). "
+             "Axis-aligned picks are cleaner and already dominate the existing corpus, so "
+             "collecting the remainder at 1.0 yields a mixed corpus rather than a new bias.",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="seed the placement-orientation RNG")
     args = parser.parse_args()
 
     calib = load_calibration(args.calib)
@@ -376,6 +425,8 @@ def main() -> int:
             max_episodes=args.episodes,
             home_every=max(0, args.home_every),
             retry_s=args.retry,
+            random_yaw_prob=min(1.0, max(0.0, args.random_yaw_prob)),
+            seed=args.seed,
         )
     except KeyboardInterrupt:
         print("\nStopped")
