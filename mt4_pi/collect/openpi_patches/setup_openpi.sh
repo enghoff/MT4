@@ -26,6 +26,17 @@ log APT_INSTALL
 sudo apt-get update -qq 2>&1 | tail -2
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl build-essential 2>&1 | tail -3
 
+# Brev GPU boxes ship swap-less. A checkpoint save pulls every param
+# GPU->host, and that spike on top of the training footprint has wedged an
+# instance hard enough to kill sshd -- twice, on two different providers.
+# Swap is cheap insurance; see PI05_FINETUNING_PIPELINE.md 4c-bis.
+log ADD_SWAP
+if ! swapon --show | grep -q swapfile; then
+  sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
+  sudo mkswap /swapfile >/dev/null && sudo swapon /swapfile
+fi
+swapon --show || echo "WARNING: no swap active"
+
 # --- 2. uv ------------------------------------------------------------------
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
