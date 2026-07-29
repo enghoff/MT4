@@ -55,8 +55,22 @@ def _load_policy(checkpoint: Path, device: str):
     policy = ACTPolicy.from_pretrained(str(checkpoint))
     policy.eval()
     policy.to(device)
+
+    # The saved preprocessor pipeline hard-codes the device it was trained
+    # on: `policy_preprocessor.json` carries a `device_processor` step with
+    # {"device": "cuda"}. Loading the policy onto the CPU is not enough on
+    # its own -- `pre(batch)` would move the batch to cuda, hand it to CPU
+    # weights, and die with "Expected all tensors to be on the same device".
+    # Setting `policy.config.device` does NOT fix it either: the step is
+    # rebuilt from the saved JSON, not from the config. The override is the
+    # only thing that reaches it.
+    #
+    # (The postprocessor's own device step is already "cpu" -- it exists to
+    # bring actions back off the accelerator -- so it needs nothing.)
     preprocessor, postprocessor = make_pre_post_processors(
-        policy.config, pretrained_path=str(checkpoint)
+        policy.config,
+        pretrained_path=str(checkpoint),
+        preprocessor_overrides={"device_processor": {"device": device}},
     )
     torch.set_grad_enabled(False)
     return policy, preprocessor, postprocessor
