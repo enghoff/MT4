@@ -22,6 +22,24 @@ DEFAULT_MCP_PORT = 8787
 _client: Mt4Client | None = None
 
 
+def _preimport_vision() -> None:
+    """Load the OpenCV/numpy C extensions on the main thread, before serving.
+
+    FastMCP runs sync tools in worker threads, and the vision tools import cv2
+    lazily inside them (see the entity layer below). On Windows that first
+    `import cv2` from a worker thread of a stdio child deadlocks in numpy's
+    extension loader -- faulthandler showed mt4_scene parked forever in
+    numpy/_core/overrides.py create_module, so the tool never returned and the
+    client timed out with no error. Importing it here makes the tool-level
+    imports cache hits. Hosts without the camera stack are unaffected: the
+    motion tools keep working and the vision tools raise as they did before.
+    """
+    try:
+        import cv2  # noqa: F401
+    except Exception:  # noqa: BLE001 -- no camera stack is a supported setup
+        pass
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -239,7 +257,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         _token_seq += 1
         return f"{prefix}{_token_seq}"
 
-    def _build_snapshot() -> tuple[Any, Any]:
+    def _build_snapshot(camera: int = 1) -> tuple[Any, Any]:
         """Fresh frame -> (Scene, Snapshot), re-acquiring registered objects."""
         from mt4_vision.calib import load_calibration
         from mt4_vision.camera import capture_frame
@@ -249,7 +267,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
 
         nonlocal _snapshot, _objects
         calib = load_calibration()
-        frame = capture_frame()
+        frame = capture_frame(camera)
         scene = capture_scene(calib, frame)
 
         # A located object is not re-detectable from scratch (there is no colour
@@ -271,7 +289,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         return scene, snapshot
 
     @server.tool
-    def mt4_scene() -> dict[str, Any]:
+    def mt4_scene(camera: int = 1) -> dict[str, Any]:
         """List everything on the work surface as addressable entities.
 
         Returns {snapshot, summary, entities}. Each entity has an `id` to pass
@@ -291,15 +309,18 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
 
         Uses a fresh camera frame, so ids change between calls. Re-call after
         anything moves. Requires the calibration from `python calibrate_vision.py`.
+
+        Args:
+            camera: USB camera index (default 1 -- the overhead work camera).
         """
         try:
-            _scene, snapshot = _build_snapshot()
+            _scene, snapshot = _build_snapshot(camera)
             return {"ok": True, **snapshot.as_dict()}
         except Exception as exc:  # noqa: BLE001 -- surface camera/calib errors
             return {"ok": False, "error": str(exc)}
 
     @server.tool
-    def mt4_camera_view() -> Any:
+    def mt4_camera_view(camera: int = 1) -> Any:
         """Return the current camera frame as an image, for finding something
         the cube detector cannot see (a pen, a key, a screwdriver).
 
@@ -312,6 +333,9 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
 
         Only for objects mt4_scene does not already list. If the thing you want
         is already a `cube_N` or `marker_N`, use that id instead.
+
+        Args:
+            camera: USB camera index (default 1 -- the overhead work camera).
         """
         try:
             import cv2
@@ -321,7 +345,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             from mt4_vision.preview import annotate_for_pointing
 
             nonlocal _view
-            frame = capture_frame()
+            frame = capture_frame(camera)
             entities = [] if _snapshot is None else _snapshot.entities
             annotated = annotate_for_pointing(frame, entities)
             ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -406,7 +430,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
 
-    def _reacquire(entity: Any) -> tuple[Any, Any, str | None]:
+    def _reacquire(entity: Any, camera: int = 1) -> tuple[Any, Any, str | None]:
         """(calib, Grasp, error) for acting on ``entity`` against a fresh frame.
 
         Cubes are re-detected by colour near the remembered position; located
@@ -428,7 +452,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             # Fixed calibrated positions; nothing to re-detect.
             return calib, entity.as_grasp(calib), None
 
-        frame = capture_frame()
+        frame = capture_frame(camera)
         if entity.kind == KIND_OBJECT:
             obj = _objects.get(entity.id)
             if obj is None:
@@ -499,7 +523,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         return entity, None
 
     @server.tool
-    def mt4_pick(entity_id: str) -> dict[str, Any]:
+    def mt4_pick(entity_id: str, camera: int = 1) -> dict[str, Any]:
         """Pick up the entity with this id (from mt4_scene / mt4_locate_at_pixel).
 
         Re-detects the target on a fresh frame first and refuses if it is no
@@ -514,6 +538,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
 
         Args:
             entity_id: e.g. "cube_2" or "obj_1".
+            camera: USB camera index for re-detection (default 1).
         """
         try:
             from mt4_vision.motion import pick_at
@@ -541,7 +566,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
                     "ok": False,
                     "error": f"{entity_id} is not pickable: {entity.reason}",
                 }
-            calib, grasp, err = _reacquire(entity)
+            calib, grasp, err = _reacquire(entity, camera)
             if err is not None:
                 return {"ok": False, "error": err}
             result = pick_at(get_client(), calib, grasp)
@@ -697,7 +722,9 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             return {"ok": False, "error": str(exc)}
 
     @server.tool
-    def mt4_goto_marker(marker_id: int, touch: bool = False) -> dict[str, Any]:
+    def mt4_goto_marker(
+        marker_id: int, touch: bool = False, camera: int = 1
+    ) -> dict[str, Any]:
         """Move the TCP to a calibration ArUco marker's position -- a
         calibration accuracy check, not a normal operation. Re-detects the
         marker on a fresh frame and converts its pixel position through the
@@ -709,6 +736,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             marker_id: ArUco marker id to move to (see mt4_scene's calibration
                 or the physical markers on the work surface).
             touch: If true, descend to table height instead of hovering.
+            camera: USB camera index (default 1 -- the overhead work camera).
         """
         try:
             from mt4_vision.calib import load_calibration
@@ -717,7 +745,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             from mt4_vision.pickplace import goto_marker
 
             calib = load_calibration()
-            markers = detect_markers(capture_frame())
+            markers = detect_markers(capture_frame(camera))
             match = next((m for m in markers if m.marker_id == marker_id), None)
             if match is None:
                 return {
@@ -760,6 +788,7 @@ def main() -> None:
         help="HTTP port (default: 8787)",
     )
     args = parser.parse_args()
+    _preimport_vision()
 
     if args.stdio:
         create_mcp().run(transport="stdio")
