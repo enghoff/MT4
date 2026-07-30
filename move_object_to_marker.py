@@ -8,10 +8,11 @@ Repeatedly asks for an object description, then::
     filter                  -> reachable / pickable / not already on a marker
     motion.transfer         -> pick with 180° long-axis wrist, place on free marker
 
-Re-parks after every transfer so the next prompt can capture immediately.
-Objects that cannot be segmented, are out of reach, fail grasp feasibility, or
-have no free marker are skipped -- never substituted onto a different target.
-Loops until Ctrl+C / EOF.
+While a prompt is active, a background thread re-runs DINO on fresh camera
+frames and updates the preview -- paced by detection latency (~0.3s on media).
+Re-parks after every transfer so the next planning capture is clear. Objects
+that cannot be segmented, are out of reach, fail grasp feasibility, or have no
+free marker are skipped. Loops until Ctrl+C / EOF.
 
 Prereqs:
   * ``.\\scripts\\start_grounding_tunnel.ps1``
@@ -27,15 +28,17 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import DEFAULT_CALIB_PATH, Calibration, load_calibration
-from mt4_vision.camera import DEFAULT_CAMERA_INDEX, capture_frame
+from mt4_vision.camera import DEFAULT_CAMERA_INDEX, FrameStream, CameraError, capture_frame
 from mt4_vision.entities import object_entity
 from mt4_vision.grounding import Detection, GroundingError, detect, health
 from mt4_vision.locate import LocateError, LocatedObject, grasp_feasibility, measure
@@ -132,35 +135,32 @@ def _gather_candidates(
     return measured, skips
 
 
-def _annotate_plan(
-    frame,
-    pairs: list[tuple[Candidate, MarkerSlot]],
-    skips: list[str],
-):
+def _annotate_track(
+    frame: np.ndarray,
+    dets: list[Detection],
+    prompt: str,
+    status: str,
+) -> np.ndarray:
+    """Draw every current DINO hit for the tracked prompt."""
     out = frame.copy()
-    for cand, marker in pairs:
-        d, obj = cand.det, cand.obj
+    for i, d in enumerate(dets):
+        color = (0, 255, 255) if i == 0 else (180, 180, 80)
         cv2.rectangle(
-            out, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), (0, 255, 255), 2,
+            out, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), color, 2,
         )
-        cv2.circle(out, (int(obj.px), int(obj.py)), 6, (0, 0, 255), -1)
         cv2.putText(
             out,
-            f"{obj.label}->{marker.marker_id}",
+            f"{d.label} {d.score:.2f}",
             (int(d.x1), max(20, int(d.y1) - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (0, 255, 255),
+            color,
             2,
         )
+    title = status or f"tracking {prompt}"
     cv2.putText(
-        out,
-        f"plan {len(pairs)} move(s), {len(skips)} skip(s)",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2,
+        out, title, (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
     )
     return out
 
@@ -178,6 +178,81 @@ def _prompt_object() -> str | None:
         print()
         return None
     return raw.strip()
+
+
+class DinoTrackPreview:
+    """Background DINO → annotate → preview loop for the active prompt.
+
+    Pace is whatever ``detect`` takes (plus a fresh camera frame); there is no
+    extra sleep. Runs through pick/place and the next prompt wait so the last
+    requested object stays visually tracked.
+    """
+
+    def __init__(
+        self,
+        stream: FrameStream,
+        preview: LivePreview,
+        *,
+        box_threshold: float,
+        text_threshold: float,
+    ) -> None:
+        self._stream = stream
+        self._preview = preview
+        self._box_threshold = box_threshold
+        self._text_threshold = text_threshold
+        self._lock = threading.Lock()
+        self._prompt: str | None = None
+        self._status = ""
+        self._stop = threading.Event()
+        self._user_quit = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop, name="dino-track", daemon=True,
+        )
+        self._thread.start()
+
+    def track(self, prompt: str, status: str = "") -> None:
+        with self._lock:
+            self._prompt = prompt
+            self._status = status
+
+    def set_status(self, status: str) -> None:
+        with self._lock:
+            self._status = status
+
+    def stopped_by_user(self) -> bool:
+        return self._user_quit.is_set()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                prompt = self._prompt
+                status = self._status
+            if not prompt:
+                time.sleep(0.05)
+                continue
+            try:
+                frame = self._stream.fresh(min_advance=1)
+                dets = detect(
+                    frame, prompt,
+                    box_threshold=self._box_threshold,
+                    text_threshold=self._text_threshold,
+                )
+            except (CameraError, GroundingError):
+                time.sleep(0.2)
+                continue
+            except Exception:  # noqa: BLE001 -- keep the feed alive
+                time.sleep(0.2)
+                continue
+            try:
+                self._preview.show(_annotate_track(frame, dets, prompt, status))
+            except PreviewStopped:
+                self._user_quit.set()
+                break
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._preview.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,19 +322,44 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"arm error: {exc}", file=sys.stderr)
                 return 1
 
+    stream: FrameStream | None = None
+    tracker: DinoTrackPreview | None = None
+    if not args.no_preview:
+        stream = FrameStream(args.camera)
+        tracker = DinoTrackPreview(
+            stream,
+            LivePreview("move object"),
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
+        )
+
     moved = 0
     deny: list[tuple[float, float]] = []
-    preview = None if args.no_preview else LivePreview("move object")
     print("ready")
     try:
         while True:
+            if tracker is not None and tracker.stopped_by_user():
+                break
             prompt = _prompt_object()
             if prompt is None:
                 break
             if not prompt:
                 continue
+            if tracker is not None and tracker.stopped_by_user():
+                break
 
-            frame = capture_frame(args.camera)
+            if tracker is not None:
+                tracker.track(prompt, status=f"finding {prompt}")
+
+            try:
+                frame = (
+                    stream.fresh(min_advance=2) if stream is not None
+                    else capture_frame(args.camera)
+                )
+            except CameraError as exc:
+                print(f"camera: {exc}")
+                continue
+
             scene = capture_scene(calib, frame)
             free = scene.placeable_markers()
             if allow_markers is not None:
@@ -267,6 +367,8 @@ def main(argv: list[str] | None = None) -> int:
             free = sorted(free, key=lambda m: m.marker_id)
             if not free:
                 print("no free markers")
+                if tracker is not None:
+                    tracker.set_status(f"tracking {prompt}")
                 continue
 
             try:
@@ -282,19 +384,21 @@ def main(argv: list[str] | None = None) -> int:
 
             if not candidates:
                 print(skips[0] if skips else f"didn't find {prompt}")
+                if tracker is not None:
+                    tracker.set_status(f"tracking {prompt}")
                 continue
 
             cand = candidates[0]
             marker = free[0]
-            annotated = _annotate_plan(frame, [(cand, marker)], skips)
-            if preview is not None:
-                try:
-                    preview.show(annotated)
-                except PreviewStopped:
-                    break
+            if tracker is not None:
+                tracker.set_status(
+                    f"moving {cand.obj.label} -> marker {marker.marker_id}"
+                )
 
             if args.dry_run:
                 print(f"would move {cand.obj.label} -> marker {marker.marker_id}")
+                if tracker is not None:
+                    tracker.set_status(f"tracking {prompt}")
                 continue
 
             assert client is not None
@@ -318,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
             except Mt4ClientError as exc:
                 print(f"couldn't move: {exc}")
                 deny.append((cand.obj.x, cand.obj.y))
+            if tracker is not None:
+                tracker.set_status(f"tracking {prompt}")
             if not args.no_park:
                 try:
                     _park(client, calib)
@@ -330,8 +436,10 @@ def main(argv: list[str] | None = None) -> int:
         print()
         return 0
     finally:
-        if preview is not None:
-            preview.close()
+        if tracker is not None:
+            tracker.close()
+        if stream is not None:
+            stream.close()
         if client is not None:
             try:
                 if not args.no_park:
