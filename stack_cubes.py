@@ -44,6 +44,14 @@ from mt4_vision.detect import CubeDetection
 
 # _travel/_approach/_check are pickplace's single-segment movers; the stack
 # executor below sequences them along StackPlanner routes.
+from mt4_vision.landing import (
+    LANDING_MIN_RADIUS_MM,
+    LANDING_SEP_MM,
+    annulus_grid,
+    expanding_angles_deg,
+    nearest_landing,
+    push_aside_xy,
+)
 from mt4_vision.motion import (
     VERIFY_ORIGIN_RADIUS_MM,
     grasp_failed_at,
@@ -70,7 +78,7 @@ from mt4_vision.pickplace import (
     routed_travel,
 )
 from mt4_vision.preview import LiveFeed, PreviewStopped
-from mt4_vision.scene import Scene, capture_scene, within_pick_hull
+from mt4_vision.scene import Scene, capture_scene
 from mt4_vision.stackpath import StackPlanner
 from mt4_vision.workspace import (
     MAX_REACH_MM,
@@ -88,12 +96,12 @@ SITE_CLEAR_MM = 70.0
 CLEAR_MARGIN_MM = 40.0
 CLEAR_PARK_MM = SITE_CLEAR_MM + CLEAR_MARGIN_MM  # 110mm from marker
 # Finger clearance from other cubes when parking a cleared cube.
-CLEAR_SEP_MM = 45.0
+CLEAR_SEP_MM = LANDING_SEP_MM
 # Cleared cubes must stay visible: the parked arm occludes a strip over the
 # J1 keep-out, so a cube dropped near it vanishes from later scans (field
 # case 2026-07-24: a clear to (134,49) at r=143 was never seen again and the
 # build stalled "no reachable cube" with the cube sitting right there).
-CLEAR_MIN_RADIUS_MM = 170.0
+CLEAR_MIN_RADIUS_MM = LANDING_MIN_RADIUS_MM
 # Settle after retreat before a fresh scene capture.
 CAMERA_SETTLE_S = 0.8
 SITE_CLEAR_ATTEMPTS = 6
@@ -113,26 +121,14 @@ STACK_SHADOW_ALONG_PER_LEVEL_MM = 35.0
 STACK_SHADOW_ALONG_FLOOR_MM = 90.0
 
 
-def _expanding_angles_deg(step: float = 20.0) -> tuple[float, ...]:
-    """0, then +-step, +-2*step, ... out to +-180 (a full-circle sweep that
-    tries the straightest push first)."""
-    angles = [0.0]
-    a = step
-    while a < 180.0:
-        angles.append(a)
-        angles.append(-a)
-        a += step
-    angles.append(180.0)
-    return tuple(angles)
-
-
 # Field case 2026-07-24: the old +-110 deg cap only ever tried a narrow fan
 # off the marker->cube bearing. At a corner site (marker 0) that fan mostly
 # fell outside the pick hull, leaving exactly one valid landing -- which the
 # previously-cleared cube had just taken, stranding the next clear with
 # "no reachable clear spot" even though open table space existed elsewhere
 # around the site. A full-circle sweep finds those spots.
-_CLEAR_ANGLES_DEG = _expanding_angles_deg()
+_CLEAR_ANGLES_DEG = expanding_angles_deg()
+_PARK_GRID = annulus_grid()
 
 
 def marker_by_id(calib, marker_id: int) -> MarkerSlot:
@@ -234,37 +230,6 @@ def cubes_near_site(
     ]
 
 
-def _clear_landing_ok(
-    tx: float,
-    ty: float,
-    *,
-    sx: float,
-    sy: float,
-    occupied: list[tuple[float, float]],
-    markers: list[MarkerSlot] | None,
-    behind_u: tuple[float, float] | None,
-    shadow_levels: int,
-) -> bool:
-    """True when a clear drop should remain a later pick candidate."""
-    if not is_mp_reachable_xy(tx, ty):
-        return False
-    r = math.hypot(tx, ty)
-    if r > MAX_REACH_MM or r < CLEAR_MIN_RADIUS_MM:
-        return False
-    if any(dist_mm(tx, ty, ox, oy) < CLEAR_SEP_MM for ox, oy in occupied):
-        return False
-    # Stay inside the same hull gate pick uses, so clears are not dropped
-    # as "phantoms" on the next capture.
-    if markers is not None and not within_pick_hull(tx, ty, markers):
-        return False
-    # Avoid the camera-LOS corridor behind the site (ignored once stacked).
-    if behind_u is not None and in_stack_camera_shadow(
-        tx, ty, sx, sy, behind_u, stack_levels=shadow_levels,
-    ):
-        return False
-    return True
-
-
 def clear_aside_xy(
     sx: float,
     sy: float,
@@ -283,48 +248,18 @@ def clear_aside_xy(
     and radii if the primary landing is blocked or unreachable. Prefers
     landings that stay pickable (marker hull + not in stack camera shadow).
     """
-    dx, dy = cx - sx, cy - sy
-    r = math.hypot(dx, dy)
-    if r < 1.0:
-        # Sitting on the tag: push outward along the marker's base bearing.
-        dx, dy = sx, sy
-        r = math.hypot(dx, dy) or 1.0
-    ux, uy = dx / r, dy / r
-    for dist in (CLEAR_PARK_MM, CLEAR_PARK_MM + 25.0, CLEAR_PARK_MM + 45.0):
-        for angle_deg in _CLEAR_ANGLES_DEG:
-            ang = math.radians(angle_deg)
-            ca, sa = math.cos(ang), math.sin(ang)
-            vx, vy = ux * ca - uy * sa, ux * sa + uy * ca
-            tx, ty = sx + vx * dist, sy + vy * dist
-            if _clear_landing_ok(
-                tx, ty, sx=sx, sy=sy, occupied=occupied,
-                markers=markers, behind_u=behind_u,
-                shadow_levels=shadow_levels,
-            ):
-                return (tx, ty)
-    return None
 
+    def _shadowed(x: float, y: float) -> bool:
+        return behind_u is not None and in_stack_camera_shadow(
+            x, y, sx, sy, behind_u, stack_levels=shadow_levels,
+        )
 
-def _park_grid_candidates(step_mm: float = 40.0) -> list[tuple[float, float]]:
-    """Rings of points spanning the whole reachable annulus, not just the
-    8 fixed PLACEMENT_SLOTS. Those slots double as where stock cubes for the
-    build get staged, so all 8 can be occupied (or, near a corner marker,
-    outside the pick hull) at once -- see _CLEAR_ANGLES_DEG above for the
-    matching field case. This is the fallback of last resort, so it trades
-    a few dozen cheap arithmetic checks for never reporting "no clear spot"
-    while open table space remains."""
-    pts: list[tuple[float, float]] = []
-    r = CLEAR_MIN_RADIUS_MM
-    while r <= MAX_REACH_MM:
-        steps = max(1, round(2 * math.pi * r / step_mm))
-        for i in range(steps):
-            ang = 2 * math.pi * i / steps
-            pts.append((r * math.cos(ang), r * math.sin(ang)))
-        r += step_mm
-    return pts
-
-
-_PARK_GRID = _park_grid_candidates()
+    return push_aside_xy(
+        sx, sy, cx, cy, occupied,
+        park_mm=CLEAR_PARK_MM, angles_deg=_CLEAR_ANGLES_DEG,
+        markers=markers, blocked=_shadowed,
+        sep_mm=CLEAR_SEP_MM, min_radius_mm=CLEAR_MIN_RADIUS_MM,
+    )
 
 
 def choose_park_slot(
@@ -343,21 +278,23 @@ def choose_park_slot(
     staging spots); falls back to a full annulus grid scan when none of
     those are free.
     """
-    avoid = avoid or []
 
-    def _valid(x: float, y: float) -> bool:
-        return dist_mm(x, y, sx, sy) >= CLEAR_PARK_MM and _clear_landing_ok(
-            x, y, sx=sx, sy=sy, occupied=avoid,
-            markers=markers, behind_u=behind_u,
-            shadow_levels=shadow_levels,
+    def _shadowed(x: float, y: float) -> bool:
+        return behind_u is not None and in_stack_camera_shadow(
+            x, y, sx, sy, behind_u, stack_levels=shadow_levels,
         )
 
-    candidates = [(x, y) for x, y in scene.free_slots if _valid(x, y)]
-    if not candidates:
-        candidates = [(x, y) for x, y in _PARK_GRID if _valid(x, y)]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda p: dist_mm(p[0], p[1], sx, sy))
+    return nearest_landing(
+        sx, sy,
+        preferred=scene.free_slots,
+        fallback=_PARK_GRID,
+        site_clear_mm=CLEAR_PARK_MM,
+        occupied=avoid or [],
+        markers=markers,
+        blocked=_shadowed,
+        sep_mm=CLEAR_SEP_MM,
+        min_radius_mm=CLEAR_MIN_RADIUS_MM,
+    )
 
 
 def stack_shadow_behind_unit(

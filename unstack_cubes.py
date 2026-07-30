@@ -41,6 +41,11 @@ from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibrat
 from mt4_vision.camera import FrameStream, capture_frame
 from dataclasses import replace
 
+from mt4_vision.landing import (
+    LANDING_MAX_RADIUS_MM,
+    LANDING_MIN_RADIUS_MM,
+    random_landing as _random_landing,
+)
 from mt4_vision.motion import Leg, barrier, plan_route_legs, send_legs, station
 from mt4_vision.pickplace import (
     CAMERA_PARK_X,
@@ -54,12 +59,10 @@ from mt4_vision.pickplace import (
     routed_travel,
 )
 from mt4_vision.preview import LiveFeed, PreviewStopped
-from mt4_vision.scene import capture_scene, within_pick_hull
+from mt4_vision.scene import capture_scene
 from mt4_vision.stackpath import StackPlanner
 from mt4_vision.workspace import (
-    MARKER_PAPER_CLEARANCE_MM,
     MAX_REACH_MM,
-    MAX_VERIFIABLE_RADIUS_MM,
     MarkerSlot,
     dist_mm,
     is_mp_reachable_xy,
@@ -74,21 +77,11 @@ from mt4_vision.workspace import (
 # preferred spacing -- better a tighter-than-ideal drop than a stall.
 DROP_SPACING_FALLBACKS_MM = (75.0, 60.0, 45.0)
 
-# Scatter radius band (mm, robot frame). Floor: field case 2026-07-24 (see
-# stack_cubes.py's CLEAR_MIN_RADIUS_MM) -- a cube parked close to the J1
-# keep-out was occluded by the arm's own camera-park silhouette and never
-# seen again by later scans.
-#
-# Ceiling: the camera, not the arm. This was 300mm on the reasoning that
-# far-field detection only "degrades" beyond that -- but degraded detection
-# out there is indistinguishable from a lost cube, and every drop past
-# MAX_VERIFIABLE_RADIUS_MM is a one-way trip. Measured 2026-07-29 over one
-# autonomous session: unstack scattered to r = 251-279 repeatedly, two of
-# those landings were stamped "lost" despite being perfect placements, and
-# the survivors accumulated until 5 of 9 cubes sat outside the detection
-# hull and the desk needed re-scattering by hand.
-SCATTER_MIN_RADIUS_MM = 170.0
-SCATTER_MAX_RADIUS_MM = MAX_VERIFIABLE_RADIUS_MM
+# Scatter radius band (mm, robot frame). Floor/ceiling live on
+# mt4_vision.landing so stack clear and unstack scatter can't drift apart
+# again (field cases 2026-07-24 / 2026-07-29).
+SCATTER_MIN_RADIUS_MM = LANDING_MIN_RADIUS_MM
+SCATTER_MAX_RADIUS_MM = LANDING_MAX_RADIUS_MM
 
 # Cubes this close to the unstack site are left alone -- clear of the
 # column while it's still standing, and out of the way once it's gone.
@@ -198,24 +191,13 @@ def random_landing(
     """A random reachable table XY at least ``spacing_mm`` from everything
     in ``avoid`` (prior drops, pre-existing cubes) and every marker paper,
     or None when nothing turned up in ``attempts`` tries."""
-    for _ in range(attempts):
-        r = rng.uniform(SCATTER_MIN_RADIUS_MM, SCATTER_MAX_RADIUS_MM)
-        theta = rng.uniform(0.0, 2.0 * math.pi)
-        x, y = r * math.cos(theta), r * math.sin(theta)
-        if not is_mp_reachable_xy(x, y) or math.hypot(x, y) > MAX_REACH_MM:
-            continue
-        if near_camera_park(x, y):
-            continue
-        if dist_mm(x, y, sx, sy) < SITE_AVOID_MM:
-            continue
-        if any(dist_mm(x, y, m.x, m.y) < MARKER_PAPER_CLEARANCE_MM for m in markers):
-            continue
-        if not within_pick_hull(x, y, markers):
-            continue
-        if any(dist_mm(x, y, ox, oy) < spacing_mm for ox, oy in avoid):
-            continue
-        return (x, y)
-    return None
+    return _random_landing(
+        rng, sx=sx, sy=sy, markers=markers, avoid=avoid,
+        spacing_mm=spacing_mm, site_avoid_mm=SITE_AVOID_MM,
+        attempts=attempts,
+        min_radius_mm=SCATTER_MIN_RADIUS_MM,
+        max_radius_mm=SCATTER_MAX_RADIUS_MM,
+    )
 
 
 def find_landing(
@@ -228,6 +210,8 @@ def find_landing(
 ) -> tuple[tuple[float, float], float]:
     """Best-effort landing spot: try the preferred spacing first, then
     degrade through ``DROP_SPACING_FALLBACKS_MM`` before giving up."""
+    # Loop here (not via landing.find_landing) so tests can monkeypatch
+    # this module's random_landing.
     for spacing in DROP_SPACING_FALLBACKS_MM:
         landing = random_landing(
             rng, sx=sx, sy=sy, markers=markers, avoid=avoid, spacing_mm=spacing,
