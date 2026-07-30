@@ -34,7 +34,7 @@ gripper, and the difference matters:
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 
 from mt4_jog.client import Mt4Client, Mt4ClientError
@@ -709,3 +709,81 @@ def transfer(
     if place_j4 is not None:
         out["place_j4"] = round(place_j4, 2)
     return out
+
+
+# -- grasp verification ---------------------------------------------------
+#
+# Post-move "did the physical action happen?" checks. Callers supply an
+# iterable of (color, x, y) detections -- scene.cubes for shuffle,
+# scene.raw_cubes for stack's miss check, or an occupancy probe for thin
+# objects later. Keeping this scene-agnostic is what lets every consumer
+# share one helper without motion importing the camera stack.
+
+VERIFY_ORIGIN_RADIUS_MM = 30.0
+VERIFY_PLACED_RADIUS_MM = 35.0
+
+# (color, x_mm, y_mm) -- whatever the caller can see after the move.
+DetectionXY = tuple[str, float, float]
+
+
+def detection_near(
+    detections: Iterable[DetectionXY],
+    *,
+    color: str,
+    x: float,
+    y: float,
+    radius_mm: float,
+) -> tuple[float, float] | None:
+    """First same-color detection within ``radius_mm`` of (x, y), or None."""
+    for c, dx, dy in detections:
+        if c == color and math.hypot(dx - x, dy - y) <= radius_mm:
+            return (dx, dy)
+    return None
+
+
+def grasp_failed_at(
+    detections: Iterable[DetectionXY],
+    *,
+    pick_x: float,
+    pick_y: float,
+    pick_color: str,
+    radius_mm: float = VERIFY_ORIGIN_RADIUS_MM,
+) -> tuple[float, float] | None:
+    """XY of a same-color detection still at the pick origin, or None.
+
+    A miss signature: the grab shoved or missed the target and it is still
+    sitting near where we aimed. Used by stack_cubes' ``pick_missed``.
+    """
+    return detection_near(
+        detections, color=pick_color, x=pick_x, y=pick_y, radius_mm=radius_mm,
+    )
+
+
+def verify_pick_place(
+    detections: Iterable[DetectionXY],
+    *,
+    pick_x: float,
+    pick_y: float,
+    pick_color: str,
+    place_x: float,
+    place_y: float,
+    origin_radius_mm: float = VERIFY_ORIGIN_RADIUS_MM,
+    placed_radius_mm: float = VERIFY_PLACED_RADIUS_MM,
+) -> str:
+    """Judge an atomic pick+place from post-move detections.
+
+    Returns ``placed``, ``grasp_failed``, or ``lost``. Occupancy-based thin-
+    object checks can feed the same verdicts by synthesizing a one-entry
+    detection list from a lift-height probe.
+    """
+    if detection_near(
+        detections, color=pick_color, x=place_x, y=place_y,
+        radius_mm=placed_radius_mm,
+    ) is not None:
+        return "placed"
+    if grasp_failed_at(
+        detections, pick_x=pick_x, pick_y=pick_y, pick_color=pick_color,
+        radius_mm=origin_radius_mm,
+    ) is not None:
+        return "grasp_failed"
+    return "lost"

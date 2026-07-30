@@ -337,9 +337,15 @@ def capture_scene(
     return Scene.from_workspace(state, pick_cubes=pick_cubes, raw_cubes=raw)
 
 
-# Post-move verification radii (mm).
-VERIFY_PLACED_RADIUS_MM = 35.0
-VERIFY_ORIGIN_RADIUS_MM = 30.0
+# Post-move verification -- implementation lives on motion so stack's
+# pick_missed and shuffle's post-move check share one helper. Re-exported
+# here so existing ``from mt4_vision.scene import verify_pick_place`` keeps
+# working.
+from mt4_vision.motion import (
+    VERIFY_ORIGIN_RADIUS_MM,
+    VERIFY_PLACED_RADIUS_MM,
+    verify_pick_place as _verify_detections,
+)
 
 
 def verify_pick_place(
@@ -355,15 +361,16 @@ def verify_pick_place(
 
     Returns ``placed``, ``grasp_failed``, or ``lost``.
     """
-    same = [c for c in scene.cubes if c.color == pick_color]
-    if any(
-        dist_mm(float(c.x), float(c.y), place_x, place_y) < VERIFY_PLACED_RADIUS_MM
-        for c in same
-    ):
-        return "placed"
-    if any(
-        dist_mm(float(c.x), float(c.y), pick_x, pick_y) < VERIFY_ORIGIN_RADIUS_MM
-        for c in same
-    ):
-        return "grasp_failed"
-    return "lost"
+    detections = [
+        (c.color, float(c.x), float(c.y))
+        for c in scene.cubes
+        if c.x is not None and c.y is not None
+    ]
+    return _verify_detections(
+        detections,
+        pick_x=pick_x,
+        pick_y=pick_y,
+        pick_color=pick_color,
+        place_x=place_x,
+        place_y=place_y,
+    )

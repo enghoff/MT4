@@ -368,6 +368,48 @@ def test_chained_transfers_are_one_send() -> None:
     assert end1 == legs1[-1].xyz
 
 
+def test_verify_pick_place_outcomes() -> None:
+    from mt4_vision.motion import verify_pick_place
+
+    dets = [("blue", 177.0, 181.0)]
+    assert (
+        verify_pick_place(
+            dets, pick_x=240.0, pick_y=0.0, pick_color="blue",
+            place_x=177.2, place_y=181.5,
+        )
+        == "placed"
+    )
+    assert (
+        verify_pick_place(
+            [("blue", 241.0, 101.0)],
+            pick_x=240.0, pick_y=100.0, pick_color="blue",
+            place_x=177.2, place_y=181.5,
+        )
+        == "grasp_failed"
+    )
+    assert (
+        verify_pick_place(
+            [("blue", 100.0, 100.0)],
+            pick_x=240.0, pick_y=100.0, pick_color="blue",
+            place_x=177.2, place_y=181.5,
+        )
+        == "lost"
+    )
+
+
+def test_grasp_failed_at_returns_origin_xy() -> None:
+    from mt4_vision.motion import grasp_failed_at
+
+    assert grasp_failed_at(
+        [("red", 68.1, 202.7), ("red", 110.0, 195.0)],
+        pick_x=55.8, pick_y=195.0, pick_color="red",
+    ) == (68.1, 202.7)
+    assert grasp_failed_at(
+        [("red", 110.0, 195.0)],
+        pick_x=55.8, pick_y=195.0, pick_color="red",
+    ) is None
+
+
 def test_transfer_fuses_the_post_grip_lift_into_the_carry() -> None:
     """One vertical rise off the grab, planned by the router as the carry's
     lift-off -- not a lift leg followed by a separate carry."""

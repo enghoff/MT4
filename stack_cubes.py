@@ -44,7 +44,13 @@ from mt4_vision.detect import CubeDetection
 
 # _travel/_approach/_check are pickplace's single-segment movers; the stack
 # executor below sequences them along StackPlanner routes.
-from mt4_vision.motion import plan_route_legs, send_legs, station
+from mt4_vision.motion import (
+    VERIFY_ORIGIN_RADIUS_MM,
+    grasp_failed_at,
+    plan_route_legs,
+    send_legs,
+    station,
+)
 from mt4_vision.pickplace import (
     CAMERA_PARK_X,
     CAMERA_PARK_Y,
@@ -458,7 +464,7 @@ def stack_integrity_issues(
 # 45mm clearance from every other cube, so a same-color detection this
 # close can only be the target itself. Missed picks correlate with lost
 # steps, so recovery is a re-home before retrying.
-PICK_FAIL_RADIUS_MM = 30.0
+PICK_FAIL_RADIUS_MM = VERIFY_ORIGIN_RADIUS_MM
 PICK_FAIL_MAX_RETRIES = 3
 
 
@@ -469,15 +475,15 @@ def pick_missed(
     if last_pick is None:
         return None
     color, px, py = last_pick
-    for c in scene.raw_cubes:
-        if (
-            c.color == color
-            and c.x is not None
-            and c.y is not None
-            and dist_mm(float(c.x), float(c.y), px, py) <= PICK_FAIL_RADIUS_MM
-        ):
-            return (float(c.x), float(c.y))
-    return None
+    detections = [
+        (c.color, float(c.x), float(c.y))
+        for c in scene.raw_cubes
+        if c.x is not None and c.y is not None
+    ]
+    return grasp_failed_at(
+        detections, pick_x=px, pick_y=py, pick_color=color,
+        radius_mm=PICK_FAIL_RADIUS_MM,
+    )
 
 
 def stack_candidates(
