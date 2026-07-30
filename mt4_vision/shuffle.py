@@ -33,7 +33,13 @@ from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import Calibration
 from mt4_vision.camera import grab_frame, open_camera
 from mt4_vision.detect import CubeDetection
-from mt4_vision.motion import Grasp, ensure_homed, plan_transfer_legs, send_legs
+from mt4_vision.motion import (
+    Grasp,
+    ensure_homed,
+    plan_transfer_legs,
+    send_legs,
+    square_place,
+)
 from mt4_vision.pickplace import home_arm, retreat_for_camera
 from mt4_vision.policy import Action, plan_shuffle
 from mt4_vision.scene import Scene, capture_scene, verify_pick_place
@@ -365,6 +371,10 @@ def run_shuffle_loop(
                 ensure_homed(client)
                 all_legs: list = []
                 start: tuple[float, float, float] | None = None
+                # Wrist the plan will have left behind, carried across chained
+                # transfers -- the live TCP is the wrong angle to minimize
+                # travel from once the first transfer is planned but unsent.
+                wrist: float | None = None
                 planned: list[tuple[float, float, str, float, float]] = []
                 for cube, mplace_x, mplace_y in moves:
                     yaw = (
@@ -385,10 +395,17 @@ def run_shuffle_loop(
                             else None
                         ),
                     )
-                    dst = Grasp(mplace_x, mplace_y)
-                    legs, start, _pj, _qj = plan_transfer_legs(
-                        client, calib, src, dst, start=start,
+                    # square_place, not a bare Grasp: the cube lands square to
+                    # the world axes, which is what place() did before shuffle
+                    # moved onto the queued transfer.
+                    dst = square_place(mplace_x, mplace_y)
+                    legs, start, pick_j4, place_j4 = plan_transfer_legs(
+                        client, calib, src, dst, start=start, current_j4=wrist,
                     )
+                    if place_j4 is not None:
+                        wrist = place_j4
+                    elif pick_j4 is not None:
+                        wrist = pick_j4
                     all_legs.extend(legs)
                     planned.append(
                         (

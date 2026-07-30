@@ -14,7 +14,6 @@ import math
 import random
 from collections.abc import Callable, Iterable, Sequence
 
-from mt4_jog.client import Mt4ClientError
 from mt4_vision.pickplace import near_camera_park
 from mt4_vision.scene import within_pick_hull
 from mt4_vision.workspace import (
@@ -215,29 +214,7 @@ def random_landing(
     return None
 
 
-def find_landing(
-    rng: random.Random,
-    *,
-    sx: float,
-    sy: float,
-    markers: Sequence[MarkerSlot],
-    avoid: Sequence[tuple[float, float]],
-    site_avoid_mm: float,
-    spacing_fallbacks_mm: Sequence[float],
-    attempts: int = 300,
-    min_radius_mm: float = LANDING_MIN_RADIUS_MM,
-    max_radius_mm: float = LANDING_MAX_RADIUS_MM,
-) -> tuple[tuple[float, float], float]:
-    """Best-effort landing: try preferred spacing, then degrade, then raise."""
-    for spacing in spacing_fallbacks_mm:
-        landing = random_landing(
-            rng, sx=sx, sy=sy, markers=markers, avoid=avoid,
-            spacing_mm=spacing, site_avoid_mm=site_avoid_mm,
-            attempts=attempts, min_radius_mm=min_radius_mm,
-            max_radius_mm=max_radius_mm,
-        )
-        if landing is not None:
-            return landing, spacing
-    raise Mt4ClientError(
-        "no free landing spot on the table -- desk is too cluttered to unstack"
-    )
+# The spacing-degradation loop that wraps random_landing deliberately does NOT
+# live here: unstack_cubes owns it so its tests can monkeypatch that module's
+# random_landing. A copy here would be dead code drifting from the live one --
+# which is the failure this module exists to prevent.

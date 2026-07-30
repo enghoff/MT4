@@ -69,8 +69,10 @@ class FakeClient:
         self.calls: list[dict[str, object]] = []
         self.homes = 0
         self.gripper_calls: list[object] = []
+        self.tcp_reads = 0
 
     def get_tcp(self):
+        self.tcp_reads += 1
         return self._tcp
 
     def get_status(self):
@@ -317,6 +319,27 @@ def test_place_releases_above_grasp_height() -> None:
     assert release.z > CALIB.table_z
 
 
+def test_square_place_lands_square_to_the_axes_not_on_the_carried_wrist() -> None:
+    """A bare Grasp means "no yaw opinion, keep the wrist", which lands a cube
+    at whatever angle the pick left it. A destination has no orientation of its
+    own, so "put it down here" means square -- what pickplace.place has always
+    done via resolve_place_j4, and what the queued path dropped."""
+    from mt4_vision.motion import square_place
+
+    c = FakeClient(_Tcp(*PICK_XY, CALIB.safe_z, j4=37.0))
+    out = place_at(c, CALIB, Grasp(*PLACE_XY))
+    # Every leg carries a firmware hold sentinel ("wrist"/None), never an angle,
+    # so the cube lands at whatever yaw the pick left.
+    assert "j4" not in out
+    assert not any(isinstance(leg.j4, float) for leg in c.legs())
+
+    c = FakeClient(_Tcp(*PICK_XY, CALIB.safe_z, j4=37.0))
+    out = place_at(c, CALIB, square_place(*PLACE_XY))
+    # 0 deg on the 90 deg lattice, nearest the current wrist of 37 deg.
+    assert out["j4"] == 0.0
+    assert any(leg.j4 == 0.0 for leg in c.legs())
+
+
 def test_place_explicit_j4_bypasses_the_resolver() -> None:
     """unstack's random landing orientation is already lattice-solved; it must
     reach the wire unfolded."""
@@ -366,6 +389,30 @@ def test_chained_transfers_are_one_send() -> None:
     assert c.gripper_calls == []
     # Second pick's transit starts from where the first place left the arm.
     assert end1 == legs1[-1].xyz
+
+
+def test_chained_transfer_resolves_its_wrist_from_the_plan_not_the_live_tcp() -> None:
+    """Once the first transfer is planned but unsent, the live TCP's j4 is the
+    wrong angle to minimize wrist travel from -- it is where the arm is now, not
+    where the queue will have left it. It also costs a serial read per stage."""
+    from mt4_vision.motion import plan_transfer_legs, square_place
+
+    c = FakeClient(_Tcp(200.0, 0.0, 260.0, j4=0.0))
+    _legs1, end1, _pj1, place_j4 = plan_transfer_legs(
+        c, CALIB, Grasp(*PICK_XY, yaw_deg=10.0), square_place(*PLACE_XY),
+    )
+    c.tcp_reads = 0
+    # A 100 deg face is the same square face as 10 deg; which representative
+    # wins depends entirely on the wrist it is measured against.
+    _legs2, _end2, pick_j4, _qj = plan_transfer_legs(
+        c, CALIB, Grasp(200.0, 80.0, yaw_deg=100.0), square_place(160.0, -100.0),
+        start=end1, current_j4=place_j4,
+    )
+    assert c.tcp_reads == 0, "chained planning must not re-read the TCP"
+    # Nearest 90 deg-lattice representative of 100 deg to the carried wrist (0),
+    # not to the stale live j4 -- here they agree in value but not in provenance,
+    # so pin the read count above and the angle here.
+    assert pick_j4 == 10.0
 
 
 def test_verify_pick_place_outcomes() -> None:

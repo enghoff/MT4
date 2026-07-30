@@ -325,8 +325,18 @@ def _obj(x, y, *, axis=37.0, short=9.0, long_mm=138.0):
     )
 
 
+def _span_calib(**kw) -> Calibration:
+    """CALIB plus the measured jaw-span model (jaws open to ~64mm)."""
+    return Calibration(
+        homography=CALIB.homography, table_z=127.2, safe_z=155.0,
+        grip_open_s=140, grip_close_s=240,
+        grip_span_s_at_zero_mm=285.0, grip_span_s_per_mm=2.25,
+        **kw,
+    )
+
+
 def test_feasible_object_in_the_workspace() -> None:
-    ok, reason = grasp_feasibility(_obj(200.0, -60.0), CALIB)
+    ok, reason = grasp_feasibility(_obj(200.0, -60.0), _span_calib())
     assert ok and reason is None
 
 
@@ -348,11 +358,7 @@ def test_infeasible_past_the_cameras_verifiable_radius() -> None:
 
 
 def test_infeasible_wider_than_the_jaws_open() -> None:
-    calib = Calibration(
-        homography=CALIB.homography, table_z=127.2, safe_z=155.0,
-        grip_open_s=140, grip_close_s=240,
-        grip_span_s_at_zero_mm=285.0, grip_span_s_per_mm=2.25,
-    )
+    calib = _span_calib()
     # Jaws open to (285-140)/2.25 ~ 64mm.
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=40.0), calib)
     assert ok
@@ -360,11 +366,28 @@ def test_infeasible_wider_than_the_jaws_open() -> None:
     assert not ok and "wider than the jaws open" in reason
 
 
-def test_span_check_is_skipped_when_uncalibrated() -> None:
-    """Without the measured jaw model there is nothing to compare against, and
-    inventing a limit would refuse valid grasps."""
+def test_too_open_check_is_skipped_when_uncalibrated() -> None:
+    """Without the measured jaw model there is no jaws-open limit to compare
+    against, and inventing one would refuse valid grasps. Closing too FAR on a
+    wide object only squeezes, which the jaws tolerate."""
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=80.0), CALIB)
     assert ok
+    # ...and within a squeeze of the cube width, the cube close value contacts.
+    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=17.0), CALIB)
+    assert ok
+
+
+def test_narrow_object_refused_when_the_jaw_model_is_uncalibrated() -> None:
+    """grip_s_for_span_mm falls back to grip_close_s -- the 20mm-cube value --
+    so a 9mm pen would be gripped at a width that never touches it, and nothing
+    in the stack senses an empty grasp. Refuse rather than warn: over MCP stdio
+    the warning goes to a log the model never reads."""
+    ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), CALIB)
+    assert not ok
+    assert "not calibrated" in reason and "grip_span_s_per_mm" in reason
+    # Calibrating the model is what lifts the refusal.
+    ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), _span_calib())
+    assert ok and reason is None
 
 
 def main() -> int:

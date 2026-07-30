@@ -293,6 +293,34 @@ def test_cube_entity_is_square_periodic() -> None:
     assert sn.of_kind(KIND_CUBE)[0].yaw_period_deg == YAW_PERIOD_SQUARE
 
 
+def test_object_ids_come_from_a_mapping_and_survive_a_dropped_neighbour() -> None:
+    """A caller holding a registry across frames (the MCP server) must be able
+    to keep an obj_N id pinned to one physical thing. Positional numbering
+    cannot: relocate() is strict, so the moment one object fails to re-acquire
+    every id after it slides onto its neighbour -- which is the silent
+    substitution this whole layer exists to prevent."""
+    pen = FakeObject(213.4, -58.1, label="pen")
+    keyring = FakeObject(200.0, 90.0, label="keyring")
+
+    sn = build_snapshot(
+        scene([]), token="s1", objects={"obj_1": pen, "obj_7": keyring}
+    )
+    assert [(e.id, e.label) for e in sn.of_kind(KIND_OBJECT)] == [
+        ("obj_1", "pen"),
+        ("obj_7", "keyring"),
+    ]
+
+    # The pen drops out of the registry; the keyring keeps ITS id.
+    sn2 = build_snapshot(scene([]), token="s2", objects={"obj_7": keyring})
+    assert [(e.id, e.label) for e in sn2.of_kind(KIND_OBJECT)] == [
+        ("obj_7", "keyring")
+    ]
+
+    # A plain sequence still numbers by position, for one-shot callers (CLI).
+    sn3 = build_snapshot(scene([]), token="s3", objects=[keyring])
+    assert sn3.of_kind(KIND_OBJECT)[0].id == "obj_1"
+
+
 def test_object_clearance_uses_its_short_axis_not_the_cube_rule() -> None:
     """A 138mm pen has neighbours inside PICK_CLEARANCE_MM constantly; applying
     a 20mm cube's finger allowance to it would refuse nearly every real grasp.

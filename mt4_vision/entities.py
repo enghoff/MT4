@@ -28,8 +28,8 @@ to still mean the same object minutes later.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import cv2
@@ -302,7 +302,7 @@ def build_snapshot(
     scene: Scene,
     *,
     token: str,
-    objects: Sequence["LocatedObject"] = (),
+    objects: Sequence["LocatedObject"] | Mapping[str, "LocatedObject"] = (),
 ) -> Snapshot:
     """Turn a ``Scene`` (plus any located non-cube objects) into addressable ids.
 
@@ -314,8 +314,18 @@ def build_snapshot(
     it, because it is not an object at all.)
 
     ``objects`` are pre-measured by :mod:`mt4_vision.locate`; this only labels
-    and numbers them.
+    and numbers them. Pass a **mapping** of id -> object when the caller keeps a
+    registry that outlives one snapshot (the MCP server does): a sequence is
+    numbered by position, so the moment one object drops out -- which
+    ``locate.relocate`` is deliberately strict about -- every id after it shifts
+    onto a different physical thing. Ids that move are worse than no ids.
     """
+    object_items: list[tuple[str, "LocatedObject"]] = (
+        list(objects.items())
+        if isinstance(objects, Mapping)
+        else [(f"obj_{i}", o) for i, o in enumerate(objects, start=1)]
+    )
+    objects = [o for _eid, o in object_items]
     pickable_ids = {id(c) for c in scene.pickable(scene.cubes)}
     raw = scene.raw_cubes if scene.raw_cubes is not None else scene.cubes
     occupant_of: dict[int, CubeDetection] = {
@@ -408,8 +418,7 @@ def build_snapshot(
     ]
 
     object_entities = [
-        object_entity(obj, i, scene=scene)
-        for i, obj in enumerate(objects, start=1)
+        object_entity(obj, eid, scene=scene) for eid, obj in object_items
     ]
 
     entities = cube_entities + object_entities + marker_entities + slot_entities
@@ -422,9 +431,14 @@ def build_snapshot(
 
 
 def object_entity(
-    obj: "LocatedObject", index: int, *, scene: Scene | None = None
+    obj: "LocatedObject", ref: int | str, *, scene: Scene | None = None
 ) -> Entity:
     """Entity for a non-cube object measured by :mod:`mt4_vision.locate`.
+
+    ``ref`` is either an ordinal (``1`` -> ``obj_1``, for a caller measuring one
+    object in one frame) or the entity id itself, for a caller holding a
+    registry whose keys must not be re-derived from list position -- see
+    ``build_snapshot``.
 
     Elongated objects are 180°-periodic (the jaws close *across* the long
     axis), which is the whole reason ``yaw_period_deg`` exists.
@@ -455,7 +469,7 @@ def object_entity(
                 )
                 break
     return Entity(
-        id=f"obj_{index}",
+        id=ref if isinstance(ref, str) else f"obj_{ref}",
         kind=KIND_OBJECT,
         label=obj.label,
         x=float(obj.x),

@@ -77,10 +77,18 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
     #                pixel is measured against the exact frame it was read from
     #   _objects  -- id -> LocatedObject registry surviving across snapshots,
     #                since a VLM-named object has no colour rule to re-detect it
+    #   _obj_seq  -- monotonic, NEVER reused. An obj_N id must name one physical
+    #                thing for the life of the server: _build_snapshot drops
+    #                objects that fail to re-acquire, so numbering from
+    #                len(_objects) would both re-issue a live key and (via a
+    #                positional build_snapshot) slide surviving ids onto their
+    #                neighbours -- the exact substitution the entity layer exists
+    #                to prevent.
     _snapshot: Any = None
     _view: tuple[str, Any] | None = None
     _objects: dict[str, Any] = {}
     _token_seq = 0
+    _obj_seq = 0
 
     server = FastMCP(
         name="MT4 Robot",
@@ -257,6 +265,22 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         _token_seq += 1
         return f"{prefix}{_token_seq}"
 
+    def _register_object(obj: Any, scene: Any) -> tuple[str, Any]:
+        """Give a measured object a permanent id and return (id, Entity).
+
+        The one place obj_N ids are minted, so every registration path agrees
+        on the invariant: the id is the registry key, the registry key is what
+        build_snapshot labels the entity with, and neither is ever re-derived
+        from a position in a list.
+        """
+        from mt4_vision.entities import object_entity
+
+        nonlocal _objects, _obj_seq
+        _obj_seq += 1
+        key = f"obj_{_obj_seq}"
+        _objects = {**_objects, key: obj}
+        return key, object_entity(obj, key, scene=scene)
+
     def _build_snapshot(camera: int = 1) -> tuple[Any, Any]:
         """Fresh frame -> (Scene, Snapshot), re-acquiring registered objects."""
         from mt4_vision.calib import load_calibration
@@ -282,8 +306,9 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
                 refreshed[key] = again
         _objects = refreshed
 
+        # The registry itself, not its values: ids must survive a drop above.
         snapshot = build_snapshot(
-            scene, token=_next_token("s"), objects=list(_objects.values())
+            scene, token=_next_token("s"), objects=_objects
         )
         _snapshot = snapshot
         return scene, snapshot
@@ -387,11 +412,9 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         """
         try:
             from mt4_vision.calib import load_calibration
-            from mt4_vision.entities import object_entity
             from mt4_vision.locate import LocateError, grasp_feasibility, measure
             from mt4_vision.scene import capture_scene
 
-            nonlocal _objects
             if _view is None:
                 return {
                     "ok": False,
@@ -418,10 +441,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
                 return {"ok": False, "error": str(exc)}
             ok, reason = grasp_feasibility(obj, calib)
 
-            key = f"obj_{len(_objects) + 1}"
-            _objects = {**_objects, key: obj}
-            index = list(_objects).index(key) + 1
-            entity = object_entity(obj, index, scene=scene)
+            _key, entity = _register_object(obj, scene)
             out = {"ok": True, "entity": entity.as_dict()}
             if not ok and entity.reason is None:
                 out["entity"]["pickable"] = False
@@ -449,8 +469,14 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         calib = load_calibration()
 
         if entity.kind in (KIND_MARKER, KIND_SLOT):
-            # Fixed calibrated positions; nothing to re-detect.
-            return calib, entity.as_grasp(calib), None
+            # Fixed calibrated positions; nothing to re-detect. A destination
+            # has no orientation of its own, so the landing yaw is squared to
+            # the world axes (square_place) rather than left at whatever the
+            # pick happened to leave the wrist at -- what pickplace.place has
+            # always done via resolve_place_j4.
+            from mt4_vision.motion import square_place
+
+            return calib, square_place(entity.x, entity.y), None
 
         frame = capture_frame(camera)
         if entity.kind == KIND_OBJECT:
@@ -468,8 +494,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
                 )
             from mt4_vision.entities import object_entity
 
-            index = list(_objects).index(entity.id) + 1
-            fresh = object_entity(again, index, scene=scene)
+            fresh = object_entity(again, entity.id, scene=scene)
             if not fresh.pickable:
                 return calib, None, f"{entity.id} is not pickable: {fresh.reason}"
             return calib, fresh.as_grasp(calib), None
@@ -672,10 +697,14 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         """
         try:
             from mt4_vision.calib import load_calibration
-            from mt4_vision.motion import Grasp, place_at
+            from mt4_vision.motion import Grasp, place_at, square_place
 
             calib = load_calibration()
-            return place_at(get_client(), calib, Grasp(x, y, yaw_deg=yaw_deg))
+            # Omitted yaw squares to the world axes; a bare Grasp would instead
+            # preserve whatever wrist the pick left, which is not what "put it
+            # down at (x, y)" means (and not what this tool used to do).
+            dst = square_place(x, y) if yaw_deg is None else Grasp(x, y, yaw_deg=yaw_deg)
+            return place_at(get_client(), calib, dst)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
 
@@ -709,14 +738,20 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         """
         try:
             from mt4_vision.calib import load_calibration
-            from mt4_vision.motion import Grasp, transfer
+            from mt4_vision.motion import Grasp, square_place, transfer
 
             calib = load_calibration()
+            # Omitted landing yaw squares to the world axes -- see mt4_place_at.
+            dst = (
+                square_place(to_x, to_y)
+                if to_yaw_deg is None
+                else Grasp(to_x, to_y, yaw_deg=to_yaw_deg)
+            )
             return transfer(
                 get_client(),
                 calib,
                 Grasp(from_x, from_y, yaw_deg=from_yaw_deg, center=center),
-                Grasp(to_x, to_y, yaw_deg=to_yaw_deg),
+                dst,
             )
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}

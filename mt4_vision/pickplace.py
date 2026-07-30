@@ -20,9 +20,8 @@ from mt4_jog.kinematics import STEPS_PER_DEG
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import CubeDetection
 from mt4_vision import motion
-from mt4_vision.motion import (
+from mt4_vision.motion import (  # noqa: F401 -- home_arm is a re-export (see below)
     Grasp,
-    YAW_PERIOD_LONG_AXIS,
     YAW_PERIOD_SQUARE,
     ensure_homed,
     home_arm,
@@ -33,7 +32,7 @@ from mt4_vision.motion import (
 )
 from mt4_vision.motion import check as _check
 from mt4_vision.stackpath import StackPlanner
-from mt4_vision.workspace import KEEPOUT_RADIUS_MM, is_mp_reachable_xy
+from mt4_vision.workspace import is_mp_reachable_xy
 
 # The wrist-angle lattice lives in mt4_vision.wrist (pure geometry, so the
 # motion primitives can build on it without importing this module). Re-exported

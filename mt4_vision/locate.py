@@ -91,6 +91,10 @@ RELOCATE_SEARCH_PX = 80
 # flooded the desk yields a huge "object" whose centroid is meaningless.
 MAX_PLAUSIBLE_LONG_MM = 200.0
 MIN_PLAUSIBLE_LONG_MM = 4.0
+# How much narrower than a cube an object may be before an UNCALIBRATED jaw-span
+# model makes its grasp untrustworthy -- see grasp_feasibility. Matched to
+# calib.GRIP_SQUEEZE_MM: within that, closing at the cube value still contacts.
+UNCALIBRATED_GRIP_SLACK_MM = 4.0
 
 
 @dataclass(frozen=True)
@@ -600,6 +604,26 @@ def grasp_feasibility(
             f"{obj.short_mm:.0f}mm across is wider than the jaws open "
             f"({span_open:.0f}mm at S={calib.grip_open_s})"
         )
+    if span_open is None:
+        # No measured jaw model, so calib.grip_s_for_span_mm falls back to
+        # grip_close_s -- the value for a cube_height_mm cube. On anything
+        # narrower the jaws stop short of the object, and with no
+        # grip-retention sensing anywhere in the stack the pick then reports
+        # success having gripped nothing. Refuse instead: a warning on stderr
+        # is invisible over MCP stdio, and this is the one failure the arm
+        # cannot detect for itself. (One-sided -- closing too far on something
+        # WIDER than a cube just squeezes, which the jaws tolerate.)
+        short_of = float(calib.cube_height_mm) - obj.short_mm
+        if short_of > UNCALIBRATED_GRIP_SLACK_MM:
+            return False, (
+                f"{obj.short_mm:.0f}mm across is {short_of:.0f}mm narrower than "
+                f"the {calib.cube_height_mm:.0f}mm cube, and the jaw-span model "
+                "is not calibrated -- the grip would close to "
+                f"S={calib.grip_close_s} (the cube value) and hold nothing while "
+                "reporting success. Measure grip_span_s_at_zero_mm and "
+                "grip_span_s_per_mm into the calibration first (see "
+                "calib.grip_s_for_span_mm)"
+            )
     if j4_for_long_axis(obj.axis_yaw_deg, x=obj.x, y=obj.y) is None:
         return False, (
             "no wrist angle closes the jaws across this object's axis while "

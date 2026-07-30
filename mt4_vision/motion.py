@@ -127,6 +127,21 @@ class Grasp:
         )
 
 
+def square_place(x: float, y: float, **kwargs: object) -> Grasp:
+    """Destination grasp that squares the held object to the world X/Y axes.
+
+    ``Grasp(x, y)`` means "no yaw opinion, keep the wrist wherever it is", which
+    lands a cube at whatever angle the pick left -- NOT what "put it down here"
+    means. Squaring is what ``pickplace.place`` has always done by default
+    (``resolve_place_j4`` = face-align to 0° on the 90° lattice, nearest the
+    current wrist), and a bare ``Grasp`` silently dropped it when the MCP and
+    shuffle paths moved onto ``place_at``/``transfer``. A destination -- a
+    marker, a slot, a bare XY -- has no orientation of its own, so this is the
+    right default for one; an object being *picked* does have one, and keeps it.
+    """
+    return Grasp(x, y, yaw_deg=0.0, yaw_period_deg=YAW_PERIOD_SQUARE, **kwargs)  # type: ignore[arg-type]
+
+
 def check(result: dict[str, object], step: str) -> dict[str, object]:
     """move_to/home/gripper report failure via {"ok": False, ...}, not an
     exception -- callers must not chain past a step that never happened, so
@@ -163,6 +178,7 @@ def resolve_yaw_j4(
     period_deg: float = YAW_PERIOD_SQUARE,
     x: float | None = None,
     y: float | None = None,
+    current_j4: float | None = None,
 ) -> float | None:
     """World-frame J4 for a grasp yaw, reading the current wrist to minimize
     travel. The single answer to "what wrist angle does this grasp want".
@@ -176,11 +192,20 @@ def resolve_yaw_j4(
     ``MT4_JOINT_SOFT_*`` window is narrower -- see ``wrist._j4_on_lattice``.
     Call ``wrist.j4_for_long_axis`` directly (pure geometry, returns None) to
     pre-check without raising.
+
+    ``current_j4`` supplies the wrist instead of a live TCP read, for a caller
+    planning legs the arm has not executed yet. The live read is the *wrong*
+    wrist there -- it is where the arm is now, not where the plan will have left
+    it -- so a chained plan would minimize travel from a stale angle, and pay a
+    serial round trip per stage to do it.
     """
     if yaw_deg is None:
         return None
-    tcp = client.get_tcp()
-    current = tcp.j4 if tcp is not None else None
+    if current_j4 is not None:
+        current: float | None = float(current_j4)
+    else:
+        tcp = client.get_tcp()
+        current = tcp.j4 if tcp is not None else None
     if period_deg == YAW_PERIOD_LONG_AXIS:
         j4 = j4_for_long_axis(yaw_deg, current_j4_deg=current, x=x, y=y)
         if j4 is None:
@@ -398,6 +423,7 @@ def plan_pick_legs(
     start: tuple[float, float, float] | None = None,
     lift_after: bool = True,
     hover_z: float | None = None,
+    current_j4: float | None = None,
 ) -> tuple[list[Leg], float | None]:
     """Legs that take the object at ``g``, plus the wrist angle used.
 
@@ -414,7 +440,8 @@ def plan_pick_legs(
     gz = g.grasp_z(calib)
     tz = float(calib.safe_z) if hover_z is None else float(hover_z)
     j4 = resolve_yaw_j4(
-        client, calib, g.yaw_deg, period_deg=g.yaw_period_deg, x=g.x, y=g.y
+        client, calib, g.yaw_deg, period_deg=g.yaw_period_deg, x=g.x, y=g.y,
+        current_j4=current_j4,
     )
     if start is None:
         tcp = client.get_tcp()
@@ -460,6 +487,7 @@ def plan_place_legs(
     release_z: float | None = None,
     travel_z: float | None = None,
     j4: float | None = None,
+    current_j4: float | None = None,
 ) -> tuple[list[Leg], float | None]:
     """Legs that release the held object at ``g``, plus the wrist angle used.
 
@@ -483,7 +511,8 @@ def plan_place_legs(
     tz = max(float(calib.safe_z), rz) if travel_z is None else float(travel_z)
     if j4 is None:
         j4 = resolve_yaw_j4(
-            client, calib, g.yaw_deg, period_deg=g.yaw_period_deg, x=g.x, y=g.y
+            client, calib, g.yaw_deg, period_deg=g.yaw_period_deg, x=g.x, y=g.y,
+            current_j4=current_j4,
         )
     if start is None:
         tcp = client.get_tcp()
@@ -600,16 +629,23 @@ def plan_transfer_legs(
     start: tuple[float, float, float] | None = None,
     release_z: float | None = None,
     travel_z: float | None = None,
+    current_j4: float | None = None,
 ) -> tuple[list[Leg], tuple[float, float, float], float | None, float | None]:
     """Composable legs for one ``src`` → ``dst`` transfer, plus the end pose.
 
     Same pick+place fusion ``transfer`` sends, lifted out so a caller can
     concatenate several transfers into one ``send_legs`` (shuffle lookahead)
-    without a stop/settle between them. ``start`` defaults to the live TCP;
-    pass the previous plan's end pose when chaining so composition does not
-    need a mid-plan status read. ``src.center`` cannot be planned this way
-    (the ±90° re-grip is an unqueueable relative ``m``) -- raise and let the
+    without a stop/settle between them. ``src.center`` cannot be planned this
+    way (the ±90° re-grip is an unqueueable relative ``m``) -- raise and let the
     caller fall back to ``transfer``.
+
+    Chaining needs BOTH carried-forward states, not just the pose: pass the
+    previous plan's end pose as ``start`` and its ending wrist (the returned
+    ``place_j4``, falling back to ``pick_j4``) as ``current_j4``. Otherwise each
+    stage resolves its wrist against a live TCP read -- the angle the arm is at
+    *now*, before any of the queue has run -- which both costs a serial round
+    trip per stage and minimizes travel from the wrong angle. The place's wrist
+    is likewise resolved against the pick's, not against the live TCP.
     """
     if src.center:
         raise Mt4ClientError(
@@ -625,7 +661,7 @@ def plan_transfer_legs(
 
     pick_legs, pick_j4 = plan_pick_legs(
         client, calib, src, planner=planner, levels=levels,
-        start=start, lift_after=False,
+        start=start, lift_after=False, current_j4=current_j4,
     )
     # The carry's own lift-off replaces the pick's lift leg: one vertical rise,
     # planned by the router, with no stop at the top.
@@ -634,6 +670,7 @@ def plan_transfer_legs(
         client, calib, dst, planner=planner, levels=levels,
         start=grab_xyz, lift_from=float(calib.safe_z),
         release_z=release_z, travel_z=travel_z,
+        current_j4=pick_j4 if pick_j4 is not None else current_j4,
     )
     legs = pick_legs + place_legs
     if not legs:
