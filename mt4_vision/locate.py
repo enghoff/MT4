@@ -81,6 +81,10 @@ STABILITY_WINDOW_RATIO = 0.72
 STABILITY_CENTROID_MM = 6.0
 STABILITY_SHORT_MM = 5.0
 STABILITY_YAW_DEG = 12.0
+# long/short at or below this: no obvious shaft. minAreaRect freely swaps which
+# edge is "long" (≈90° yaw flips) between window sizes, and the grasp does not
+# care -- jaws can meet any face. Above this, yaw disagreement is load-bearing.
+COMPACT_ASPECT = 1.35
 # Normalized-cross-correlation floor for re-acquiring a registered object.
 # Below this, report nothing rather than a low-confidence guess -- a wrong
 # position is worse than "re-scan", because the arm will act on it.
@@ -129,6 +133,11 @@ class LocatedObject:
 
 class LocateError(Exception):
     """Raised when a hint cannot be turned into a measurement."""
+
+
+def is_compact(long_mm: float, short_mm: float) -> bool:
+    """True when there is no obvious long axis (cube-like, not pen-like)."""
+    return float(long_mm) <= COMPACT_ASPECT * max(float(short_mm), 1e-6)
 
 
 def _window(frame: np.ndarray, px: float, py: float, win: int) -> tuple[int, int, int, int]:
@@ -489,32 +498,160 @@ def measure(
                 f"{second_win}px window -- too unstable to act on"
             )
         alt = other[0]
-        # Split the disagreement along and across the axis. Along-axis drift is
-        # expected -- an end whose contrast against the desk fades gets clipped
-        # by a different amount at each scale -- and it is harmless, because the
-        # grasp still lands on the shaft. Across-axis drift is the one that makes
-        # the jaws miss, so only that is held to a tight bound.
-        rad = math.radians(obj.axis_yaw_deg)
         dx, dy = alt.x - obj.x, alt.y - obj.y
-        along = abs(dx * math.cos(rad) + dy * math.sin(rad))
-        across = abs(-dx * math.sin(rad) + dy * math.cos(rad))
-        dshort = abs(alt.short_mm - obj.short_mm)
-        dyaw = abs((alt.axis_yaw_deg - obj.axis_yaw_deg + 90.0) % 180.0 - 90.0)
-        if (
-            across > STABILITY_CENTROID_MM
-            or along > max(STABILITY_CENTROID_MM, 0.5 * obj.long_mm)
-            or dshort > STABILITY_SHORT_MM
-            or dyaw > STABILITY_YAW_DEG
-        ):
-            raise LocateError(
-                f"unstable segmentation at ({px:.0f}, {py:.0f}): {win}px and "
-                f"{second_win}px windows disagree by {across:.0f}mm across the "
-                f"axis, {along:.0f}mm along it, {dshort:.0f}mm in width and "
-                f"{dyaw:.0f}deg in angle -- refusing rather than guessing which "
-                "is right"
+        if is_compact(obj.long_mm, obj.short_mm):
+            # Near-square: which edge is "long" flips ~90° between scales and
+            # is not load-bearing for the grasp. Only centroid and overall size.
+            drift = math.hypot(dx, dy)
+            dsize = abs(
+                (alt.long_mm + alt.short_mm) - (obj.long_mm + obj.short_mm)
             )
+            if drift > STABILITY_CENTROID_MM or dsize > 2.0 * STABILITY_SHORT_MM:
+                raise LocateError(
+                    f"unstable segmentation at ({px:.0f}, {py:.0f}): "
+                    f"compact object drifted {drift:.0f}mm / {dsize:.0f}mm size "
+                    f"across window scales"
+                )
+        else:
+            # Split disagreement along and across the axis. Along-axis drift is
+            # expected (faded ends clip differently per scale) and harmless for
+            # a shaft grasp; across-axis drift makes the jaws miss.
+            rad = math.radians(obj.axis_yaw_deg)
+            along = abs(dx * math.cos(rad) + dy * math.sin(rad))
+            across = abs(-dx * math.sin(rad) + dy * math.cos(rad))
+            dshort = abs(alt.short_mm - obj.short_mm)
+            dyaw = abs((alt.axis_yaw_deg - obj.axis_yaw_deg + 90.0) % 180.0 - 90.0)
+            if (
+                across > STABILITY_CENTROID_MM
+                or along > max(STABILITY_CENTROID_MM, 0.5 * obj.long_mm)
+                or dshort > STABILITY_SHORT_MM
+                or dyaw > STABILITY_YAW_DEG
+            ):
+                raise LocateError(
+                    f"unstable segmentation at ({px:.0f}, {py:.0f}): {win}px and "
+                    f"{second_win}px windows disagree by {across:.0f}mm across the "
+                    f"axis, {along:.0f}mm along it, {dshort:.0f}mm in width and "
+                    f"{dyaw:.0f}deg in angle -- refusing rather than guessing which "
+                    "is right"
+                )
 
     return replace(obj, label=label, confidence=confidence)
+
+
+def measure_box(
+    frame: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    calib: Calibration,
+    label: str,
+    *,
+    confidence: float = 1.0,
+    object_height_mm: float | None = None,
+) -> LocatedObject:
+    """Geometry from an axis-aligned detector box (e.g. Grounding DINO).
+
+    Fallback when desk-deviation segmentation is unstable or missing: the box
+    is coarser (image-aligned AABB, loose on rotated objects) but consistent.
+    Good enough for a full-close grip that does not need a precise jaw span.
+    """
+    h, w = frame.shape[:2]
+    xa, xb = sorted((float(x1), float(x2)))
+    ya, yb = sorted((float(y1), float(y2)))
+    xa = max(0.0, min(xa, w - 1.0))
+    xb = max(0.0, min(xb, w - 1.0))
+    ya = max(0.0, min(ya, h - 1.0))
+    yb = max(0.0, min(yb, h - 1.0))
+    if xb - xa < 2.0 or yb - ya < 2.0:
+        raise LocateError(
+            f"detector box too small ({xb - xa:.0f}x{yb - ya:.0f}px) to measure"
+        )
+
+    # Corners ordered around the AABB -- consecutive pairs are the two sides.
+    corners = [(xa, ya), (xb, ya), (xb, yb), (xa, yb)]
+    centroid = (0.5 * (xa + xb), 0.5 * (ya + yb))
+    robot = [calib.pixel_to_robot(cx, cy, on_cube_top=False) for cx, cy in corners]
+    cx, cy = calib.pixel_to_robot(centroid[0], centroid[1], on_cube_top=False)
+
+    e0 = (robot[1][0] - robot[0][0], robot[1][1] - robot[0][1])
+    e1 = (robot[2][0] - robot[1][0], robot[2][1] - robot[1][1])
+    len0, len1 = math.hypot(*e0), math.hypot(*e1)
+    if len0 >= len1:
+        long_v, long_mm, short_mm = e0, len0, len1
+    else:
+        long_v, long_mm, short_mm = e1, len1, len0
+    if long_mm < 1e-6:
+        raise LocateError("detector box projects to a degenerate rect")
+    if not MIN_PLAUSIBLE_LONG_MM <= long_mm <= MAX_PLAUSIBLE_LONG_MM:
+        raise LocateError(
+            f"box measures {long_mm:.0f}x{short_mm:.0f}mm, outside the plausible "
+            f"{MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm range"
+        )
+    axis_yaw = math.degrees(math.atan2(long_v[1], long_v[0]))
+
+    gain = _parallax_gain(calib, cx, cy)
+    cam = calib.cam_xy_robot
+    cos_radial = 1.0
+    if cam:
+        d = math.hypot(cam[0] - cx, cam[1] - cy)
+        if d > 1e-6:
+            ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
+            cos_radial = abs(ax * (cam[0] - cx) + ay * (cam[1] - cy)) / d
+    height = (
+        _assumed_height_mm(short_mm, gain, cos_radial)
+        if object_height_mm is None
+        else max(0.0, float(object_height_mm))
+    )
+    if height > 0.0:
+        short_mm = max(1.0, short_mm - height * gain * cos_radial)
+        cx, cy = _unproject(calib, centroid[0], centroid[1], height / 2.0)
+
+    ix0, iy0 = int(math.floor(xa)), int(math.floor(ya))
+    ix1, iy1 = int(math.ceil(xb)), int(math.ceil(yb))
+    return LocatedObject(
+        label=label,
+        px=centroid[0],
+        py=centroid[1],
+        x=cx,
+        y=cy,
+        axis_yaw_deg=axis_yaw,
+        long_mm=long_mm,
+        short_mm=short_mm,
+        confidence=float(confidence),
+        height_mm=height,
+        template=np.ascontiguousarray(frame[iy0:iy1, ix0:ix1]),
+        mask_area_px=float((xb - xa) * (yb - ya)),
+    )
+
+
+def measure_with_box_fallback(
+    frame: np.ndarray,
+    px: float,
+    py: float,
+    calib: Calibration,
+    label: str,
+    *,
+    box: tuple[float, float, float, float] | None = None,
+    win: int = DEFAULT_WINDOW_PX,
+    confidence: float = 1.0,
+    marker_xy: Sequence[tuple[float, float]] = (),
+    object_height_mm: float | None = None,
+) -> LocatedObject:
+    """``measure`` at the hint; on failure, fall back to ``measure_box`` if given."""
+    try:
+        return measure(
+            frame, px, py, calib, label,
+            win=win, confidence=confidence, marker_xy=marker_xy,
+            object_height_mm=object_height_mm,
+        )
+    except LocateError:
+        if box is None:
+            raise
+        return measure_box(
+            frame, box[0], box[1], box[2], box[3], calib, label,
+            confidence=confidence, object_height_mm=object_height_mm,
+        )
 
 
 def relocate(
@@ -592,6 +729,9 @@ def grasp_feasibility(
         return False, (
             f"wider than jaws ({obj.short_mm:.0f}>{span_open:.0f}mm)"
         )
+    if is_compact(obj.long_mm, obj.short_mm):
+        # Near-square: jaw orientation is not load-bearing (90° period).
+        return True, None
     if j4_for_long_axis(obj.axis_yaw_deg, x=obj.x, y=obj.y) is None:
         return False, "no J4 angle in soft limits"
     return True, None

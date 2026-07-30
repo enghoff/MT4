@@ -247,6 +247,90 @@ def test_square_object_measures_as_square() -> None:
     assert abs(obj.long_mm - 40.0 * MM_PER_PX) < 3.0
 
 
+def test_compact_object_tolerates_long_edge_swap_between_windows() -> None:
+    """Near-square masks flip which edge is 'long' (~90° yaw) across scales;
+    that must not refuse -- grip orientation is not critical without a shaft."""
+    from mt4_vision import locate as mod
+
+    img = frame_with_bar(600.0, 300.0, 40.0, 40.0, 12.0)
+    real = mod._measure_one
+
+    def flipped(frame, px, py, calib, win, exclude, height):
+        got = real(frame, px, py, calib, win, exclude, height)
+        if got is None or win >= 200:
+            return got
+        obj, mask = got
+        alt = mod.replace(
+            obj,
+            axis_yaw_deg=obj.axis_yaw_deg + 90.0,
+            long_mm=obj.short_mm,
+            short_mm=obj.long_mm,
+        )
+        return alt, mask
+
+    mod._measure_one = flipped
+    try:
+        obj = measure(img, 600.0, 300.0, CALIB, "block", win=200)
+    finally:
+        mod._measure_one = real
+    assert abs(obj.long_mm - obj.short_mm) < 3.0
+
+
+def test_measure_box_from_axis_aligned_detector() -> None:
+    """DINO-style AABB: long/short follow the box sides in robot mm."""
+    from mt4_vision.locate import measure_box
+
+    img = np.full((FRAME_H, FRAME_W, 3), DESK, dtype=np.uint8)
+    # 80x20 px box at 0.5mm/px -> 40x10 mm
+    obj = measure_box(img, 100, 200, 180, 220, CALIB, "eraser", confidence=0.4)
+    assert abs(obj.long_mm - 40.0) < 1.0
+    assert abs(obj.short_mm - 10.0) < 1.0
+    assert abs(obj.x - 140.0 * MM_PER_PX) < 1.0
+    assert abs(obj.y - 210.0 * MM_PER_PX) < 1.0
+    assert obj.confidence == 0.4
+
+
+def test_measure_falls_back_to_box_when_mask_is_unstable() -> None:
+    from mt4_vision import locate as mod
+    from mt4_vision.locate import measure_with_box_fallback
+
+    real = mod._measure_one
+    calls = {"n": 0}
+
+    def shifted(frame, px, py, calib, win, exclude, height):
+        got = real(frame, px, py, calib, win, exclude, height)
+        calls["n"] += 1
+        if got is None or calls["n"] == 1:
+            return got
+        obj, mask = got
+        rad = math.radians(obj.axis_yaw_deg)
+        return (
+            mod.replace(
+                obj,
+                x=obj.x - math.sin(rad) * 20.0,
+                y=obj.y + math.cos(rad) * 20.0,
+            ),
+            mask,
+        )
+
+    mod._measure_one = shifted
+    try:
+        # Mask path would refuse; box around the pen still yields a pose.
+        half_l, half_s = PEN_LONG_PX / 2.0, PEN_SHORT_PX / 2.0
+        obj = measure_with_box_fallback(
+            pen_frame(), PEN_CX, PEN_CY, CALIB, "pen",
+            box=(
+                PEN_CX - half_l, PEN_CY - half_s,
+                PEN_CX + half_l, PEN_CY + half_s,
+            ),
+            win=PEN_WIN,
+        )
+    finally:
+        mod._measure_one = real
+    assert abs(obj.x - PEN_CX * MM_PER_PX) < 6.0
+    assert abs(obj.y - PEN_CY * MM_PER_PX) < 6.0
+
+
 # -- refusals ------------------------------------------------------------
 
 

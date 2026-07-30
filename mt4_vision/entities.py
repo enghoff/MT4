@@ -469,13 +469,11 @@ def object_entity(
     ``build_snapshot``.
 
     Elongated objects are 180°-periodic (the jaws close *across* the long
-    axis), which is the whole reason ``yaw_period_deg`` exists.
-
-    Clearance is checked against the object's own SHORT axis, not the cube
-    rule: a 138mm pen has neighbours inside ``PICK_CLEARANCE_MM`` constantly,
-    and applying a 20mm cube's finger allowance to it would refuse nearly every
-    real grasp. What matters is room beside the grasp point across the jaws.
+    axis). Compact / near-square extents use the 90° square period instead --
+    grip orientation is not critical when there is no obvious shaft.
     """
+    from mt4_vision.locate import is_compact
+
     reason: str | None = None
     r = math.hypot(obj.x, obj.y)
     if not is_mp_reachable_xy(obj.x, obj.y):
@@ -498,6 +496,11 @@ def object_entity(
                     f"{need:.0f}mm the jaws need across a {obj.short_mm:.0f}mm object"
                 )
                 break
+    period = (
+        YAW_PERIOD_SQUARE
+        if is_compact(obj.long_mm, obj.short_mm)
+        else YAW_PERIOD_LONG_AXIS
+    )
     return Entity(
         id=ref if isinstance(ref, str) else f"obj_{ref}",
         kind=KIND_OBJECT,
@@ -506,7 +509,7 @@ def object_entity(
         y=float(obj.y),
         pixel=(float(obj.px), float(obj.py)),
         yaw_deg=float(obj.axis_yaw_deg),
-        yaw_period_deg=YAW_PERIOD_LONG_AXIS,
+        yaw_period_deg=period,
         pickable=reason is None,
         placeable=False,
         reason=reason,

@@ -399,6 +399,14 @@ def test_as_grasp_carries_yaw_and_period() -> None:
     assert g.grip_close_s == GRIPPER_S_CLOSED
 
 
+def test_compact_object_uses_square_yaw_period() -> None:
+    sn = snap([], objects=[FakeObject(200.0, 0.0, long_mm=22.0, short_mm=20.0)])
+    obj = sn.get("obj_1")
+    assert obj is not None
+    assert obj.yaw_period_deg == YAW_PERIOD_SQUARE
+    assert obj.as_grasp().yaw_period_deg == YAW_PERIOD_SQUARE
+
+
 def test_as_grasp_opens_fully_and_closes_fully_on_objects() -> None:
     """Servo stops on resistance -- no measured jaw-span sizing needed."""
     sn = snap([], objects=[FakeObject(213.4, -58.1)])

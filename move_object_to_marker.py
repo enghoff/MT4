@@ -27,6 +27,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import threading
 import time
@@ -41,8 +42,14 @@ from mt4_vision.calib import DEFAULT_CALIB_PATH, Calibration, load_calibration
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX, FrameStream, CameraError, capture_frame
 from mt4_vision.entities import object_entity
 from mt4_vision.grounding import Detection, GroundingError, detect, health
-from mt4_vision.locate import LocateError, LocatedObject, grasp_feasibility, measure
-from mt4_vision.motion import Grasp, YAW_PERIOD_LONG_AXIS, transfer
+from mt4_vision.locate import (
+    LocateError,
+    LocatedObject,
+    grasp_feasibility,
+    measure_with_box_fallback,
+    refine_at_hint,
+)
+from mt4_vision.motion import Grasp, transfer
 from mt4_vision.pickplace import ensure_homed, retreat_for_camera
 from mt4_vision.preview import LivePreview, PreviewStopped
 from mt4_vision.scene import Scene, capture_scene
@@ -102,11 +109,14 @@ def _gather_candidates(
     for det in dets:
         label = det.label.strip() or prompt.strip().rstrip(".")
         try:
-            obj = measure(
-                frame, det.cx, det.cy, calib, label, marker_xy=marker_xy,
+            obj = measure_with_box_fallback(
+                frame, det.cx, det.cy, calib, label,
+                box=(det.x1, det.y1, det.x2, det.y2),
+                marker_xy=marker_xy,
+                confidence=det.score,
             )
-        except LocateError:
-            skips.append(f"couldn't measure {label}")
+        except LocateError as exc:
+            skips.append(f"couldn't measure {label}: {exc}")
             continue
 
         if _denied(obj, deny):
@@ -135,16 +145,51 @@ def _gather_candidates(
     return measured, skips
 
 
+MASK_OVERLAY_BGR = (0, 220, 255)  # amber
+MASK_OVERLAY_ALPHA = 0.40
+
+
+def _overlay_mask(
+    out: np.ndarray,
+    mask: np.ndarray,
+    origin: tuple[int, int, int, int],
+    *,
+    color: tuple[int, int, int] = MASK_OVERLAY_BGR,
+    alpha: float = MASK_OVERLAY_ALPHA,
+) -> None:
+    """Blend ``mask`` (crop-local 0/1) onto ``out`` in place."""
+    x0, y0, x1, y1 = origin
+    h, w = mask.shape[:2]
+    if h == 0 or w == 0:
+        return
+    # refine_at_hint's origin is the crop box; trust mask shape over x1/y1.
+    y1 = min(out.shape[0], y0 + h)
+    x1 = min(out.shape[1], x0 + w)
+    region = out[y0:y1, x0:x1]
+    m = mask[: y1 - y0, : x1 - x0].astype(bool)
+    if not m.any():
+        return
+    tinted = region.copy()
+    tinted[m] = color
+    blended = cv2.addWeighted(tinted, alpha, region, 1.0 - alpha, 0)
+    region[m] = blended[m]
+
+
 def _annotate_track(
     frame: np.ndarray,
     dets: list[Detection],
     prompt: str,
     status: str,
 ) -> np.ndarray:
-    """Draw every current DINO hit for the tracked prompt."""
+    """Draw DINO boxes plus locate masks for each hit."""
     out = frame.copy()
     for i, d in enumerate(dets):
         color = (0, 255, 255) if i == 0 else (180, 180, 80)
+        try:
+            mask, origin = refine_at_hint(frame, d.cx, d.cy)
+            _overlay_mask(out, mask, origin, color=color)
+        except LocateError:
+            pass
         cv2.rectangle(
             out, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), color, 2,
         )
@@ -170,22 +215,358 @@ def _park(client: Mt4Client, calib: Calibration) -> None:
     time.sleep(CAMERA_SETTLE_S)
 
 
-def _prompt_object() -> str | None:
-    """Ask for the next object description. None means exit (EOF)."""
-    try:
-        raw = input("\nobject: ")
-    except EOFError:
-        print()
-        return None
-    return raw.strip()
+def _enable_vt() -> bool:
+    """Turn on ANSI cursor control on Windows consoles; True if usable."""
+    if not sys.stdout.isatty():
+        return False
+    if sys.platform != "win32":
+        return True
+    import ctypes
 
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+    mode = ctypes.c_uint()
+    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return False
+    return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+
+
+class BottomUI:
+    """Fixed prompt (2nd-to-last line) + status (last line); no scroll chatter.
+
+    Background threads call ``set_status``; the main thread blocks in
+    ``read_object`` editing the prompt line in place.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._status = "ready"
+        self._buf = ""
+        self._live = _enable_vt()
+        if self._live:
+            # Reserve the bottom two lines once so history stays above.
+            sys.stdout.write("\n\n")
+            sys.stdout.flush()
+            self._redraw()
+
+    @property
+    def live(self) -> bool:
+        return self._live
+
+    def _size(self) -> tuple[int, int]:
+        sz = shutil.get_terminal_size((80, 24))
+        return max(2, sz.lines), max(20, sz.columns)
+
+    def _redraw(self) -> None:
+        rows, cols = self._size()
+        prompt_row = rows - 1
+        status_row = rows
+        with self._lock:
+            buf = self._buf
+            status = self._status
+        # Truncate so we never wrap (wrapping would scroll).
+        label = "object: "
+        max_buf = max(0, cols - len(label) - 1)
+        if len(buf) > max_buf:
+            buf = buf[-max_buf:]
+        status = status.replace("\n", " ")
+        if len(status) > cols - 1:
+            status = status[: cols - 1]
+        col = len(label) + len(buf) + 1
+        sys.stdout.write(
+            "\033[?25l"
+            f"\033[{prompt_row};1H\033[2K{label}{buf}"
+            f"\033[{status_row};1H\033[2K{status}"
+            f"\033[{prompt_row};{col}H\033[?25h"
+        )
+        sys.stdout.flush()
+
+    def set_status(self, msg: str) -> None:
+        with self._lock:
+            self._status = msg
+        if self._live:
+            self._redraw()
+        else:
+            print(msg, flush=True)
+
+    def read_object(self) -> str | None:
+        """Edit the prompt line until Enter. None on EOF."""
+        if not self._live:
+            try:
+                raw = input("\nobject: ")
+            except EOFError:
+                print()
+                return None
+            return raw.strip()
+
+        with self._lock:
+            self._buf = ""
+        self._redraw()
+
+        if sys.platform == "win32":
+            return self._read_win()
+        return self._read_posix()
+
+    def _read_win(self) -> str | None:
+        import msvcrt
+
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                with self._lock:
+                    line = self._buf.strip()
+                    self._buf = ""
+                self._redraw()
+                return line
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x1a":
+                return None
+            if ch in ("\x08", "\x7f"):
+                with self._lock:
+                    self._buf = self._buf[:-1]
+                self._redraw()
+                continue
+            if ch in ("\x00", "\xe0"):
+                msvcrt.getwch()
+                continue
+            if ch.isprintable():
+                with self._lock:
+                    self._buf += ch
+                self._redraw()
+
+    def _read_posix(self) -> str | None:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ("\r", "\n"):
+                    with self._lock:
+                        line = self._buf.strip()
+                        self._buf = ""
+                    self._redraw()
+                    return line
+                if ch == "\x04":  # Ctrl+D
+                    return None
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                if ch in ("\x7f", "\b"):
+                    with self._lock:
+                        self._buf = self._buf[:-1]
+                    self._redraw()
+                    continue
+                if ch.isprintable():
+                    with self._lock:
+                        self._buf += ch
+                    self._redraw()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def close(self) -> None:
+        if not self._live:
+            return
+        rows, _cols = self._size()
+        sys.stdout.write(
+            f"\033[{rows - 1};1H\033[2K\033[{rows};1H\033[2K\033[?25h\n"
+        )
+        sys.stdout.flush()
+
+
+class PickSearch:
+    """Background scan/pick so the main thread can keep taking ``object:`` input.
+
+    ``look_for(prompt)`` starts (or replaces) a search. A later prompt cancels
+    the in-flight one via a generation counter. Arm motion is serialized.
+    """
+
+    def __init__(
+        self,
+        *,
+        ui: BottomUI,
+        calib: Calibration,
+        camera: int,
+        stream: FrameStream | None,
+        tracker: DinoTrackPreview | None,
+        client: Mt4Client | None,
+        allow_markers: set[int] | None,
+        box_threshold: float,
+        text_threshold: float,
+        dry_run: bool,
+        no_park: bool,
+        align_place: bool,
+    ) -> None:
+        self._ui = ui
+        self._calib = calib
+        self._camera = camera
+        self._stream = stream
+        self._tracker = tracker
+        self._client = client
+        self._allow_markers = allow_markers
+        self._box_threshold = box_threshold
+        self._text_threshold = text_threshold
+        self._dry_run = dry_run
+        self._no_park = no_park
+        self._align_place = align_place
+        self._lock = threading.Lock()
+        self._arm_lock = threading.Lock()
+        self._prompt: str | None = None
+        self._gen = 0
+        self._stop = threading.Event()
+        self.deny: list[tuple[float, float]] = []
+        self.moved = 0
+        self._thread = threading.Thread(
+            target=self._loop, name="pick-search", daemon=True,
+        )
+        self._thread.start()
+
+    def look_for(self, prompt: str) -> None:
+        with self._lock:
+            self._prompt = prompt
+            self._gen += 1
+        self._ui.set_status(f"looking for {prompt}…")
+        if self._tracker is not None:
+            self._tracker.track(prompt, status=f"finding {prompt}")
+
+    def _target(self) -> tuple[str | None, int]:
+        with self._lock:
+            return self._prompt, self._gen
+
+    def _clear_if_current(self, gen: int) -> None:
+        with self._lock:
+            if self._gen == gen:
+                self._prompt = None
+
+    def _loop(self) -> None:
+        skip_gen = -1
+        markers_gen = -1
+        while not self._stop.is_set():
+            if self._tracker is not None and self._tracker.stopped_by_user():
+                break
+            prompt, gen = self._target()
+            if not prompt:
+                time.sleep(0.05)
+                continue
+
+            try:
+                frame = (
+                    self._stream.fresh(min_advance=1) if self._stream is not None
+                    else capture_frame(self._camera)
+                )
+            except CameraError as exc:
+                self._ui.set_status(f"camera: {exc}")
+                time.sleep(0.5)
+                continue
+
+            scene = capture_scene(self._calib, frame)
+            free = scene.placeable_markers()
+            if self._allow_markers is not None:
+                free = [m for m in free if m.marker_id in self._allow_markers]
+            free = sorted(free, key=lambda m: m.marker_id)
+            if not free:
+                if markers_gen != gen:
+                    self._ui.set_status("no free markers — still looking…")
+                    markers_gen = gen
+                if self._tracker is not None:
+                    self._tracker.set_status("waiting for free marker")
+                continue
+
+            try:
+                candidates, skips = _gather_candidates(
+                    frame, self._calib, scene, prompt,
+                    box_threshold=self._box_threshold,
+                    text_threshold=self._text_threshold,
+                    deny=self.deny,
+                )
+            except GroundingError as exc:
+                self._ui.set_status(f"couldn't detect: {exc}")
+                time.sleep(0.5)
+                continue
+
+            if not candidates:
+                if skips and skip_gen != gen:
+                    note = skips[0]
+                    if note.startswith("can't pick") or "measure" in note:
+                        self._ui.set_status(f"{note} — still looking…")
+                        skip_gen = gen
+                    else:
+                        self._ui.set_status(f"looking for {prompt}…")
+                        skip_gen = gen
+                if self._tracker is not None:
+                    self._tracker.set_status(f"finding {prompt}")
+                continue
+
+            prompt_now, gen_now = self._target()
+            if gen_now != gen or prompt_now != prompt:
+                continue
+
+            cand = candidates[0]
+            marker = free[0]
+            self._ui.set_status(f"found {cand.obj.label}")
+            if self._tracker is not None:
+                self._tracker.set_status(
+                    f"moving {cand.obj.label} -> marker {marker.marker_id}"
+                )
+
+            with self._arm_lock:
+                prompt_now, gen_now = self._target()
+                if gen_now != gen or prompt_now != prompt:
+                    continue
+                if self._dry_run or self._client is None:
+                    self._ui.set_status(
+                        f"would move {cand.obj.label} -> marker {marker.marker_id}"
+                    )
+                    self._clear_if_current(gen)
+                    if self._tracker is not None:
+                        self._tracker.set_status(f"tracking {prompt}")
+                    continue
+
+                entity = object_entity(cand.obj, 1, scene=scene)
+                src = entity.as_grasp(self._calib)
+                if self._align_place:
+                    dst = Grasp(
+                        marker.x, marker.y,
+                        yaw_deg=cand.obj.axis_yaw_deg,
+                        yaw_period_deg=src.yaw_period_deg,
+                        grip_close_s=src.grip_close_s,
+                    )
+                else:
+                    dst = Grasp(marker.x, marker.y)
+                self._ui.set_status(
+                    f"moving {cand.obj.label} -> marker {marker.marker_id}"
+                )
+                try:
+                    transfer(self._client, self._calib, src, dst)
+                    self._ui.set_status(
+                        f"moved {cand.obj.label} -> marker {marker.marker_id}"
+                    )
+                    self.moved += 1
+                except Mt4ClientError as exc:
+                    self._ui.set_status(f"couldn't move: {exc}")
+                    self.deny.append((cand.obj.x, cand.obj.y))
+                if self._tracker is not None:
+                    self._tracker.set_status(f"tracking {prompt}")
+                if not self._no_park:
+                    try:
+                        _park(self._client, self._calib)
+                    except Mt4ClientError as exc:
+                        self._ui.set_status(f"couldn't park: {exc}")
+                self._clear_if_current(gen)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
 
 class DinoTrackPreview:
-    """Background DINO → annotate → preview loop for the active prompt.
+    """Background DINO → segment → annotate → preview loop for the active prompt.
 
-    Pace is whatever ``detect`` takes (plus a fresh camera frame); there is no
-    extra sleep. Runs through pick/place and the next prompt wait so the last
-    requested object stays visually tracked.
+    Pace is whatever ``detect`` takes (plus a fresh camera frame and a cheap
+    locate mask per hit). Runs through pick/place and the next prompt wait so
+    the last requested object stays visually tracked.
     """
 
     def __init__(
@@ -333,109 +714,40 @@ def main(argv: list[str] | None = None) -> int:
             text_threshold=args.text_threshold,
         )
 
-    moved = 0
-    deny: list[tuple[float, float]] = []
-    print("ready")
+    ui = BottomUI()
+    search = PickSearch(
+        ui=ui,
+        calib=calib,
+        camera=args.camera,
+        stream=stream,
+        tracker=tracker,
+        client=client,
+        allow_markers=allow_markers,
+        box_threshold=args.box_threshold,
+        text_threshold=args.text_threshold,
+        dry_run=args.dry_run,
+        no_park=args.no_park,
+        align_place=args.align_place,
+    )
+    ui.set_status("ready")
     try:
         while True:
             if tracker is not None and tracker.stopped_by_user():
                 break
-            prompt = _prompt_object()
+            prompt = ui.read_object()
             if prompt is None:
                 break
             if not prompt:
                 continue
             if tracker is not None and tracker.stopped_by_user():
                 break
-
-            if tracker is not None:
-                tracker.track(prompt, status=f"finding {prompt}")
-
-            try:
-                frame = (
-                    stream.fresh(min_advance=2) if stream is not None
-                    else capture_frame(args.camera)
-                )
-            except CameraError as exc:
-                print(f"camera: {exc}")
-                continue
-
-            scene = capture_scene(calib, frame)
-            free = scene.placeable_markers()
-            if allow_markers is not None:
-                free = [m for m in free if m.marker_id in allow_markers]
-            free = sorted(free, key=lambda m: m.marker_id)
-            if not free:
-                print("no free markers")
-                if tracker is not None:
-                    tracker.set_status(f"tracking {prompt}")
-                continue
-
-            try:
-                candidates, skips = _gather_candidates(
-                    frame, calib, scene, prompt,
-                    box_threshold=args.box_threshold,
-                    text_threshold=args.text_threshold,
-                    deny=deny,
-                )
-            except GroundingError as exc:
-                print(f"couldn't detect: {exc}")
-                continue
-
-            if not candidates:
-                print(skips[0] if skips else f"didn't find {prompt}")
-                if tracker is not None:
-                    tracker.set_status(f"tracking {prompt}")
-                continue
-
-            cand = candidates[0]
-            marker = free[0]
-            if tracker is not None:
-                tracker.set_status(
-                    f"moving {cand.obj.label} -> marker {marker.marker_id}"
-                )
-
-            if args.dry_run:
-                print(f"would move {cand.obj.label} -> marker {marker.marker_id}")
-                if tracker is not None:
-                    tracker.set_status(f"tracking {prompt}")
-                continue
-
-            assert client is not None
-            entity = object_entity(cand.obj, 1, scene=scene)
-            src = entity.as_grasp(calib)
-            assert src.yaw_period_deg == YAW_PERIOD_LONG_AXIS
-            if args.align_place:
-                dst = Grasp(
-                    marker.x, marker.y,
-                    yaw_deg=cand.obj.axis_yaw_deg,
-                    yaw_period_deg=YAW_PERIOD_LONG_AXIS,
-                    grip_close_s=src.grip_close_s,
-                )
-            else:
-                dst = Grasp(marker.x, marker.y)
-
-            try:
-                transfer(client, calib, src, dst)
-                print(f"moved {cand.obj.label} -> marker {marker.marker_id}")
-                moved += 1
-            except Mt4ClientError as exc:
-                print(f"couldn't move: {exc}")
-                deny.append((cand.obj.x, cand.obj.y))
-            if tracker is not None:
-                tracker.set_status(f"tracking {prompt}")
-            if not args.no_park:
-                try:
-                    _park(client, calib)
-                except Mt4ClientError as exc:
-                    print(f"couldn't park: {exc}")
-                    return 1
-
+            search.look_for(prompt)
         return 0
     except KeyboardInterrupt:
-        print()
         return 0
     finally:
+        search.close()
+        ui.close()
         if tracker is not None:
             tracker.close()
         if stream is not None:

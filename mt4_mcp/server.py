@@ -476,7 +476,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             from mt4_vision.calib import load_calibration
             from mt4_vision.camera import capture_frame
             from mt4_vision.grounding import GroundingError, detect
-            from mt4_vision.locate import LocateError, grasp_feasibility, measure
+            from mt4_vision.locate import LocateError, grasp_feasibility, measure_with_box_fallback
             from mt4_vision.scene import capture_scene
 
             nonlocal _view
@@ -500,9 +500,11 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             scene = capture_scene(calib, frame)
             label = best.label.strip() or prompt.strip().rstrip(".")
             try:
-                obj = measure(
+                obj = measure_with_box_fallback(
                     frame, best.cx, best.cy, calib, label,
+                    box=(best.x1, best.y1, best.x2, best.y2),
                     marker_xy=[(m.x, m.y) for m in scene.markers],
+                    confidence=best.score,
                 )
             except LocateError as exc:
                 return {

@@ -219,7 +219,7 @@ def cmd_grounding(args: argparse.Namespace) -> int:
         return 0
 
     from mt4_vision.entities import object_entity
-    from mt4_vision.locate import LocateError, grasp_feasibility, measure
+    from mt4_vision.locate import LocateError, grasp_feasibility, measure_with_box_fallback
     from mt4_vision.preview import annotate_for_pointing
     from mt4_vision.scene import capture_scene
 
@@ -228,9 +228,11 @@ def cmd_grounding(args: argparse.Namespace) -> int:
     calib = load_calibration(Path(args.calib))
     scene = capture_scene(calib, frame)
     try:
-        obj = measure(
+        obj = measure_with_box_fallback(
             frame, best.cx, best.cy, calib, label,
+            box=(best.x1, best.y1, best.x2, best.y2),
             win=args.window, marker_xy=[(m.x, m.y) for m in scene.markers],
+            confidence=best.score,
         )
     except LocateError as exc:
         print(f"locate failed: {exc}")
