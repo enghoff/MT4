@@ -328,6 +328,17 @@ def build_snapshot(
     objects = [o for _eid, o in object_items]
     pickable_ids = {id(c) for c in scene.pickable(scene.cubes)}
     raw = scene.raw_cubes if scene.raw_cubes is not None else scene.cubes
+    if objects:
+        # One physical thing must not get two ids. A located object that
+        # happens to be cube-coloured is also in the cube list (see
+        # is_own_colour_blob), and that duplicate would be advertised as a
+        # pickable cube_N -- picking it would grab the object with the wrong
+        # (90°-periodic) wrist rule.
+        raw = [
+            c
+            for c in raw
+            if not any(is_own_colour_blob(obj, c) for obj in objects)
+        ]
     occupant_of: dict[int, CubeDetection] = {
         m.marker_id: c for m, c in scene.occupied
     }
@@ -430,6 +441,27 @@ def build_snapshot(
     )
 
 
+def is_own_colour_blob(obj: "LocatedObject", cube: CubeDetection) -> bool:
+    """True when ``cube`` is this object's own colour blob, detected again.
+
+    The cube detector is colour+area based, so a coloured non-cube of plausible
+    size reads as a cube: measured live 2026-07-30, a red clic eraser at
+    (141, -180) came back as `red cube` area 1169px, 20mm from the eraser's own
+    grasp point -- inside the finger clearance the object needs, so the eraser
+    blocked its own pick. Two detections of one blob share one centroid, so
+    identity is settled in pixels (the trick ``scene.is_held_cube_blob`` uses
+    for the gripped cube): the cube's centroid falls inside the object's own
+    mask footprint. A genuine neighbour sits outside it and still blocks.
+    """
+    mask_area_px = float(getattr(obj, "mask_area_px", 0.0) or 0.0)
+    if mask_area_px <= 0.0:
+        # Hand-built or duck-typed object (tests, or a measure() that kept no
+        # mask): no footprint to compare against, so every cube is a neighbour.
+        return False
+    radius_px = math.sqrt(mask_area_px / math.pi)
+    return math.hypot(cube.px - obj.px, cube.py - obj.py) <= radius_px
+
+
 def object_entity(
     obj: "LocatedObject", ref: int | str, *, scene: Scene | None = None
 ) -> Entity:
@@ -460,6 +492,8 @@ def object_entity(
         need = max(obj.short_mm, 20.0) * 0.5 + 12.0
         for other in scene.cubes:
             if other.x is None or other.y is None:
+                continue
+            if is_own_colour_blob(obj, other):
                 continue
             d = dist_mm(obj.x, obj.y, float(other.x), float(other.y))
             if d < need:

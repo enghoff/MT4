@@ -26,7 +26,11 @@ markers_frame.jpg
 scene_frame.jpg
 entities_frame.jpg
 locate_frame.jpg
+grounding_frame.jpg
+grounding_locate.jpg
+move_object_frame.jpg
 vision_calibration.json
 
 # demonstration collection + converted dataset output (images -- not for git)
 data/
+.mcp.json

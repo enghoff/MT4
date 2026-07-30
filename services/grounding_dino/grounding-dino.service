@@ -1,0 +1,17 @@
+[Unit]
+Description=Grounding DINO open-vocab detection service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/grounding_dino
+Environment=GROUNDING_DINO_HOST=127.0.0.1
+Environment=GROUNDING_DINO_PORT=8765
+Environment=GROUNDING_DINO_MODEL=IDEA-Research/grounding-dino-base
+Environment=GROUNDING_DINO_DEVICE=cuda
+ExecStart=/opt/grounding_dino/.venv/bin/python /opt/grounding_dino/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

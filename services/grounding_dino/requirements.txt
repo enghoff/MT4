@@ -1,0 +1,9 @@
+torch
+torchvision
+transformers>=4.40
+accelerate
+fastapi
+uvicorn[standard]
+pillow
+opencv-python-headless
+python-multipart

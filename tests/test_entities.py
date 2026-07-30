@@ -342,6 +342,33 @@ def test_object_clearance_uses_its_short_axis_not_the_cube_rule() -> None:
     assert blocked.reason and "grasp point" in blocked.reason
 
 
+def test_object_is_not_blocked_by_its_own_colour_blob() -> None:
+    """A coloured non-cube is also in the cube list (the detector is colour +
+    area), and that duplicate sat 20mm from the object's own grasp point --
+    inside the finger clearance, so the eraser refused its own pick. Measured
+    live 2026-07-30: a red clic eraser read as `red cube` area 1169px."""
+    own = CubeDetection(
+        color="red", px=744.0, py=390.0, area=1169.0, x=140.6, y=-180.2, yaw_deg=12.0
+    )
+    eraser = FakeObject(122.6, -189.2, label="eraser", long_mm=55.2, short_mm=4.4)
+    eraser.mask_area_px = 1181.0  # centroid distance ~2.8px, well inside r=19px
+    sn = build_snapshot(scene([own]), token="s1", objects=[eraser])
+
+    obj = sn.get("obj_1")
+    assert obj is not None and obj.pickable, obj.reason
+    # ...and one physical thing gets one id: no duplicate cube entity.
+    assert not sn.of_kind(KIND_CUBE)
+
+    # A real cube, whose blob is elsewhere in the frame, still blocks.
+    neighbour = CubeDetection(
+        color="red", px=300.0, py=500.0, area=2500.0, x=140.6, y=-180.2, yaw_deg=12.0
+    )
+    sn2 = build_snapshot(scene([neighbour]), token="s1", objects=[eraser])
+    blocked = sn2.get("obj_1")
+    assert blocked is not None and not blocked.pickable
+    assert blocked.reason and "grasp point" in blocked.reason
+
+
 def test_object_outside_reach_abstains() -> None:
     sn = snap([], objects=[FakeObject(400.0, 0.0)])
     obj = sn.get("obj_1")

@@ -110,7 +110,9 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             "If the object asked for is not in mt4_scene's list, it may be "
             "something the cube detector cannot see (a pen, a key). Call "
             "mt4_camera_view, read its pixel off the drawn grid, and register "
-            "it with mt4_locate_at_pixel; then it has an id like the rest.\n\n"
+            "it with mt4_locate_at_pixel; then it has an id like the rest. "
+            "Alternatively mt4_locate_by_prompt runs Grounding DINO (via the "
+            "SSH tunnel to media) and registers the top hit the same way.\n\n"
             "Do not substitute a target. When a referent cannot be resolved, "
             "or an entity reports pickable/placeable false, say so and quote "
             "the reason field -- the physical constraint it names (keep-out, "
@@ -443,6 +445,82 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
 
             _key, entity = _register_object(obj, scene)
             out = {"ok": True, "entity": entity.as_dict()}
+            if not ok and entity.reason is None:
+                out["entity"]["pickable"] = False
+                out["entity"]["reason"] = reason
+            return out
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool
+    def mt4_locate_by_prompt(
+        prompt: str,
+        camera: int = 1,
+        box_threshold: float = 0.35,
+        text_threshold: float = 0.25,
+    ) -> dict[str, Any]:
+        """Find an object by open-vocab text via Grounding DINO on media, then
+        register the top hit as `obj_N` the same way mt4_locate_at_pixel does.
+
+        Requires the SSH tunnel to media (`scripts/start_grounding_tunnel.ps1`)
+        so `http://127.0.0.1:8765` reaches the GPU service. Prefer mt4_scene ids
+        for coloured cubes; use this for things HSV cannot name (pen, key, ...).
+
+        Args:
+            prompt: What to look for, e.g. "pen" or "screwdriver".
+            camera: USB camera index (default 1).
+            box_threshold: Grounding DINO box score floor.
+            text_threshold: Grounding DINO text score floor.
+        """
+        try:
+            from mt4_vision.calib import load_calibration
+            from mt4_vision.camera import capture_frame
+            from mt4_vision.grounding import GroundingError, detect
+            from mt4_vision.locate import LocateError, grasp_feasibility, measure
+            from mt4_vision.scene import capture_scene
+
+            nonlocal _view
+            frame = capture_frame(camera)
+            try:
+                dets = detect(
+                    frame, prompt,
+                    box_threshold=box_threshold,
+                    text_threshold=text_threshold,
+                )
+            except GroundingError as exc:
+                return {"ok": False, "error": str(exc)}
+            if not dets:
+                return {
+                    "ok": False,
+                    "error": f"no detections for prompt={prompt!r}",
+                    "detections": [],
+                }
+            best = dets[0]
+            calib = load_calibration()
+            scene = capture_scene(calib, frame)
+            label = best.label.strip() or prompt.strip().rstrip(".")
+            try:
+                obj = measure(
+                    frame, best.cx, best.cy, calib, label,
+                    marker_xy=[(m.x, m.y) for m in scene.markers],
+                )
+            except LocateError as exc:
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "detections": [d.as_dict() for d in dets],
+                }
+            ok, reason = grasp_feasibility(obj, calib)
+            _key, entity = _register_object(obj, scene)
+            token = _next_token("v")
+            _view = (token, frame)
+            out = {
+                "ok": True,
+                "entity": entity.as_dict(),
+                "detection": best.as_dict(),
+                "detections": [d.as_dict() for d in dets],
+                "view": token,
+            }
             if not ok and entity.reason is None:
                 out["entity"]["pickable"] = False
                 out["entity"]["reason"] = reason
