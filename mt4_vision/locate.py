@@ -49,7 +49,6 @@ import numpy as np
 from mt4_vision.calib import Calibration
 from mt4_vision.wrist import j4_for_long_axis
 from mt4_vision.workspace import (
-    KEEPOUT_RADIUS_MM,
     MAX_REACH_MM,
     MAX_VERIFIABLE_RADIUS_MM,
     is_mp_reachable_xy,
@@ -82,6 +81,10 @@ STABILITY_WINDOW_RATIO = 0.72
 STABILITY_CENTROID_MM = 6.0
 STABILITY_SHORT_MM = 5.0
 STABILITY_YAW_DEG = 12.0
+# long/short at or below this: no obvious shaft. minAreaRect freely swaps which
+# edge is "long" (≈90° yaw flips) between window sizes, and the grasp does not
+# care -- jaws can meet any face. Above this, yaw disagreement is load-bearing.
+COMPACT_ASPECT = 1.35
 # Normalized-cross-correlation floor for re-acquiring a registered object.
 # Below this, report nothing rather than a low-confidence guess -- a wrong
 # position is worse than "re-scan", because the arm will act on it.
@@ -91,10 +94,6 @@ RELOCATE_SEARCH_PX = 80
 # flooded the desk yields a huge "object" whose centroid is meaningless.
 MAX_PLAUSIBLE_LONG_MM = 200.0
 MIN_PLAUSIBLE_LONG_MM = 4.0
-# How much narrower than a cube an object may be before an UNCALIBRATED jaw-span
-# model makes its grasp untrustworthy -- see grasp_feasibility. Matched to
-# calib.GRIP_SQUEEZE_MM: within that, closing at the cube value still contacts.
-UNCALIBRATED_GRIP_SLACK_MM = 4.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +133,11 @@ class LocatedObject:
 
 class LocateError(Exception):
     """Raised when a hint cannot be turned into a measurement."""
+
+
+def is_compact(long_mm: float, short_mm: float) -> bool:
+    """True when there is no obvious long axis (cube-like, not pen-like)."""
+    return float(long_mm) <= COMPACT_ASPECT * max(float(short_mm), 1e-6)
 
 
 def _window(frame: np.ndarray, px: float, py: float, win: int) -> tuple[int, int, int, int]:
@@ -265,6 +269,134 @@ def refine_at_hint(
     return got
 
 
+# GrabCut: detector AABB is probable FG; a small centre disc is sure FG so the
+# GMM has a colour sample. Marking the box border as sure BG looks tempting for
+# loose boxes but eats thin rotated objects whose tips sit in that border.
+GRABCUT_ITERS = 5
+GRABCUT_MARGIN_PX = 32  # desk context around the box for the GMM
+GRABCUT_SURE_FG_RADIUS_PX = 10
+GRABCUT_MIN_AREA_FRAC = 0.02  # refuse if FG is tiny vs the box
+
+
+def _clip_box(
+    frame: np.ndarray, x1: float, y1: float, x2: float, y2: float
+) -> tuple[int, int, int, int] | None:
+    h, w = frame.shape[:2]
+    xa, xb = sorted((int(math.floor(x1)), int(math.ceil(x2))))
+    ya, yb = sorted((int(math.floor(y1)), int(math.ceil(y2))))
+    xa = max(0, min(xa, w - 1))
+    xb = max(0, min(xb, w))
+    ya = max(0, min(ya, h - 1))
+    yb = max(0, min(yb, h))
+    if xb - xa < 4 or yb - ya < 4:
+        return None
+    return xa, ya, xb, yb
+
+
+def _segment_grabcut(
+    frame: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    exclude: np.ndarray | None = None,
+    *,
+    iters: int = GRABCUT_ITERS,
+    margin_px: int = GRABCUT_MARGIN_PX,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """Foreground mask from a detector AABB via GrabCut.
+
+    The box is a strong prior from Grounding DINO; GrabCut turns it into a
+    silhouette that desk-deviation segmentation often cannot find (low contrast,
+    textured objects, soft shadows). Marker paper is forced to sure background.
+    """
+    clipped = _clip_box(frame, x1, y1, x2, y2)
+    if clipped is None:
+        return None
+    bx0, by0, bx1, by1 = clipped
+    h, w = frame.shape[:2]
+    # Crop with margin so GrabCut sees real desk outside the box.
+    cx0 = max(0, bx0 - margin_px)
+    cy0 = max(0, by0 - margin_px)
+    cx1 = min(w, bx1 + margin_px)
+    cy1 = min(h, by1 + margin_px)
+    crop = np.ascontiguousarray(frame[cy0:cy1, cx0:cx1])
+    if crop.size == 0 or min(crop.shape[:2]) < 8:
+        return None
+
+    lx0, ly0 = bx0 - cx0, by0 - cy0
+    lx1, ly1 = bx1 - cx0, by1 - cy0
+    bw, bh = lx1 - lx0, ly1 - ly0
+
+    gc = np.full(crop.shape[:2], cv2.GC_BGD, dtype=np.uint8)
+    gc[ly0:ly1, lx0:lx1] = cv2.GC_PR_FGD
+    # Seed sure FG at the box centre so GrabCut has an object colour sample
+    # even when most of a loose AABB is desk.
+    hx = max(0, min((lx0 + lx1) // 2, crop.shape[1] - 1))
+    hy = max(0, min((ly0 + ly1) // 2, crop.shape[0] - 1))
+    r = max(3, min(GRABCUT_SURE_FG_RADIUS_PX, bw // 4, bh // 4))
+    cv2.circle(gc, (hx, hy), r, int(cv2.GC_FGD), thickness=-1)
+
+    if exclude is not None:
+        ex = exclude[cy0:cy1, cx0:cx1]
+        if ex.shape[:2] == gc.shape:
+            gc[ex.astype(bool)] = cv2.GC_BGD
+
+    bgd = np.zeros((1, 65), np.float64)
+    fgd = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(crop, gc, None, bgd, fgd, iters, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return None
+
+    fg = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    # Keep only the component under the box centre (or nearest inside the box).
+    n, labels = cv2.connectedComponents(fg)
+    if n <= 1:
+        return None
+    want = int(labels[hy, hx])
+    if want == 0:
+        ys, xs = np.nonzero(labels)
+        if not len(ys):
+            return None
+        # Prefer components that overlap the detector box.
+        in_box = (
+            (xs >= lx0) & (xs < lx1) & (ys >= ly0) & (ys < ly1) & (labels[ys, xs] > 0)
+        )
+        if in_box.any():
+            ys, xs = ys[in_box], xs[in_box]
+        d2 = (ys - hy) ** 2 + (xs - hx) ** 2
+        i = int(d2.argmin())
+        want = int(labels[ys[i], xs[i]])
+    mask = (labels == want).astype(np.uint8)
+    area = int(mask.sum())
+    box_area = max(1, bw * bh)
+    if area < max(16, int(box_area * GRABCUT_MIN_AREA_FRAC)):
+        return None
+    return mask, (cx0, cy0, cx1, cy1)
+
+
+def refine_at_box(
+    frame: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    *,
+    exclude: np.ndarray | None = None,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """GrabCut mask for a detector AABB (preview / measure path)."""
+    got = _segment_grabcut(frame, x1, y1, x2, y2, exclude)
+    if got is None:
+        raise LocateError(
+            f"GrabCut found no foreground in box "
+            f"({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})"
+        )
+    return got
+
+
 def _rect_from_mask(
     mask: np.ndarray, origin: tuple[int, int]
 ) -> tuple[tuple[float, float], list[tuple[float, float]]]:
@@ -354,21 +486,19 @@ def _median_width_px(mask: np.ndarray, long_axis_deg_px: float) -> float:
     return float(np.median(nz)) if nz.size else 0.0
 
 
-def _measure_one(
+def _object_from_mask(
     frame: np.ndarray,
-    px: float,
-    py: float,
+    mask: np.ndarray,
+    origin: tuple[int, int],
     calib: Calibration,
-    win: int,
-    exclude: np.ndarray | None,
     object_height_mm: float | None,
-) -> tuple[LocatedObject, np.ndarray] | None:
-    """One window's measurement, or None if nothing could be segmented."""
-    got = _segment(frame, px, py, win, exclude)
-    if got is None:
+) -> LocatedObject | None:
+    """Geometry from a crop-local mask; None if the silhouette is degenerate."""
+    x0, y0 = origin
+    try:
+        centroid, corners = _rect_from_mask(mask, (x0, y0))
+    except LocateError:
         return None
-    mask, (x0, y0, _x1, _y1) = got
-    centroid, corners = _rect_from_mask(mask, (x0, y0))
     robot = [calib.pixel_to_robot(cx, cy, on_cube_top=False) for cx, cy in corners]
     cx, cy = calib.pixel_to_robot(centroid[0], centroid[1], on_cube_top=False)
 
@@ -418,7 +548,7 @@ def _measure_one(
         cx, cy = _unproject(calib, centroid[0], centroid[1], height / 2.0)
 
     th, tw = mask.shape[:2]
-    obj = LocatedObject(
+    return LocatedObject(
         label="",
         px=centroid[0],
         py=centroid[1],
@@ -432,6 +562,25 @@ def _measure_one(
         template=np.ascontiguousarray(frame[y0 : y0 + th, x0 : x0 + tw]),
         mask_area_px=float(mask.sum()),
     )
+
+
+def _measure_one(
+    frame: np.ndarray,
+    px: float,
+    py: float,
+    calib: Calibration,
+    win: int,
+    exclude: np.ndarray | None,
+    object_height_mm: float | None,
+) -> tuple[LocatedObject, np.ndarray] | None:
+    """One window's measurement, or None if nothing could be segmented."""
+    got = _segment(frame, px, py, win, exclude)
+    if got is None:
+        return None
+    mask, (x0, y0, _x1, _y1) = got
+    obj = _object_from_mask(frame, mask, (x0, y0), calib, object_height_mm)
+    if obj is None:
+        return None
     return obj, mask
 
 
@@ -494,32 +643,207 @@ def measure(
                 f"{second_win}px window -- too unstable to act on"
             )
         alt = other[0]
-        # Split the disagreement along and across the axis. Along-axis drift is
-        # expected -- an end whose contrast against the desk fades gets clipped
-        # by a different amount at each scale -- and it is harmless, because the
-        # grasp still lands on the shaft. Across-axis drift is the one that makes
-        # the jaws miss, so only that is held to a tight bound.
-        rad = math.radians(obj.axis_yaw_deg)
         dx, dy = alt.x - obj.x, alt.y - obj.y
-        along = abs(dx * math.cos(rad) + dy * math.sin(rad))
-        across = abs(-dx * math.sin(rad) + dy * math.cos(rad))
-        dshort = abs(alt.short_mm - obj.short_mm)
-        dyaw = abs((alt.axis_yaw_deg - obj.axis_yaw_deg + 90.0) % 180.0 - 90.0)
-        if (
-            across > STABILITY_CENTROID_MM
-            or along > max(STABILITY_CENTROID_MM, 0.5 * obj.long_mm)
-            or dshort > STABILITY_SHORT_MM
-            or dyaw > STABILITY_YAW_DEG
-        ):
-            raise LocateError(
-                f"unstable segmentation at ({px:.0f}, {py:.0f}): {win}px and "
-                f"{second_win}px windows disagree by {across:.0f}mm across the "
-                f"axis, {along:.0f}mm along it, {dshort:.0f}mm in width and "
-                f"{dyaw:.0f}deg in angle -- refusing rather than guessing which "
-                "is right"
+        if is_compact(obj.long_mm, obj.short_mm):
+            # Near-square: which edge is "long" flips ~90° between scales and
+            # is not load-bearing for the grasp. Only centroid and overall size.
+            drift = math.hypot(dx, dy)
+            dsize = abs(
+                (alt.long_mm + alt.short_mm) - (obj.long_mm + obj.short_mm)
             )
+            if drift > STABILITY_CENTROID_MM or dsize > 2.0 * STABILITY_SHORT_MM:
+                raise LocateError(
+                    f"unstable segmentation at ({px:.0f}, {py:.0f}): "
+                    f"compact object drifted {drift:.0f}mm / {dsize:.0f}mm size "
+                    f"across window scales"
+                )
+        else:
+            # Split disagreement along and across the axis. Along-axis drift is
+            # expected (faded ends clip differently per scale) and harmless for
+            # a shaft grasp; across-axis drift makes the jaws miss.
+            rad = math.radians(obj.axis_yaw_deg)
+            along = abs(dx * math.cos(rad) + dy * math.sin(rad))
+            across = abs(-dx * math.sin(rad) + dy * math.cos(rad))
+            dshort = abs(alt.short_mm - obj.short_mm)
+            dyaw = abs((alt.axis_yaw_deg - obj.axis_yaw_deg + 90.0) % 180.0 - 90.0)
+            if (
+                across > STABILITY_CENTROID_MM
+                or along > max(STABILITY_CENTROID_MM, 0.5 * obj.long_mm)
+                or dshort > STABILITY_SHORT_MM
+                or dyaw > STABILITY_YAW_DEG
+            ):
+                raise LocateError(
+                    f"unstable segmentation at ({px:.0f}, {py:.0f}): {win}px and "
+                    f"{second_win}px windows disagree by {across:.0f}mm across the "
+                    f"axis, {along:.0f}mm along it, {dshort:.0f}mm in width and "
+                    f"{dyaw:.0f}deg in angle -- refusing rather than guessing which "
+                    "is right"
+                )
 
     return replace(obj, label=label, confidence=confidence)
+
+
+def measure_box(
+    frame: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    calib: Calibration,
+    label: str,
+    *,
+    confidence: float = 1.0,
+    object_height_mm: float | None = None,
+) -> LocatedObject:
+    """Geometry from an axis-aligned detector box (e.g. Grounding DINO).
+
+    Fallback when desk-deviation segmentation is unstable or missing: the box
+    is coarser (image-aligned AABB, loose on rotated objects) but consistent.
+    Good enough for a full-close grip that does not need a precise jaw span.
+    """
+    h, w = frame.shape[:2]
+    xa, xb = sorted((float(x1), float(x2)))
+    ya, yb = sorted((float(y1), float(y2)))
+    xa = max(0.0, min(xa, w - 1.0))
+    xb = max(0.0, min(xb, w - 1.0))
+    ya = max(0.0, min(ya, h - 1.0))
+    yb = max(0.0, min(yb, h - 1.0))
+    if xb - xa < 2.0 or yb - ya < 2.0:
+        raise LocateError(
+            f"detector box too small ({xb - xa:.0f}x{yb - ya:.0f}px) to measure"
+        )
+
+    # Corners ordered around the AABB -- consecutive pairs are the two sides.
+    corners = [(xa, ya), (xb, ya), (xb, yb), (xa, yb)]
+    centroid = (0.5 * (xa + xb), 0.5 * (ya + yb))
+    robot = [calib.pixel_to_robot(cx, cy, on_cube_top=False) for cx, cy in corners]
+    cx, cy = calib.pixel_to_robot(centroid[0], centroid[1], on_cube_top=False)
+
+    e0 = (robot[1][0] - robot[0][0], robot[1][1] - robot[0][1])
+    e1 = (robot[2][0] - robot[1][0], robot[2][1] - robot[1][1])
+    len0, len1 = math.hypot(*e0), math.hypot(*e1)
+    if len0 >= len1:
+        long_v, long_mm, short_mm = e0, len0, len1
+    else:
+        long_v, long_mm, short_mm = e1, len1, len0
+    if long_mm < 1e-6:
+        raise LocateError("detector box projects to a degenerate rect")
+    if not MIN_PLAUSIBLE_LONG_MM <= long_mm <= MAX_PLAUSIBLE_LONG_MM:
+        raise LocateError(
+            f"box measures {long_mm:.0f}x{short_mm:.0f}mm, outside the plausible "
+            f"{MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm range"
+        )
+    axis_yaw = math.degrees(math.atan2(long_v[1], long_v[0]))
+
+    gain = _parallax_gain(calib, cx, cy)
+    cam = calib.cam_xy_robot
+    cos_radial = 1.0
+    if cam:
+        d = math.hypot(cam[0] - cx, cam[1] - cy)
+        if d > 1e-6:
+            ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
+            cos_radial = abs(ax * (cam[0] - cx) + ay * (cam[1] - cy)) / d
+    height = (
+        _assumed_height_mm(short_mm, gain, cos_radial)
+        if object_height_mm is None
+        else max(0.0, float(object_height_mm))
+    )
+    if height > 0.0:
+        short_mm = max(1.0, short_mm - height * gain * cos_radial)
+        cx, cy = _unproject(calib, centroid[0], centroid[1], height / 2.0)
+
+    ix0, iy0 = int(math.floor(xa)), int(math.floor(ya))
+    ix1, iy1 = int(math.ceil(xb)), int(math.ceil(yb))
+    return LocatedObject(
+        label=label,
+        px=centroid[0],
+        py=centroid[1],
+        x=cx,
+        y=cy,
+        axis_yaw_deg=axis_yaw,
+        long_mm=long_mm,
+        short_mm=short_mm,
+        confidence=float(confidence),
+        height_mm=height,
+        template=np.ascontiguousarray(frame[iy0:iy1, ix0:ix1]),
+        mask_area_px=float((xb - xa) * (yb - ya)),
+    )
+
+
+def measure_grabcut(
+    frame: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    calib: Calibration,
+    label: str,
+    *,
+    confidence: float = 1.0,
+    marker_xy: Sequence[tuple[float, float]] = (),
+    object_height_mm: float | None = None,
+) -> LocatedObject:
+    """Measure via GrabCut seeded by a detector AABB.
+
+    Tighter than ``measure_box`` (axis-aligned AABB) when the object contrasts
+    with the desk; still refuses on empty / flooded masks.
+    """
+    exclude = marker_paper_mask(frame, calib, marker_xy) if marker_xy else None
+    got = _segment_grabcut(frame, x1, y1, x2, y2, exclude)
+    if got is None:
+        raise LocateError(
+            f"GrabCut found no foreground in box "
+            f"({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})"
+        )
+    mask, (ox, oy, _x1, _y1) = got
+    obj = _object_from_mask(frame, mask, (ox, oy), calib, object_height_mm)
+    if obj is None:
+        raise LocateError("GrabCut mask produced a degenerate silhouette")
+    if not MIN_PLAUSIBLE_LONG_MM <= obj.long_mm <= MAX_PLAUSIBLE_LONG_MM:
+        raise LocateError(
+            f"GrabCut measured {obj.long_mm:.0f}x{obj.short_mm:.0f}mm, outside "
+            f"the plausible {MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm "
+            "range -- the mask has most likely flooded the desk"
+        )
+    return replace(obj, label=label, confidence=float(confidence))
+
+
+def measure_with_box_fallback(
+    frame: np.ndarray,
+    px: float,
+    py: float,
+    calib: Calibration,
+    label: str,
+    *,
+    box: tuple[float, float, float, float] | None = None,
+    win: int = DEFAULT_WINDOW_PX,
+    confidence: float = 1.0,
+    marker_xy: Sequence[tuple[float, float]] = (),
+    object_height_mm: float | None = None,
+) -> LocatedObject:
+    """Prefer GrabCut from ``box``; else desk ``measure``; else raw ``measure_box``."""
+    if box is not None:
+        try:
+            return measure_grabcut(
+                frame, box[0], box[1], box[2], box[3], calib, label,
+                confidence=confidence, marker_xy=marker_xy,
+                object_height_mm=object_height_mm,
+            )
+        except LocateError:
+            pass
+    try:
+        return measure(
+            frame, px, py, calib, label,
+            win=win, confidence=confidence, marker_xy=marker_xy,
+            object_height_mm=object_height_mm,
+        )
+    except LocateError:
+        if box is None:
+            raise
+        return measure_box(
+            frame, box[0], box[1], box[2], box[3], calib, label,
+            confidence=confidence, object_height_mm=object_height_mm,
+        )
 
 
 def relocate(
@@ -587,48 +911,21 @@ def grasp_feasibility(
     """
     r = math.hypot(obj.x, obj.y)
     if not is_mp_reachable_xy(obj.x, obj.y):
-        return False, (
-            f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out"
-        )
+        return False, f"keep-out (r={r:.0f}mm)"
     if r > MAX_REACH_MM:
-        return False, f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
+        return False, f"beyond max reach (r={r:.0f}mm)"
     if r > MAX_VERIFIABLE_RADIUS_MM:
-        return False, (
-            f"r={r:.0f}mm is past the {MAX_VERIFIABLE_RADIUS_MM:.0f}mm the camera "
-            "can confirm a placement at -- anything put down there is lost to "
-            "vision until moved by hand"
-        )
+        return False, f"beyond camera (r={r:.0f}mm)"
     span_open = _span_mm(calib, int(calib.grip_open_s))
     if span_open is not None and obj.short_mm > span_open:
         return False, (
-            f"{obj.short_mm:.0f}mm across is wider than the jaws open "
-            f"({span_open:.0f}mm at S={calib.grip_open_s})"
+            f"wider than jaws ({obj.short_mm:.0f}>{span_open:.0f}mm)"
         )
-    if span_open is None:
-        # No measured jaw model, so calib.grip_s_for_span_mm falls back to
-        # grip_close_s -- the value for a cube_height_mm cube. On anything
-        # narrower the jaws stop short of the object, and with no
-        # grip-retention sensing anywhere in the stack the pick then reports
-        # success having gripped nothing. Refuse instead: a warning on stderr
-        # is invisible over MCP stdio, and this is the one failure the arm
-        # cannot detect for itself. (One-sided -- closing too far on something
-        # WIDER than a cube just squeezes, which the jaws tolerate.)
-        short_of = float(calib.cube_height_mm) - obj.short_mm
-        if short_of > UNCALIBRATED_GRIP_SLACK_MM:
-            return False, (
-                f"{obj.short_mm:.0f}mm across is {short_of:.0f}mm narrower than "
-                f"the {calib.cube_height_mm:.0f}mm cube, and the jaw-span model "
-                "is not calibrated -- the grip would close to "
-                f"S={calib.grip_close_s} (the cube value) and hold nothing while "
-                "reporting success. Measure grip_span_s_at_zero_mm and "
-                "grip_span_s_per_mm into the calibration first (see "
-                "calib.grip_s_for_span_mm)"
-            )
+    if is_compact(obj.long_mm, obj.short_mm):
+        # Near-square: jaw orientation is not load-bearing (90° period).
+        return True, None
     if j4_for_long_axis(obj.axis_yaw_deg, x=obj.x, y=obj.y) is None:
-        return False, (
-            "no wrist angle closes the jaws across this object's axis while "
-            "joint J4 stays inside its soft limits at this bearing"
-        )
+        return False, "no J4 angle in soft limits"
     return True, None
 
 

@@ -1,0 +1,13 @@
+torch
+transformers>=4.40
+fastapi
+uvicorn[standard]
+pillow
+python-multipart
+
+# Not imported by server.py, kept until verified unnecessary against the
+# deployed venv: transformers reaches for torchvision on its fast
+# image-processor path, and accelerate on from_pretrained's low_cpu_mem_usage
+# path (default-on in transformers 5.x).
+torchvision
+accelerate

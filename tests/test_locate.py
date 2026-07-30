@@ -247,6 +247,175 @@ def test_square_object_measures_as_square() -> None:
     assert abs(obj.long_mm - 40.0 * MM_PER_PX) < 3.0
 
 
+def test_compact_object_tolerates_long_edge_swap_between_windows() -> None:
+    """Near-square masks flip which edge is 'long' (~90° yaw) across scales;
+    that must not refuse -- grip orientation is not critical without a shaft."""
+    from mt4_vision import locate as mod
+
+    img = frame_with_bar(600.0, 300.0, 40.0, 40.0, 12.0)
+    real = mod._measure_one
+
+    def flipped(frame, px, py, calib, win, exclude, height):
+        got = real(frame, px, py, calib, win, exclude, height)
+        if got is None or win >= 200:
+            return got
+        obj, mask = got
+        alt = mod.replace(
+            obj,
+            axis_yaw_deg=obj.axis_yaw_deg + 90.0,
+            long_mm=obj.short_mm,
+            short_mm=obj.long_mm,
+        )
+        return alt, mask
+
+    mod._measure_one = flipped
+    try:
+        obj = measure(img, 600.0, 300.0, CALIB, "block", win=200)
+    finally:
+        mod._measure_one = real
+    assert abs(obj.long_mm - obj.short_mm) < 3.0
+
+
+def test_measure_box_from_axis_aligned_detector() -> None:
+    """DINO-style AABB: long/short follow the box sides in robot mm."""
+    from mt4_vision.locate import measure_box
+
+    img = np.full((FRAME_H, FRAME_W, 3), DESK, dtype=np.uint8)
+    # 80x20 px box at 0.5mm/px -> 40x10 mm
+    obj = measure_box(img, 100, 200, 180, 220, CALIB, "eraser", confidence=0.4)
+    assert abs(obj.long_mm - 40.0) < 1.0
+    assert abs(obj.short_mm - 10.0) < 1.0
+    assert abs(obj.x - 140.0 * MM_PER_PX) < 1.0
+    assert abs(obj.y - 210.0 * MM_PER_PX) < 1.0
+    assert obj.confidence == 0.4
+
+
+def test_measure_falls_back_to_box_when_mask_is_unstable() -> None:
+    from mt4_vision import locate as mod
+    from mt4_vision.locate import measure_with_box_fallback
+
+    real = mod._measure_one
+    calls = {"n": 0}
+
+    def shifted(frame, px, py, calib, win, exclude, height):
+        got = real(frame, px, py, calib, win, exclude, height)
+        calls["n"] += 1
+        if got is None or calls["n"] == 1:
+            return got
+        obj, mask = got
+        rad = math.radians(obj.axis_yaw_deg)
+        return (
+            mod.replace(
+                obj,
+                x=obj.x - math.sin(rad) * 20.0,
+                y=obj.y + math.cos(rad) * 20.0,
+            ),
+            mask,
+        )
+
+    mod._measure_one = shifted
+    # Force GrabCut to fail so we exercise desk then final AABB fallback.
+    real_gc = mod._segment_grabcut
+    mod._segment_grabcut = lambda *a, **k: None
+    try:
+        # Mask path would refuse; box around the pen still yields a pose.
+        half_l, half_s = PEN_LONG_PX / 2.0, PEN_SHORT_PX / 2.0
+        obj = measure_with_box_fallback(
+            pen_frame(), PEN_CX, PEN_CY, CALIB, "pen",
+            box=(
+                PEN_CX - half_l, PEN_CY - half_s,
+                PEN_CX + half_l, PEN_CY + half_s,
+            ),
+            win=PEN_WIN,
+        )
+    finally:
+        mod._measure_one = real
+        mod._segment_grabcut = real_gc
+    assert abs(obj.x - PEN_CX * MM_PER_PX) < 6.0
+    assert abs(obj.y - PEN_CY * MM_PER_PX) < 6.0
+
+
+def test_grabcut_measures_pen_from_loose_box() -> None:
+    """GrabCut turns a DINO-style AABB (of the rotated silhouette) into a mask."""
+    from mt4_vision.locate import measure_grabcut, refine_at_box
+
+    pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
+    pad = 12.0
+    box = (
+        float(pts[:, 0].min()) - pad,
+        float(pts[:, 1].min()) - pad,
+        float(pts[:, 0].max()) + pad,
+        float(pts[:, 1].max()) + pad,
+    )
+    mask, _origin = refine_at_box(pen_frame(), *box)
+    assert mask.sum() > 2000
+    # Mask should be tighter than the padded box area.
+    box_area = (box[2] - box[0]) * (box[3] - box[1])
+    assert mask.sum() < 0.7 * box_area
+
+    obj = measure_grabcut(pen_frame(), *box, CALIB, "pen", confidence=0.55)
+    assert abs(obj.x - PEN_CX * MM_PER_PX) < 8.0
+    assert abs(obj.y - PEN_CY * MM_PER_PX) < 8.0
+    assert obj.short_mm < 25.0
+    assert obj.confidence == 0.55
+
+
+def test_measure_prefers_grabcut_when_box_given() -> None:
+    """With a detector box, GrabCut runs first (desk measure is not needed)."""
+    from mt4_vision import locate as mod
+    from mt4_vision.locate import measure_with_box_fallback
+
+    real = mod.measure
+
+    def boom(*_a, **_k):
+        raise LocateError("desk path should not run when GrabCut succeeds")
+
+    pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
+    pad = 12.0
+    box = (
+        float(pts[:, 0].min()) - pad,
+        float(pts[:, 1].min()) - pad,
+        float(pts[:, 0].max()) + pad,
+        float(pts[:, 1].max()) + pad,
+    )
+    mod.measure = boom
+    try:
+        obj = measure_with_box_fallback(
+            pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", box=box,
+        )
+    finally:
+        mod.measure = real
+    assert abs(obj.x - PEN_CX * MM_PER_PX) < 8.0
+    assert abs(obj.y - PEN_CY * MM_PER_PX) < 8.0
+    box_area = (box[2] - box[0]) * (box[3] - box[1])
+    assert obj.mask_area_px < 0.7 * box_area
+
+
+def test_measure_falls_back_to_desk_when_grabcut_fails() -> None:
+    from mt4_vision import locate as mod
+    from mt4_vision.locate import measure_with_box_fallback
+
+    real_gc = mod._segment_grabcut
+    mod._segment_grabcut = lambda *a, **k: None
+    try:
+        pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
+        pad = 12.0
+        obj = measure_with_box_fallback(
+            pen_frame(), PEN_CX, PEN_CY, CALIB, "pen",
+            box=(
+                float(pts[:, 0].min()) - pad,
+                float(pts[:, 1].min()) - pad,
+                float(pts[:, 0].max()) + pad,
+                float(pts[:, 1].max()) + pad,
+            ),
+            win=PEN_WIN,
+        )
+    finally:
+        mod._segment_grabcut = real_gc
+    assert abs(obj.x - PEN_CX * MM_PER_PX) < 6.0
+    assert abs(obj.y - PEN_CY * MM_PER_PX) < 6.0
+
+
 # -- refusals ------------------------------------------------------------
 
 
@@ -354,7 +523,7 @@ def test_infeasible_past_the_cameras_verifiable_radius() -> None:
     """Placing past this radius loses the object to vision until moved by hand,
     so it is refused even though the arm can physically reach it."""
     ok, reason = grasp_feasibility(_obj(300.0, 0.0), CALIB)
-    assert not ok and "confirm a placement" in reason
+    assert not ok and "beyond camera" in reason
 
 
 def test_infeasible_wider_than_the_jaws_open() -> None:
@@ -363,7 +532,7 @@ def test_infeasible_wider_than_the_jaws_open() -> None:
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=40.0), calib)
     assert ok
     ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=80.0), calib)
-    assert not ok and "wider than the jaws open" in reason
+    assert not ok and "wider than jaws" in reason
 
 
 def test_too_open_check_is_skipped_when_uncalibrated() -> None:
@@ -372,20 +541,15 @@ def test_too_open_check_is_skipped_when_uncalibrated() -> None:
     wide object only squeezes, which the jaws tolerate."""
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=80.0), CALIB)
     assert ok
-    # ...and within a squeeze of the cube width, the cube close value contacts.
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=17.0), CALIB)
     assert ok
 
 
-def test_narrow_object_refused_when_the_jaw_model_is_uncalibrated() -> None:
-    """grip_s_for_span_mm falls back to grip_close_s -- the 20mm-cube value --
-    so a 9mm pen would be gripped at a width that never touches it, and nothing
-    in the stack senses an empty grasp. Refuse rather than warn: over MCP stdio
-    the warning goes to a log the model never reads."""
+def test_narrow_object_allowed_when_the_jaw_model_is_uncalibrated() -> None:
+    """Object picks open fully then command a full close; the servo stops on
+    resistance, so a missing jaw-span model is not a reason to refuse."""
     ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), CALIB)
-    assert not ok
-    assert "not calibrated" in reason and "grip_span_s_per_mm" in reason
-    # Calibrating the model is what lifts the refusal.
+    assert ok and reason is None
     ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), _span_calib())
     assert ok and reason is None
 

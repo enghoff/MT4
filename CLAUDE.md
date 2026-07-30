@@ -24,7 +24,6 @@ Cursor rules with full detail:
 | MCP `mt4_home` / `mt4_move_to` | Recover pose, probe reachability |
 | `Mt4Client` (Python) | Scripts: `calibrate_*.py`, `stack_cubes.py`, `jog.py` |
 | `mt4_vision.camera.capture_frame` | Camera / detection issues |
-| `terminals/*.txt` | Recent command output and firmware errors |
 
 Homed FK TCP is about **(190, 0, 226)**; J1 keep-out **140 mm**; soft ground **115 mm**. After kinematics or keep-out changes, flash and re-run vision calibration.
 

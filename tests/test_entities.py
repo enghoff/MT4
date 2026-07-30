@@ -21,7 +21,6 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mt4_vision.calib import GRIP_SQUEEZE_MM
 from mt4_vision.detect import CubeDetection
 from mt4_vision.entities import (
     KIND_CUBE,
@@ -31,6 +30,7 @@ from mt4_vision.entities import (
     build_snapshot,
     pick_block_reason,
 )
+from mt4_jog.joints import GRIPPER_S_CLOSED, GRIPPER_S_OPEN
 from mt4_vision.motion import YAW_PERIOD_LONG_AXIS, YAW_PERIOD_SQUARE
 from mt4_vision.scene import PICK_MAX_AREA, PICK_MIN_AREA, Scene, filter_phantoms
 from mt4_vision.workspace import (
@@ -342,6 +342,33 @@ def test_object_clearance_uses_its_short_axis_not_the_cube_rule() -> None:
     assert blocked.reason and "grasp point" in blocked.reason
 
 
+def test_object_is_not_blocked_by_its_own_colour_blob() -> None:
+    """A coloured non-cube is also in the cube list (the detector is colour +
+    area), and that duplicate sat 20mm from the object's own grasp point --
+    inside the finger clearance, so the eraser refused its own pick. Measured
+    live 2026-07-30: a red clic eraser read as `red cube` area 1169px."""
+    own = CubeDetection(
+        color="red", px=744.0, py=390.0, area=1169.0, x=140.6, y=-180.2, yaw_deg=12.0
+    )
+    eraser = FakeObject(122.6, -189.2, label="eraser", long_mm=55.2, short_mm=4.4)
+    eraser.mask_area_px = 1181.0  # centroid distance ~2.8px, well inside r=19px
+    sn = build_snapshot(scene([own]), token="s1", objects=[eraser])
+
+    obj = sn.get("obj_1")
+    assert obj is not None and obj.pickable, obj.reason
+    # ...and one physical thing gets one id: no duplicate cube entity.
+    assert not sn.of_kind(KIND_CUBE)
+
+    # A real cube, whose blob is elsewhere in the frame, still blocks.
+    neighbour = CubeDetection(
+        color="red", px=300.0, py=500.0, area=2500.0, x=140.6, y=-180.2, yaw_deg=12.0
+    )
+    sn2 = build_snapshot(scene([neighbour]), token="s1", objects=[eraser])
+    blocked = sn2.get("obj_1")
+    assert blocked is not None and not blocked.pickable
+    assert blocked.reason and "grasp point" in blocked.reason
+
+
 def test_object_outside_reach_abstains() -> None:
     sn = snap([], objects=[FakeObject(400.0, 0.0)])
     obj = sn.get("obj_1")
@@ -368,31 +395,30 @@ def test_as_grasp_carries_yaw_and_period() -> None:
     g = sn.get("obj_1").as_grasp()
     assert (g.x, g.y) == (213.4, -58.1)
     assert g.yaw_deg == 37.0 and g.yaw_period_deg == YAW_PERIOD_LONG_AXIS
-    assert g.grip_close_s is None  # no calib -> inherit the calibration value
+    assert g.grip_open_s == GRIPPER_S_OPEN
+    assert g.grip_close_s == GRIPPER_S_CLOSED
 
 
-def test_as_grasp_sizes_the_close_value_to_the_object() -> None:
+def test_compact_object_uses_square_yaw_period() -> None:
+    sn = snap([], objects=[FakeObject(200.0, 0.0, long_mm=22.0, short_mm=20.0)])
+    obj = sn.get("obj_1")
+    assert obj is not None
+    assert obj.yaw_period_deg == YAW_PERIOD_SQUARE
+    assert obj.as_grasp().yaw_period_deg == YAW_PERIOD_SQUARE
+
+
+def test_as_grasp_opens_fully_and_closes_fully_on_objects() -> None:
+    """Servo stops on resistance -- no measured jaw-span sizing needed."""
     sn = snap([], objects=[FakeObject(213.4, -58.1)])
-    calib = _calib(grip_span_s_at_zero_mm=285.0, grip_span_s_per_mm=2.25)
-    g = sn.get("obj_1").as_grasp(calib)
-    # 9mm pen: much more closed than the 20mm cube's 240.
-    assert g.grip_close_s is not None and g.grip_close_s > calib.grip_close_s
-    assert abs(g.grip_close_s - (285.0 - 2.25 * (9.0 - GRIP_SQUEEZE_MM))) <= 1
+    g = sn.get("obj_1").as_grasp(_calib(grip_span_s_at_zero_mm=285.0, grip_span_s_per_mm=2.25))
+    assert g.grip_open_s == GRIPPER_S_OPEN
+    assert g.grip_close_s == GRIPPER_S_CLOSED
 
 
-def test_as_grasp_closes_past_the_measured_width() -> None:
-    """Vision reports a silhouette, which reads wide for anything with height --
-    the one error direction that grips nothing and still reports success."""
-    sn = snap([], objects=[FakeObject(213.4, -58.1)])
-    calib = _calib(grip_span_s_at_zero_mm=285.0, grip_span_s_per_mm=2.25)
-    just_touching = 285.0 - 2.25 * 9.0
-    assert sn.get("obj_1").as_grasp(calib).grip_close_s > just_touching
-
-
-def test_as_grasp_falls_back_when_the_span_is_uncalibrated() -> None:
-    sn = snap([], objects=[FakeObject(213.4, -58.1)])
-    g = sn.get("obj_1").as_grasp(_calib())
-    assert g.grip_close_s == 240  # the cube value, with a warning emitted
+def test_as_grasp_cubes_still_inherit_calib_close() -> None:
+    sn = snap([cube("red", 200.0, 0.0, 50)])
+    g = sn.get("cube_1").as_grasp(_calib())
+    assert g.grip_open_s is None and g.grip_close_s is None
 
 
 def main() -> int:

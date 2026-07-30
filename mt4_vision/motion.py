@@ -388,8 +388,8 @@ def send_legs(
         }
         # Only mention grip/dwell when a leg actually uses them, so a plain
         # transit's call is byte-identical to what routed_travel sent before
-        # this layer existed -- including for duck-typed clients (test fakes,
-        # mt4_pi) that predate the station fields. When they ARE used they go
+        # this layer existed -- including for duck-typed clients (test fakes)
+        # that predate the station fields. When they ARE used they go
         # as lists: a scalar grip means "first leg only" to move_path, which is
         # not what a plan means.
         if any(grips):

@@ -132,28 +132,24 @@ class Entity:
     def as_grasp(self, calib: Calibration | None = None) -> Grasp:
         """The motion-layer pose for taking (or releasing at) this entity.
 
-        With a ``calib`` and a measured short axis, the gripper close value is
-        sized to the object instead of inheriting the 20mm-cube default -- see
-        ``calib.grip_s_for_span_mm``. Without that, closing on a ~10mm pen at
-        the cube's value never contacts it, and with no grip-retention sensing
-        the pick reports success having done nothing.
+        Located objects open fully then command a full close -- the servo
+        stops when the jaws meet resistance, so there is no need to size S
+        from a measured width (or refuse when the jaw-span model is missing).
+        Cubes keep ``None`` and inherit the calibrated cube ``grip_close_s``.
         """
+        open_s: int | None = None
         close_s: int | None = None
-        if calib is not None and self.extent_mm is not None:
-            from mt4_vision.calib import GRIP_SQUEEZE_MM, grip_s_for_span_mm
+        if self.kind == KIND_OBJECT:
+            from mt4_jog.joints import GRIPPER_S_CLOSED, GRIPPER_S_OPEN
 
-            # Close past the measured width, not to it. The measurement is a
-            # silhouette from a steeply oblique camera, so it reads wide for
-            # anything with height -- an error in the one direction that grips
-            # nothing at all. Erring closed instead just grips harder.
-            close_s = grip_s_for_span_mm(
-                calib, max(2.0, self.extent_mm[1] - GRIP_SQUEEZE_MM)
-            )
+            open_s = GRIPPER_S_OPEN
+            close_s = GRIPPER_S_CLOSED
         return Grasp(
             self.x,
             self.y,
             yaw_deg=self.yaw_deg,
             yaw_period_deg=self.yaw_period_deg,
+            grip_open_s=open_s,
             grip_close_s=close_s,
         )
 
@@ -328,6 +324,17 @@ def build_snapshot(
     objects = [o for _eid, o in object_items]
     pickable_ids = {id(c) for c in scene.pickable(scene.cubes)}
     raw = scene.raw_cubes if scene.raw_cubes is not None else scene.cubes
+    if objects:
+        # One physical thing must not get two ids. A located object that
+        # happens to be cube-coloured is also in the cube list (see
+        # is_own_colour_blob), and that duplicate would be advertised as a
+        # pickable cube_N -- picking it would grab the object with the wrong
+        # (90°-periodic) wrist rule.
+        raw = [
+            c
+            for c in raw
+            if not any(is_own_colour_blob(obj, c) for obj in objects)
+        ]
     occupant_of: dict[int, CubeDetection] = {
         m.marker_id: c for m, c in scene.occupied
     }
@@ -430,6 +437,27 @@ def build_snapshot(
     )
 
 
+def is_own_colour_blob(obj: "LocatedObject", cube: CubeDetection) -> bool:
+    """True when ``cube`` is this object's own colour blob, detected again.
+
+    The cube detector is colour+area based, so a coloured non-cube of plausible
+    size reads as a cube: measured live 2026-07-30, a red clic eraser at
+    (141, -180) came back as `red cube` area 1169px, 20mm from the eraser's own
+    grasp point -- inside the finger clearance the object needs, so the eraser
+    blocked its own pick. Two detections of one blob share one centroid, so
+    identity is settled in pixels (the trick ``scene.is_held_cube_blob`` uses
+    for the gripped cube): the cube's centroid falls inside the object's own
+    mask footprint. A genuine neighbour sits outside it and still blocks.
+    """
+    mask_area_px = float(getattr(obj, "mask_area_px", 0.0) or 0.0)
+    if mask_area_px <= 0.0:
+        # Hand-built or duck-typed object (tests, or a measure() that kept no
+        # mask): no footprint to compare against, so every cube is a neighbour.
+        return False
+    radius_px = math.sqrt(mask_area_px / math.pi)
+    return math.hypot(cube.px - obj.px, cube.py - obj.py) <= radius_px
+
+
 def object_entity(
     obj: "LocatedObject", ref: int | str, *, scene: Scene | None = None
 ) -> Entity:
@@ -441,13 +469,11 @@ def object_entity(
     ``build_snapshot``.
 
     Elongated objects are 180°-periodic (the jaws close *across* the long
-    axis), which is the whole reason ``yaw_period_deg`` exists.
-
-    Clearance is checked against the object's own SHORT axis, not the cube
-    rule: a 138mm pen has neighbours inside ``PICK_CLEARANCE_MM`` constantly,
-    and applying a 20mm cube's finger allowance to it would refuse nearly every
-    real grasp. What matters is room beside the grasp point across the jaws.
+    axis). Compact / near-square extents use the 90° square period instead --
+    grip orientation is not critical when there is no obvious shaft.
     """
+    from mt4_vision.locate import is_compact
+
     reason: str | None = None
     r = math.hypot(obj.x, obj.y)
     if not is_mp_reachable_xy(obj.x, obj.y):
@@ -461,6 +487,8 @@ def object_entity(
         for other in scene.cubes:
             if other.x is None or other.y is None:
                 continue
+            if is_own_colour_blob(obj, other):
+                continue
             d = dist_mm(obj.x, obj.y, float(other.x), float(other.y))
             if d < need:
                 reason = (
@@ -468,6 +496,11 @@ def object_entity(
                     f"{need:.0f}mm the jaws need across a {obj.short_mm:.0f}mm object"
                 )
                 break
+    period = (
+        YAW_PERIOD_SQUARE
+        if is_compact(obj.long_mm, obj.short_mm)
+        else YAW_PERIOD_LONG_AXIS
+    )
     return Entity(
         id=ref if isinstance(ref, str) else f"obj_{ref}",
         kind=KIND_OBJECT,
@@ -476,7 +509,7 @@ def object_entity(
         y=float(obj.y),
         pixel=(float(obj.px), float(obj.py)),
         yaw_deg=float(obj.axis_yaw_deg),
-        yaw_period_deg=YAW_PERIOD_LONG_AXIS,
+        yaw_period_deg=period,
         pickable=reason is None,
         placeable=False,
         reason=reason,

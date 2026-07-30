@@ -171,6 +171,97 @@ def cmd_locate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_grounding(args: argparse.Namespace) -> int:
+    """Open-vocab detect via the Grounding DINO service (MT4_GROUNDING_URL)."""
+    from mt4_vision.grounding import GroundingError, detect, health
+
+    try:
+        info = health()
+        print(f"service: {info}")
+    except GroundingError as exc:
+        print(exc)
+        return 1
+
+    frame = capture_frame(args.camera)
+    try:
+        dets = detect(
+            frame, args.prompt,
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
+        )
+    except GroundingError as exc:
+        print(exc)
+        return 1
+
+    if not dets:
+        print(f"no detections for prompt={args.prompt!r}")
+        _save_annotated(frame, "grounding_frame.jpg")
+        return 1
+
+    # Draw on a COPY. cv2 draws in place, and the hint dot lands exactly on the
+    # pixel measure() segments around -- a saturated disc on top of the object
+    # fuses into its own mask and biases the centroid and width, which the
+    # two-window stability check cannot catch (the disc is in both windows).
+    overlay = frame.copy()
+    for i, d in enumerate(dets):
+        print(f"[{i}] {d.label} score={d.score:.3f} box=({d.x1:.0f},{d.y1:.0f})-({d.x2:.0f},{d.y2:.0f}) cx={d.cx:.0f} cy={d.cy:.0f}")
+        cv2.rectangle(
+            overlay, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), (0, 255, 0), 2,
+        )
+        cv2.circle(overlay, (int(d.cx), int(d.cy)), 6, (0, 0, 255), -1)
+        cv2.putText(
+            overlay, f"{d.label} {d.score:.2f}", (int(d.x1), max(20, int(d.y1) - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+        )
+    _save_annotated(overlay, "grounding_frame.jpg")
+
+    if not args.locate and not args.pick:
+        return 0
+
+    from mt4_vision.entities import object_entity
+    from mt4_vision.locate import LocateError, grasp_feasibility, measure_with_box_fallback
+    from mt4_vision.preview import annotate_for_pointing
+    from mt4_vision.scene import capture_scene
+
+    best = dets[0]
+    label = args.label or best.label
+    calib = load_calibration(Path(args.calib))
+    scene = capture_scene(calib, frame)
+    try:
+        obj = measure_with_box_fallback(
+            frame, best.cx, best.cy, calib, label,
+            box=(best.x1, best.y1, best.x2, best.y2),
+            win=args.window, marker_xy=[(m.x, m.y) for m in scene.markers],
+            confidence=best.score,
+        )
+    except LocateError as exc:
+        print(f"locate failed: {exc}")
+        return 1
+    print(f"{obj.label}: {obj.as_dict()}")
+    ok, reason = grasp_feasibility(obj, calib)
+    print(f"graspable: {ok}" + ("" if ok else f" -- {reason}"))
+    entity = object_entity(obj, 1, scene=scene)
+    _save_annotated(annotate_for_pointing(frame, [entity]), "grounding_locate.jpg")
+    if not args.pick:
+        return 0
+    if not ok:
+        print("refusing to pick: not graspable")
+        return 1
+
+    from mt4_jog.client import Mt4ClientError
+    from mt4_vision.motion import pick_at
+
+    client = _pick_place_client(args)
+    try:
+        print(pick_at(client, calib, entity.as_grasp(calib)))
+    except Mt4ClientError as exc:
+        print(f"pick failed: {exc}")
+        return 1
+    finally:
+        client.close()
+    return 0
+
+
 def cmd_transfer(args: argparse.Namespace) -> int:
     """Exercise the queued transfer primitive directly (moves the arm)."""
     from mt4_jog.client import Mt4ClientError
@@ -390,6 +481,20 @@ def main() -> None:
     p.add_argument("--pick", action="store_true", help="then pick it (moves the arm)")
     p.add_argument("--port", default="")
     p.set_defaults(func=cmd_locate)
+
+    p = sub.add_parser(
+        "grounding",
+        help="open-vocab detect via the Grounding DINO service (MT4_GROUNDING_URL)",
+    )
+    p.add_argument("--prompt", required=True, help='e.g. "pen" or "pen. red cube."')
+    p.add_argument("--label", default="", help="override label when --locate/--pick")
+    p.add_argument("--box-threshold", type=float, default=0.35)
+    p.add_argument("--text-threshold", type=float, default=0.25)
+    p.add_argument("--locate", action="store_true", help="measure top hit via locate.measure")
+    p.add_argument("--window", type=int, default=280)
+    p.add_argument("--pick", action="store_true", help="then pick top hit (moves the arm)")
+    p.add_argument("--port", default="")
+    p.set_defaults(func=cmd_grounding)
 
     p = sub.add_parser(
         "transfer",
