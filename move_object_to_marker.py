@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""Open-vocab sweep: move every handleable desk object onto a free marker.
+"""Interactive open-vocab mover: prompt for an object, place it on a free marker.
 
-For each clear camera frame::
+Repeatedly asks for an object description, then::
 
-    Grounding DINO(--object prompt)  -> candidate boxes
-    locate.measure each              -> robot XY + long-axis yaw (skip failures)
-    filter                           -> reachable / pickable / not already on a marker
-    assign 1:1 to placeable free markers
-    motion.transfer                  -> pick with 180° long-axis wrist, place on marker
+    Grounding DINO(prompt)  -> candidate boxes
+    locate.measure each     -> robot XY + long-axis yaw (skip failures)
+    filter                  -> reachable / pickable / not already on a marker
+    motion.transfer         -> pick with 180° long-axis wrist, place on free marker
 
-Objects that cannot be segmented (e.g. sitting on marker paper), are out of
-reach, fail grasp feasibility, or have no free marker left are **skipped** --
-never substituted onto a different target than planned for that cycle.
-
-Re-parks and re-scans after every successful transfer so occupancy stays true.
-Stops when a scan finds no more handleable objects or no free markers.
+Re-parks after every transfer so the next prompt can capture immediately.
+Objects that cannot be segmented, are out of reach, fail grasp feasibility, or
+have no free marker are skipped -- never substituted onto a different target.
+Loops until Ctrl+C / EOF.
 
 Prereqs:
   * ``.\\scripts\\start_grounding_tunnel.ps1``
@@ -22,8 +19,8 @@ Prereqs:
 
 Example::
 
-    python move_object_to_marker.py --object "pen. eraser. drill bits." --camera 1
-    python move_object_to_marker.py --object "red eraser" --dry-run --no-park
+    python move_object_to_marker.py --camera 1
+    python move_object_to_marker.py --dry-run --no-park
 """
 
 from __future__ import annotations
@@ -44,6 +41,7 @@ from mt4_vision.grounding import Detection, GroundingError, detect, health
 from mt4_vision.locate import LocateError, LocatedObject, grasp_feasibility, measure
 from mt4_vision.motion import Grasp, YAW_PERIOD_LONG_AXIS, transfer
 from mt4_vision.pickplace import ensure_homed, retreat_for_camera
+from mt4_vision.preview import LivePreview, PreviewStopped
 from mt4_vision.scene import Scene, capture_scene
 from mt4_vision.workspace import (
     MARKER_OCCUPY_RADIUS_MM,
@@ -93,54 +91,40 @@ def _gather_candidates(
         text_threshold=text_threshold,
     )
     if not dets:
-        skips.append(f"dino: no detections for {prompt!r}")
+        skips.append(f"didn't find {prompt}")
         return [], skips
 
     marker_xy = [(m.x, m.y) for m in scene.markers]
     measured: list[Candidate] = []
-    for i, det in enumerate(dets):
+    for det in dets:
         label = det.label.strip() or prompt.strip().rstrip(".")
-        tag = (
-            f"[{i}] {label!r} score={det.score:.3f} "
-            f"hint=({det.cx:.0f},{det.cy:.0f})"
-        )
         try:
             obj = measure(
                 frame, det.cx, det.cy, calib, label, marker_xy=marker_xy,
             )
-        except LocateError as exc:
-            skips.append(f"{tag}: skip measure -- {exc}")
+        except LocateError:
+            skips.append(f"couldn't measure {label}")
             continue
 
         if _denied(obj, deny):
-            skips.append(
-                f"{tag}: skip denied after earlier transfer fail "
-                f"near ({obj.x:.0f},{obj.y:.0f})"
-            )
+            skips.append(f"skipping {label} (earlier fail)")
             continue
 
         home = _on_marker(obj, scene.markers)
         if home is not None:
-            skips.append(
-                f"{tag}: skip already on marker {home.marker_id} "
-                f"at ({obj.x:.0f},{obj.y:.0f})"
-            )
+            skips.append(f"{label} already on marker {home.marker_id}")
             continue
 
         ok, reason = grasp_feasibility(obj, calib)
         entity = object_entity(obj, len(measured) + 1, scene=scene)
         if not ok:
-            skips.append(f"{tag}: skip grasp -- {reason}")
+            skips.append(f"can't pick {label}: {reason}")
             continue
         if not entity.pickable:
-            skips.append(f"{tag}: skip pickable -- {entity.reason}")
+            skips.append(f"can't pick {label}: {entity.reason}")
             continue
 
         if any(dist_mm(obj.x, obj.y, c.obj.x, c.obj.y) < DEDUP_MM for c in measured):
-            skips.append(
-                f"{tag}: skip duplicate of earlier hit "
-                f"near ({obj.x:.0f},{obj.y:.0f})"
-            )
             continue
 
         measured.append(Candidate(det=det, obj=obj))
@@ -152,8 +136,7 @@ def _annotate_plan(
     frame,
     pairs: list[tuple[Candidate, MarkerSlot]],
     skips: list[str],
-    path: Path,
-) -> None:
+):
     out = frame.copy()
     for cand, marker in pairs:
         d, obj = cand.det, cand.obj
@@ -179,8 +162,7 @@ def _annotate_plan(
         (255, 255, 255),
         2,
     )
-    cv2.imwrite(str(path), out)
-    print(f"annotated frame saved to {path}")
+    return out
 
 
 def _park(client: Mt4Client, calib: Calibration) -> None:
@@ -188,19 +170,21 @@ def _park(client: Mt4Client, calib: Calibration) -> None:
     time.sleep(CAMERA_SETTLE_S)
 
 
+def _prompt_object() -> str | None:
+    """Ask for the next object description. None means exit (EOF)."""
+    try:
+        raw = input("\nobject: ")
+    except EOFError:
+        print()
+        return None
+    return raw.strip()
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description=(
-            "Detect open-vocab objects with Grounding DINO and move each "
-            "handleable one onto a free marker; skip the rest"
-        ),
-    )
-    p.add_argument(
-        "--object",
-        required=True,
-        help=(
-            'DINO vocabulary, period-separated phrases '
-            'e.g. "pen. eraser. drill bits."'
+            "Prompt for an open-vocab object, detect it with Grounding DINO, "
+            "and move it onto a free marker; repeat until terminated"
         ),
     )
     p.add_argument(
@@ -224,15 +208,9 @@ def main(argv: list[str] | None = None) -> int:
         help="re-apply long-axis wrist at the marker (default: preserve pick yaw)",
     )
     p.add_argument(
-        "--max-moves",
-        type=int,
-        default=20,
-        help="safety cap on transfers this run",
-    )
-    p.add_argument(
         "--dry-run",
         action="store_true",
-        help="one scan + plan only; do not move the arm",
+        help="detect + plan only; do not move the arm",
     )
     p.add_argument(
         "--no-park",
@@ -240,18 +218,16 @@ def main(argv: list[str] | None = None) -> int:
         help="skip retreat to camera park before captures",
     )
     p.add_argument(
-        "--save",
-        type=Path,
-        default=Path("move_object_frame.jpg"),
-        help="annotated plan frame (empty string to skip)",
+        "--no-preview",
+        action="store_true",
+        help="skip the annotated OpenCV preview window",
     )
     args = p.parse_args(argv)
 
     try:
-        info = health()
-        print(f"grounding: {info}")
+        health()
     except GroundingError as exc:
-        print(exc, file=sys.stderr)
+        print(f"grounding unavailable: {exc}", file=sys.stderr)
         return 1
 
     calib = load_calibration(args.calib)
@@ -266,7 +242,6 @@ def main(argv: list[str] | None = None) -> int:
                 _park(client, calib)
         except Mt4ClientError as exc:
             if args.dry_run:
-                print(f"arm unavailable ({exc}); capturing anyway")
                 client = None
             else:
                 print(f"arm error: {exc}", file=sys.stderr)
@@ -274,14 +249,15 @@ def main(argv: list[str] | None = None) -> int:
 
     moved = 0
     deny: list[tuple[float, float]] = []
+    preview = None if args.no_preview else LivePreview("move object")
+    print("ready")
     try:
-        while moved < args.max_moves:
-            if client is not None and not args.no_park:
-                try:
-                    _park(client, calib)
-                except Mt4ClientError as exc:
-                    print(f"park failed: {exc}", file=sys.stderr)
-                    return 1
+        while True:
+            prompt = _prompt_object()
+            if prompt is None:
+                break
+            if not prompt:
+                continue
 
             frame = capture_frame(args.camera)
             scene = capture_scene(calib, frame)
@@ -289,52 +265,38 @@ def main(argv: list[str] | None = None) -> int:
             if allow_markers is not None:
                 free = [m for m in free if m.marker_id in allow_markers]
             free = sorted(free, key=lambda m: m.marker_id)
-            print(
-                f"scan: free placeable markers="
-                f"{[m.marker_id for m in free]} "
-                f"occupied={[m.marker_id for m, _ in scene.occupied]}"
-            )
             if not free:
-                print("no free markers left -- done")
-                break
+                print("no free markers")
+                continue
 
             try:
                 candidates, skips = _gather_candidates(
-                    frame, calib, scene, args.object,
+                    frame, calib, scene, prompt,
                     box_threshold=args.box_threshold,
                     text_threshold=args.text_threshold,
                     deny=deny,
                 )
             except GroundingError as exc:
-                print(exc, file=sys.stderr)
-                return 1
-
-            for note in skips:
-                print(f"  {note}")
+                print(f"couldn't detect: {exc}")
+                continue
 
             if not candidates:
-                print("no handleable objects this scan -- done")
-                break
+                print(skips[0] if skips else f"didn't find {prompt}")
+                continue
 
-            for c, m in zip(candidates, free):
-                print(
-                    f"  plan: {c.obj.label!r} ({c.obj.x:.0f},{c.obj.y:.0f}) "
-                    f"yaw={c.obj.axis_yaw_deg:.1f} "
-                    f"-> marker {m.marker_id} ({m.x:.0f},{m.y:.0f})"
-                )
-
-            if args.save and str(args.save):
-                _annotate_plan(
-                    frame, list(zip(candidates, free)), skips, args.save,
-                )
-
-            if args.dry_run:
-                print("dry-run: skipping transfers")
-                break
-
-            # One transfer per scan so the next free-marker set is truthful.
             cand = candidates[0]
             marker = free[0]
+            annotated = _annotate_plan(frame, [(cand, marker)], skips)
+            if preview is not None:
+                try:
+                    preview.show(annotated)
+                except PreviewStopped:
+                    break
+
+            if args.dry_run:
+                print(f"would move {cand.obj.label} -> marker {marker.marker_id}")
+                continue
+
             assert client is not None
             entity = object_entity(cand.obj, 1, scene=scene)
             src = entity.as_grasp(calib)
@@ -349,23 +311,27 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 dst = Grasp(marker.x, marker.y)
 
-            print(
-                f"transfer {cand.obj.label!r} -> marker {marker.marker_id} ..."
-            )
             try:
-                result = transfer(client, calib, src, dst)
-                print(result)
+                transfer(client, calib, src, dst)
+                print(f"moved {cand.obj.label} -> marker {marker.marker_id}")
                 moved += 1
             except Mt4ClientError as exc:
-                print(
-                    f"transfer failed ({exc}); denying this pose and continuing",
-                    file=sys.stderr,
-                )
+                print(f"couldn't move: {exc}")
                 deny.append((cand.obj.x, cand.obj.y))
+            if not args.no_park:
+                try:
+                    _park(client, calib)
+                except Mt4ClientError as exc:
+                    print(f"couldn't park: {exc}")
+                    return 1
 
-        print(f"finished: {moved} object(s) moved")
+        return 0
+    except KeyboardInterrupt:
+        print()
         return 0
     finally:
+        if preview is not None:
+            preview.close()
         if client is not None:
             try:
                 if not args.no_park:

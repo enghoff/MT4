@@ -354,7 +354,7 @@ def test_infeasible_past_the_cameras_verifiable_radius() -> None:
     """Placing past this radius loses the object to vision until moved by hand,
     so it is refused even though the arm can physically reach it."""
     ok, reason = grasp_feasibility(_obj(300.0, 0.0), CALIB)
-    assert not ok and "confirm a placement" in reason
+    assert not ok and "beyond camera" in reason
 
 
 def test_infeasible_wider_than_the_jaws_open() -> None:
@@ -363,7 +363,7 @@ def test_infeasible_wider_than_the_jaws_open() -> None:
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=40.0), calib)
     assert ok
     ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=80.0), calib)
-    assert not ok and "wider than the jaws open" in reason
+    assert not ok and "wider than jaws" in reason
 
 
 def test_too_open_check_is_skipped_when_uncalibrated() -> None:
@@ -372,20 +372,15 @@ def test_too_open_check_is_skipped_when_uncalibrated() -> None:
     wide object only squeezes, which the jaws tolerate."""
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=80.0), CALIB)
     assert ok
-    # ...and within a squeeze of the cube width, the cube close value contacts.
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=17.0), CALIB)
     assert ok
 
 
-def test_narrow_object_refused_when_the_jaw_model_is_uncalibrated() -> None:
-    """grip_s_for_span_mm falls back to grip_close_s -- the 20mm-cube value --
-    so a 9mm pen would be gripped at a width that never touches it, and nothing
-    in the stack senses an empty grasp. Refuse rather than warn: over MCP stdio
-    the warning goes to a log the model never reads."""
+def test_narrow_object_allowed_when_the_jaw_model_is_uncalibrated() -> None:
+    """Object picks open fully then command a full close; the servo stops on
+    resistance, so a missing jaw-span model is not a reason to refuse."""
     ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), CALIB)
-    assert not ok
-    assert "not calibrated" in reason and "grip_span_s_per_mm" in reason
-    # Calibrating the model is what lifts the refusal.
+    assert ok and reason is None
     ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), _span_calib())
     assert ok and reason is None
 

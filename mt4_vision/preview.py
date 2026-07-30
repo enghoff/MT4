@@ -8,6 +8,7 @@ the planner works without touching the pick/place logic itself.
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 
@@ -222,28 +223,108 @@ class PreviewStopped(Exception):
     """Raised when the user closes a ``LivePreview`` window (q or Esc)."""
 
 
-class LivePreview:
-    """Pop-up cv2 window showing whatever frame it's handed.
+_gui_available: bool | None = None
+_warned_no_gui = False
 
-    Mirrors track_cube.py's preview window: non-blocking (``cv2.waitKey(1)``),
-    closed with q/Esc.
+
+def _opencv_gui_available() -> bool:
+    """True when ``cv2.imshow`` works (false for opencv-python-headless)."""
+    global _gui_available
+    if _gui_available is not None:
+        return _gui_available
+    try:
+        blank = np.zeros((8, 8, 3), dtype=np.uint8)
+        cv2.imshow("__mt4_gui_probe__", blank)
+        cv2.waitKey(1)
+        cv2.destroyWindow("__mt4_gui_probe__")
+        _gui_available = True
+    except cv2.error:
+        _gui_available = False
+    return _gui_available
+
+
+class LivePreview:
+    """Pop-up window showing whatever frame it's handed.
+
+    OpenCV highgui only stays responsive while something calls ``waitKey``.
+    Callers often block for seconds on arm motion or ``input()``, which makes
+    Windows mark the window "(Not Responding)". So all ``imshow`` / ``waitKey``
+    work runs on a dedicated daemon thread; ``show`` just publishes the latest
+    frame. q/Esc on that thread raises ``PreviewStopped`` on the next ``show``.
+
+    When OpenCV was installed headless -- common if ``opencv-python-headless``
+    shadows ``opencv-python`` -- falls back to ``PIL.Image.show``.
     """
 
     def __init__(self, window_name: str = "mt4 preview (q or Esc to stop)") -> None:
         self._window = window_name
+        self._frame: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._user_quit = threading.Event()
+        self._thread: threading.Thread | None = None
 
     def show(self, frame: np.ndarray) -> None:
-        """Render one frame; raise ``PreviewStopped`` if the user hit q/Esc."""
-        cv2.imshow(self._window, frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord("q")):
+        """Publish one frame; raise ``PreviewStopped`` if the user hit q/Esc."""
+        global _warned_no_gui
+        if self._user_quit.is_set():
             raise PreviewStopped()
 
-    def close(self) -> None:
+        if not _opencv_gui_available():
+            if not _warned_no_gui:
+                _warned_no_gui = True
+                print(
+                    "WARNING: OpenCV has no GUI (is opencv-python-headless installed?). "
+                    "Preview opens via the system image viewer instead.",
+                    file=sys.stderr,
+                )
+            from PIL import Image
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            Image.fromarray(rgb).show(title=self._window)
+            return
+
+        with self._lock:
+            self._frame = frame.copy()
+        if self._thread is None or not self._thread.is_alive():
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._pump, name="mt4-preview", daemon=True,
+            )
+            self._thread.start()
+            # Let the first paint land before the caller blocks on motion.
+            time.sleep(0.05)
+        if self._user_quit.is_set():
+            raise PreviewStopped()
+
+    def _pump(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                frame = None if self._frame is None else self._frame.copy()
+            if frame is None:
+                time.sleep(0.03)
+                continue
+            cv2.imshow(self._window, frame)
+            key = cv2.waitKey(30) & 0xFF
+            if key in (27, ord("q")):
+                self._user_quit.set()
+                break
         try:
             cv2.destroyWindow(self._window)
         except cv2.error:
             pass
+
+    def close(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+            self._thread = None
+        if _opencv_gui_available():
+            try:
+                cv2.destroyWindow(self._window)
+            except cv2.error:
+                pass
 
 
 # Gate for matching the cube a caller is currently acting on (``set_target``)

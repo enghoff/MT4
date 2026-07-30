@@ -132,28 +132,24 @@ class Entity:
     def as_grasp(self, calib: Calibration | None = None) -> Grasp:
         """The motion-layer pose for taking (or releasing at) this entity.
 
-        With a ``calib`` and a measured short axis, the gripper close value is
-        sized to the object instead of inheriting the 20mm-cube default -- see
-        ``calib.grip_s_for_span_mm``. Without that, closing on a ~10mm pen at
-        the cube's value never contacts it, and with no grip-retention sensing
-        the pick reports success having done nothing.
+        Located objects open fully then command a full close -- the servo
+        stops when the jaws meet resistance, so there is no need to size S
+        from a measured width (or refuse when the jaw-span model is missing).
+        Cubes keep ``None`` and inherit the calibrated cube ``grip_close_s``.
         """
+        open_s: int | None = None
         close_s: int | None = None
-        if calib is not None and self.extent_mm is not None:
-            from mt4_vision.calib import GRIP_SQUEEZE_MM, grip_s_for_span_mm
+        if self.kind == KIND_OBJECT:
+            from mt4_jog.joints import GRIPPER_S_CLOSED, GRIPPER_S_OPEN
 
-            # Close past the measured width, not to it. The measurement is a
-            # silhouette from a steeply oblique camera, so it reads wide for
-            # anything with height -- an error in the one direction that grips
-            # nothing at all. Erring closed instead just grips harder.
-            close_s = grip_s_for_span_mm(
-                calib, max(2.0, self.extent_mm[1] - GRIP_SQUEEZE_MM)
-            )
+            open_s = GRIPPER_S_OPEN
+            close_s = GRIPPER_S_CLOSED
         return Grasp(
             self.x,
             self.y,
             yaw_deg=self.yaw_deg,
             yaw_period_deg=self.yaw_period_deg,
+            grip_open_s=open_s,
             grip_close_s=close_s,
         )
 
