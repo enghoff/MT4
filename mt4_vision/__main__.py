@@ -103,6 +103,97 @@ def cmd_scene(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_entities(args: argparse.Namespace) -> int:
+    """Print the entity table the MCP layer and any model would see."""
+    from mt4_vision.entities import build_snapshot
+    from mt4_vision.scene import capture_scene
+
+    calib = load_calibration(Path(args.calib))
+    frame = capture_frame(args.camera)
+    scene = capture_scene(calib, frame)
+    snapshot = build_snapshot(scene, token="cli")
+    print(snapshot.summary)
+    for line in snapshot.table():
+        print(line)
+    from mt4_vision.preview import annotate_for_pointing
+
+    _save_annotated(annotate_for_pointing(frame, snapshot.entities), "entities_frame.jpg")
+    return 0
+
+
+def cmd_locate(args: argparse.Namespace) -> int:
+    """Measure the object at a pixel hint -- the grounding path, without MCP.
+
+    Lets the segmentation window and match threshold be tuned against the real
+    object on the real desk with no model in the loop.
+    """
+    from mt4_vision.entities import object_entity
+    from mt4_vision.locate import LocateError, grasp_feasibility, measure
+    from mt4_vision.preview import annotate_for_pointing
+    from mt4_vision.scene import capture_scene
+
+    calib = load_calibration(Path(args.calib))
+    frame = capture_frame(args.camera)
+    scene = capture_scene(calib, frame)
+    try:
+        obj = measure(
+            frame, args.pixel[0], args.pixel[1], calib, args.label,
+            win=args.window, marker_xy=[(m.x, m.y) for m in scene.markers],
+        )
+    except LocateError as exc:
+        print(f"locate failed: {exc}")
+        return 1
+    print(f"{obj.label}: {obj.as_dict()}")
+    ok, reason = grasp_feasibility(obj, calib)
+    print(f"graspable: {ok}" + ("" if ok else f" -- {reason}"))
+
+    entity = object_entity(obj, 1, scene=scene)
+    _save_annotated(
+        annotate_for_pointing(frame, [entity]), "locate_frame.jpg"
+    )
+    if not args.pick:
+        return 0
+    if not ok:
+        print("refusing to pick: not graspable")
+        return 1
+
+    from mt4_jog.client import Mt4ClientError
+    from mt4_vision.motion import pick_at
+
+    client = _pick_place_client(args)
+    try:
+        print(pick_at(client, calib, entity.as_grasp(calib)))
+    except Mt4ClientError as exc:
+        print(f"pick failed: {exc}")
+        return 1
+    finally:
+        client.close()
+    return 0
+
+
+def cmd_transfer(args: argparse.Namespace) -> int:
+    """Exercise the queued transfer primitive directly (moves the arm)."""
+    from mt4_jog.client import Mt4ClientError
+    from mt4_vision.motion import Grasp, transfer
+
+    calib = load_calibration(Path(args.calib))
+    client = _pick_place_client(args)
+    try:
+        result = transfer(
+            client,
+            calib,
+            Grasp(args.src[0], args.src[1], yaw_deg=args.src_yaw, center=args.center),
+            Grasp(args.dst[0], args.dst[1], yaw_deg=args.dst_yaw),
+        )
+        print(result)
+    except Mt4ClientError as exc:
+        print(f"transfer failed: {exc}")
+        return 1
+    finally:
+        client.close()
+    return 0
+
+
 def _pick_place_client(args: argparse.Namespace):
     from mt4_jog.client import Mt4Client
 
@@ -282,6 +373,35 @@ def main() -> None:
     )
     p.add_argument("--port", default="")
     p.set_defaults(func=cmd_goto_marker)
+
+    p = sub.add_parser(
+        "entities",
+        help="print the addressable entity table (ids, pickable, why not)",
+    )
+    p.set_defaults(func=cmd_entities)
+
+    p = sub.add_parser(
+        "locate",
+        help="measure a non-cube object at a pixel hint (the grounding path)",
+    )
+    p.add_argument("--pixel", type=float, nargs=2, required=True, metavar=("PX", "PY"))
+    p.add_argument("--label", default="object")
+    p.add_argument("--window", type=int, default=280, help="segmentation crop side (px)")
+    p.add_argument("--pick", action="store_true", help="then pick it (moves the arm)")
+    p.add_argument("--port", default="")
+    p.set_defaults(func=cmd_locate)
+
+    p = sub.add_parser(
+        "transfer",
+        help="queued pick+place between two robot-frame XYs (moves the arm)",
+    )
+    p.add_argument("--from", dest="src", type=float, nargs=2, required=True, metavar=("X", "Y"))
+    p.add_argument("--to", dest="dst", type=float, nargs=2, required=True, metavar=("X", "Y"))
+    p.add_argument("--from-yaw", dest="src_yaw", type=float, default=None)
+    p.add_argument("--to-yaw", dest="dst_yaw", type=float, default=None)
+    p.add_argument("--center", action="store_true", help="+/-90 deg re-grip after gripping")
+    p.add_argument("--port", default="")
+    p.set_defaults(func=cmd_transfer)
 
     p = sub.add_parser(
         "shuffle",

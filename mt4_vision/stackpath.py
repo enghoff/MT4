@@ -112,15 +112,51 @@ def max_z_at(x: float, y: float, *, hi: float = 340.0) -> float | None:
 
 
 class StackPlanner:
-    """Height and route planning around a growing stack at (sx, sy)."""
+    """Height and route planning around a growing stack at (sx, sy).
 
-    def __init__(self, calib, sx: float, sy: float) -> None:
-        self.sx = float(sx)
-        self.sy = float(sy)
+    The site is optional: ``StackPlanner.free_space(calib)`` (or sx/sy None)
+    gives a planner with no column to avoid, whose ``route()`` still detours
+    around the J1 keep-out and still checks every sampled pose against IK and
+    the joint soft limits. That is what a plain point-to-point move wants, and
+    routing it through this same class -- rather than a second, parallel
+    free-space router -- is deliberate: ``pickplace.routed_travel`` requires
+    stack and unstack to share one safety model, and a duplicate implementation
+    is how that guarantee rots. With a site, behaviour is unchanged.
+
+    The stack-specific height and staging helpers (``grip_top_z``,
+    ``hover_z``, ``stage_point``, ``slide_exits``, ...) require a site and say
+    so rather than returning a plausible-looking number.
+    """
+
+    def __init__(
+        self, calib, sx: float | None = None, sy: float | None = None
+    ) -> None:
+        self.sx = None if sx is None else float(sx)
+        self.sy = None if sy is None else float(sy)
         self.table_z = float(calib.table_z)
         self.cube_h = float(calib.cube_height_mm)
         self.safe_z = float(calib.safe_z)
-        self.site_max_z = max_z_at(self.sx, self.sy) or GROUND_Z_MM
+        self.site_max_z = (
+            (max_z_at(self.sx, self.sy) or GROUND_Z_MM)
+            if self.has_site
+            else GROUND_Z_MM
+        )
+
+    @classmethod
+    def free_space(cls, calib) -> StackPlanner:
+        """A planner with no stack column -- keep-out and joint limits only."""
+        return cls(calib)
+
+    @property
+    def has_site(self) -> bool:
+        return self.sx is not None and self.sy is not None
+
+    def _require_site(self, what: str) -> None:
+        if not self.has_site:
+            raise ValueError(
+                f"StackPlanner.{what} needs a stack site; this planner was "
+                "built for free space (StackPlanner.free_space)"
+            )
 
     # -- heights -----------------------------------------------------------
 
@@ -138,6 +174,7 @@ class StackPlanner:
         HOVER_ABOVE_MAX_MM; a level is buildable only if at least
         HOVER_ABOVE_MIN_MM fits.
         """
+        self._require_site("hover_z")
         rz = self.release_z(level)
         hz = min(rz + HOVER_ABOVE_MAX_MM, self.site_max_z - Z_LIMIT_MARGIN_MM)
         return hz if hz >= rz + HOVER_ABOVE_MIN_MM else None
@@ -150,6 +187,7 @@ class StackPlanner:
         leaning column cannot be clipped by the exit hop) and accepts down
         to FREE_RETREAT_ABOVE_MM before switching to the slide retreat.
         """
+        self._require_site("free_retreat_z")
         rz = self.release_z(level)
         fz = min(
             rz + FREE_RETREAT_PREFER_MM, self.site_max_z - Z_LIMIT_MARGIN_MM
@@ -162,16 +200,22 @@ class StackPlanner:
         """Slide-out height: fingers straddle the upper half of the placed
         cube, so a move perpendicular to the jaw axis sweeps them off the
         cube faces without touching it."""
+        self._require_site("slide_z")
         rz = self.release_z(level)
         return min(rz + SLIDE_LIFT_ABOVE_MM, self.site_max_z - Z_LIMIT_MARGIN_MM)
 
     # -- safety model ------------------------------------------------------
 
     def pose_safe(self, x: float, y: float, z: float, levels: int) -> bool:
-        """True when a TCP pose cannot touch a ``levels``-cube stack."""
+        """True when a TCP pose cannot touch a ``levels``-cube stack.
+
+        With no site (free space) this is exactly the ``levels <= 0`` case that
+        already existed: reachability, IK branch, and joint soft limits, with
+        no column or forearm model to apply.
+        """
         if not joint_reachable(x, y, z):
             return False
-        if levels <= 0:
+        if not self.has_site or levels <= 0:
             return True
         if (
             math.hypot(x - self.sx, y - self.sy) < COLUMN_AVOID_MM
@@ -217,7 +261,13 @@ class StackPlanner:
     # -- stages and routing ------------------------------------------------
 
     def _ring(self, radius: float) -> list[tuple[float, float]]:
-        """Eight points around the stack, index 0 toward the base."""
+        """Eight points around the stack, index 0 toward the base.
+
+        Empty with no site: there is no column to ring, so ``_route_via``
+        falls through to the J1 keep-out base ring alone.
+        """
+        if not self.has_site:
+            return []
         rs = math.hypot(self.sx, self.sy)
         ux, uy = -self.sx / rs, -self.sy / rs
         out: list[tuple[float, float]] = []
@@ -242,6 +292,7 @@ class StackPlanner:
         """Hover entry/exit point STAGE_OFFSET_MM from the axis, nearest to
         ``prefer_xy``. Requires a little z headroom beyond ``z`` so the
         firmware's own per-segment IK cannot reject it by a hair."""
+        self._require_site("stage_point")
         cands = [
             p
             for p in self._ring(STAGE_OFFSET_MM)
@@ -268,6 +319,7 @@ class StackPlanner:
         only safe low retreat is a straight slide perpendicular to the jaw
         axis so both fingers sweep off the cube faces without pushing it.
         """
+        self._require_site("slide_exits")
         sz = self.slide_z(level)
         ranked: list[tuple[bool, float, tuple[float, float]]] = []
         for ang in (jaw_world_deg + 90.0, jaw_world_deg - 90.0):

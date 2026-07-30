@@ -122,9 +122,28 @@ bool start_absolute_move(float x, float y, float z, float j4_deg,
  * does not (yet) give one flat-cruise ramp across the whole queue. An `mp`
  * sent while a queue is in flight keeps its existing override behavior
  * (immediate retarget to the new target) and drops any still-pending queued
- * legs. Async completion of the *whole* queue reuses "mp done pos ...". */
+ * legs. Async completion of the *whole* queue reuses "mp done pos ...".
+ *
+ * dwell_ms > 0 makes the entry a GRIP STATION instead of a leg: no motion is
+ * planned, the gripper is driven to `g`, and the queue holds until the sweep
+ * finishes plus dwell_ms of mechanical settle, then resumes on its own. This
+ * is what lets a whole pick-and-place be one queue -- the per-leg `g` fires
+ * at leg *start* and sweeps while the arm moves, which is wrong for a grasp
+ * (the jaws must close after the descent, with the arm stopped). A station's
+ * x/y/z must equal the pose the leg ahead of it ended at; a mismatch beyond a
+ * few mm is "err mq station pose" and kills the path, rather than gripping
+ * somewhere the host did not intend. Capped at MQ_STATION_DWELL_MAX_MS
+ * ("err mq dwell 0-N") since a station stalls the whole queue.
+ * `mp` rejects a nonzero dwell outright -- a station is only meaningful
+ * inside a queue. */
 bool motion_queue_move(float x, float y, float z, float j4_deg,
-                       uint8_t j4_mode, long g, long speed_us);
+                       uint8_t j4_mode, long g, long speed_us,
+                       long dwell_ms);
+
+/* Polled from the main loop: releases a pending grip-station hold once the
+ * gripper sweep has finished and the settle has elapsed, then resumes the
+ * queue. No-op when no station is pending. */
+void motion_poll_mq_hold();
 
 /* "speed <us>" command: clamps, applies to the timer live, and prints the
  * accepted value. */

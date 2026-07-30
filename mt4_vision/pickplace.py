@@ -1,4 +1,13 @@
-"""Pick and place sequences for cubes on the calibrated work surface."""
+"""Pick and place sequences for cubes on the calibrated work surface.
+
+The queued-motion core moved to ``mt4_vision.motion``: ``pick``/``place`` here
+are thin wrappers over ``motion.pick_at``/``motion.place_at`` (same signatures,
+so every existing caller is untouched), and ``routed_travel`` now sends legs
+built by ``motion.plan_route_legs`` rather than composing them itself. What
+stays here is the cube-specific and legacy-sequence material: the camera park,
+``pick_centered``'s ±90° re-grip, ``center_placed_cube``, and the
+``CubeDetection``-shaped entry points.
+"""
 
 from __future__ import annotations
 
@@ -10,68 +19,32 @@ from mt4_jog.joints import JOINT_SOFT_MAX_STEPS, JOINT_SOFT_MIN_STEPS, JOG_SPEED
 from mt4_jog.kinematics import STEPS_PER_DEG
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import CubeDetection
+from mt4_vision import motion
+from mt4_vision.motion import (  # noqa: F401 -- home_arm is a re-export (see below)
+    Grasp,
+    YAW_PERIOD_SQUARE,
+    ensure_homed,
+    home_arm,
+    plan_route_legs,
+    require_mp_reachable,
+    resolve_yaw_j4,
+    send_legs,
+)
+from mt4_vision.motion import check as _check
 from mt4_vision.stackpath import StackPlanner
-from mt4_vision.workspace import KEEPOUT_RADIUS_MM, is_mp_reachable_xy
+from mt4_vision.workspace import is_mp_reachable_xy
 
-
-def fold_square_yaw_deg(yaw_deg: float) -> float:
-    """Map any angle into (-45, 45] -- one face of a square (90° period)."""
-    return (yaw_deg + 45.0) % 90.0 - 45.0
-
-
-def j4_for_face_align(
-    cube_yaw_deg: float,
-    *,
-    current_j4_deg: float | None = None,
-    x: float | None = None,
-    y: float | None = None,
-    j4_margin_steps: int = 200,
-) -> float:
-    """World-frame J4 (deg) so the jaws meet a cube face, not a corner.
-
-    Assumes firmware ``j4zero``: jaws along the arm ⇒ world J4 = 0.
-    ``cube_yaw_deg`` is a robot-frame edge angle from detection. Squares are
-    90°-periodic; when ``current_j4_deg`` is given, pick the equivalent that
-    minimizes wrist travel -- but only among candidates whose *joint* J4
-    (world − j1) stays inside soft limits at (x, y). Preferring nearest
-    world yaw alone can pin joint J4 past ±8100 on far −Y picks after the
-    wrist has drifted near 90° (stack level-4: world 109° at j1≈−72° →
-    joint 181° / 8130 steps → ``err mp joints``).
-    """
-    base = fold_square_yaw_deg(cube_yaw_deg)
-    # Face-aligned lattice: base + k*90.
-    candidates = [base + 90.0 * k for k in range(-4, 5)]
-    if x is not None and y is not None:
-        j1 = math.degrees(math.atan2(y, x))
-        lo = JOINT_SOFT_MIN_STEPS[3] / STEPS_PER_DEG[3] + j4_margin_steps / STEPS_PER_DEG[3]
-        hi = JOINT_SOFT_MAX_STEPS[3] / STEPS_PER_DEG[3] - j4_margin_steps / STEPS_PER_DEG[3]
-        feasible = [w for w in candidates if lo <= (w - j1) <= hi]
-        if feasible:
-            candidates = feasible
-    if current_j4_deg is None:
-        # Prefer the folded representative (or the feasible one closest to it).
-        return min(candidates, key=lambda w: abs(w - base))
-    return min(candidates, key=lambda w: abs(w - current_j4_deg))
-
-
-def j4_preserve_wrist(
-    x: float,
-    y: float,
-    *,
-    from_x: float,
-    from_y: float,
-    from_j4: float,
-) -> float:
-    """World-frame J4 that keeps joint J4 fixed across a J1 swing.
-
-    ``Mt4Client.move_to(j4=None)`` holds *world* yaw, which commands
-    ``joint_j4 = world_j4 - j1``. Large base swings (e.g. to marker 0 at
-    j1≈−80°) then drive J4 past soft limits → ``err mp joints``. Holding
-    the wrist joint instead yields ``world_j4 = j1_tgt + (from_j4 - j1_from)``.
-    """
-    j1_from = math.degrees(math.atan2(from_y, from_x))
-    j1_to = math.degrees(math.atan2(y, x))
-    return j1_to + (from_j4 - j1_from)
+# The wrist-angle lattice lives in mt4_vision.wrist (pure geometry, so the
+# motion primitives can build on it without importing this module). Re-exported
+# here, along with the motion-layer names above, because callers and tests have
+# always reached for them via pickplace.
+from mt4_vision.wrist import (  # noqa: F401
+    fold_square_yaw_deg,
+    fold_yaw_deg,
+    j4_for_face_align,
+    j4_for_long_axis,
+    j4_preserve_wrist,
+)
 
 
 def _resolve_travel_j4(j4: float | str | None) -> float | str:
@@ -85,15 +58,6 @@ def _resolve_travel_j4(j4: float | str | None) -> float | str:
     (`mq`/move_path) waypoints.
     """
     return "wrist" if j4 is None else float(j4)
-
-
-def _check(result: dict[str, object], step: str) -> dict[str, object]:
-    """move_to/home/gripper report failure via {"ok": False, ...}, not an
-    exception -- callers here must not chain past a step that never
-    happened, so turn a failed result into one."""
-    if not result.get("ok"):
-        raise Mt4ClientError(f"{step} failed: {result.get('error', result)}")
-    return result
 
 
 def _travel(
@@ -322,54 +286,22 @@ def routed_travel(
     Shared by stack_cubes.py (levels grows as cubes are added) and
     unstack_cubes.py (levels shrinks as cubes come off) -- both route
     around the same column, so the safety model must stay identical.
+
+    The leg composition itself now lives in ``motion.plan_route_legs`` so a
+    pick's and a place's legs can be planned together and sent as one queue;
+    this reads the TCP and sends. Behaviour is unchanged
+    (tests/test_routed_travel.py pins it).
     """
     tcp = client.get_tcp()
     if tcp is None:
         raise Mt4ClientError(f"{step}: could not read TCP")
-    cur = (float(tcp.x), float(tcp.y), float(tcp.z))
-    lift_wps: list[tuple[float, float, float]] = []
-    a = cur
-    if lift_to is not None and float(lift_to) - cur[2] > _Z_EPS_MM:
-        a = (cur[0], cur[1], float(lift_to))
-        lift_wps = [a]
-    tail = [(float(px), float(py), float(pz)) for px, py, pz in (then or [])]
-    descend_wps = (
-        []
-        if descend is None
-        else [(float(descend[0]), float(descend[1]), float(descend[2]))]
+    legs = plan_route_legs(
+        calib, planner, (float(tcp.x), float(tcp.y), float(tcp.z)),
+        x, y, z, levels,
+        j4=j4, then=then, final_j4=final_j4, lift_to=lift_to,
+        descend=descend, step=step,
     )
-    final = descend_wps[-1] if descend_wps else (tail[-1] if tail else (x, y, z))
-    if not lift_wps and math.dist(cur, final) < 1.0:
-        return
-    wps = planner.route(a, (x, y, z), levels)
-    if wps is None:
-        raise Mt4ClientError(
-            f"{step}: no stack-safe route from "
-            f"({a[0]:.0f},{a[1]:.0f},{a[2]:.0f}) to ({x:.0f},{y:.0f},{z:.0f})"
-        )
-    all_wps = lift_wps + wps + tail + descend_wps
-    transit_j4 = j4 if j4 is not None else "wrist"
-    arrival_j4 = float(final_j4) if final_j4 is not None else transit_j4
-    # Lift legs hold "wrist" (preserve the gripped orientation up the vertical
-    # lift). Route transit legs hold the transit wrist. The leg that ARRIVES
-    # at (x, y, z) and everything after it (then hops, the final descend) hold
-    # arrival_j4, so the wrist is settled before any hop or drop rather than
-    # turning into it (arrival_j4 == transit_j4 when no final_j4, i.e. uniform).
-    n_lift = len(lift_wps)
-    n_route_transit = len(wps) - 1
-    j4_list = (
-        ["wrist"] * n_lift
-        + [transit_j4] * n_route_transit
-        + [arrival_j4] * (len(all_wps) - n_lift - n_route_transit)
-    )
-    speeds = [calib.travel_speed_us] * len(all_wps)
-    if descend_wps:
-        speeds[-1] = int(calib.approach_speed_us)
-    # Collapse to a scalar when uniform (the common case) so the wire form
-    # and existing behavior are unchanged; only mixed legs go out as lists.
-    j4_arg: object = j4_list[0] if all(v == j4_list[0] for v in j4_list) else j4_list
-    speed_arg: object = speeds[0] if all(s == speeds[0] for s in speeds) else speeds
-    _check(client.move_path(all_wps, j4=j4_arg, speed_us=speed_arg), step)
+    send_legs(client, legs, step=step)
 
 
 def go_camera_park(
@@ -384,25 +316,6 @@ def go_camera_park(
         )
         return {"ok": True, "parked_at": [CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z]}
     return retreat_for_camera(client, calib)
-
-
-def ensure_homed(client: Mt4Client) -> None:
-    status = client.get_status()
-    if not status.homed:
-        home_arm(client)
-
-
-def home_arm(client: Mt4Client) -> None:
-    """Run firmware homing regardless of the session homed flag."""
-    _check(client.home(), "home")
-
-
-def _require_mp_reachable(x: float, y: float, step: str) -> None:
-    if not is_mp_reachable_xy(x, y):
-        raise Mt4ClientError(
-            f"{step}: ({x:.1f}, {y:.1f}) is inside the {KEEPOUT_RADIUS_MM:.0f}mm "
-            f"J1 keep-out zone (mp cannot move there)"
-        )
 
 
 def resolve_pick_j4(
@@ -421,13 +334,9 @@ def resolve_pick_j4(
     ``j4_preserve_wrist``. Pass pick (x, y) so face-align stays inside
     joint-J4 soft limits at the target bearing.
     """
-    if not face_align or yaw_deg is None:
+    if not face_align:
         return None
-    tcp = client.get_tcp()
-    current = tcp.j4 if tcp is not None else None
-    return j4_for_face_align(
-        yaw_deg, current_j4_deg=current, x=x, y=y,
-    )
+    return resolve_yaw_j4(client, calib, yaw_deg, period_deg=90.0, x=x, y=y)
 
 
 def resolve_place_j4(
@@ -468,29 +377,23 @@ def pick(
     face-align is enabled, world-frame J4 is commanded so the jaws meet a
     face rather than a corner. Face-align defaults on and assumes firmware
     ``j4zero`` (``calibrate_j4.py``): world J4 = 0 means jaws along the arm.
+
+    A cube-shaped wrapper over ``motion.pick_at``: the sequence is now one
+    queued `mq` path with a firmware grip station instead of two blocking
+    gripper calls and three blocking `mp` moves. Same signature, same return
+    keys.
     """
-    ensure_homed(client)
-    _require_mp_reachable(x, y, "pick target")
     if face_align is None:
         face_align = bool(getattr(calib, "face_align_picks", True))
-    j4 = resolve_pick_j4(
-        client, calib, yaw_deg, face_align=face_align, x=x, y=y,
+    return motion.pick_at(
+        client,
+        calib,
+        Grasp(
+            x, y,
+            yaw_deg=yaw_deg if face_align else None,
+            yaw_period_deg=YAW_PERIOD_SQUARE,
+        ),
     )
-    client.gripper(calib.grip_open_s)
-    _travel(client, calib, x, y, calib.safe_z, "move to safe height", j4=j4)
-    _approach(client, calib, x, y, calib.table_z, "descend to pick height", j4=j4)
-    result = client.gripper(calib.grip_close_s)
-    if not result.get("ok"):
-        # Lift clear anyway so a failed grip doesn't leave the TCP parked
-        # against the cube.
-        _travel(client, calib, x, y, calib.safe_z, "lift after failed grip")
-        raise Mt4ClientError(f"gripper close failed: {result}")
-    _travel(client, calib, x, y, calib.safe_z, "lift after grip")
-    out: dict[str, object] = {"ok": True, "picked_at": [x, y]}
-    if j4 is not None:
-        out["j4"] = round(j4, 2)
-        out["yaw_deg"] = None if yaw_deg is None else round(float(yaw_deg), 2)
-    return out
 
 
 def pick_cube(
@@ -558,38 +461,43 @@ def place(
 
     When ``lift_after`` is False the TCP stays at release height over the
     target (for in-place centering immediately after).
+
+    The ordinary path is a cube-shaped wrapper over ``motion.place_at`` -- one
+    queued `mq` path with a firmware release station. ``axis_clear_mm`` keeps
+    the older per-segment orthogonal route: it is the stacking approach, whose
+    vertical-then-horizontal legs and stack-axis clear hop are not expressible
+    as a routed plan, and migrating the column path is deliberately staged
+    behind proving the queued path on the shuffle loop first.
     """
-    ensure_homed(client)
-    _require_mp_reachable(x, y, "place target")
     if j4 is not None:
-        pass
+        wrist: float | None = float(j4)
     elif along_arm:
         # Prefer world 0 (jaws along arm after j4zero), not nearest-to-current.
-        j4 = j4_for_face_align(0.0, current_j4_deg=None, x=x, y=y)
+        wrist = j4_for_face_align(0.0, current_j4_deg=None, x=x, y=y)
     else:
-        j4 = resolve_place_j4(client, calib, axis_align=axis_align, x=x, y=y)
-    rz = calib.table_z + 3.0 if release_z is None else float(release_z)
-    tz = max(float(calib.safe_z), rz) if travel_z is None else float(travel_z)
-    tcp0 = client.get_tcp()
-    if tcp0 is None:
-        raise Mt4ClientError("place: could not read TCP")
+        wrist = resolve_place_j4(client, calib, axis_align=axis_align, x=x, y=y)
+
     if axis_clear_mm is not None and axis_clear_mm > 0:
+        ensure_homed(client)
+        require_mp_reachable(x, y, "place target")
+        rz = calib.table_z + 3.0 if release_z is None else float(release_z)
+        tz = max(float(calib.safe_z), rz) if travel_z is None else float(travel_z)
+        tcp0 = client.get_tcp()
+        if tcp0 is None:
+            raise Mt4ClientError("place: could not read TCP")
         travel_orthogonal(
             client, calib, float(tcp0.x), float(tcp0.y), tz,
-            "stack approach height", j4=j4,
+            "stack approach height", j4=wrist,
         )
         travel_orthogonal(
-            client, calib, x, y, tz, "horizontal over place XY", j4=j4,
+            client, calib, x, y, tz, "horizontal over place XY", j4=wrist,
         )
-    else:
-        _travel(client, calib, x, y, tz, "move to safe height", j4=j4)
-    _approach(client, calib, x, y, rz, "descend to release height", j4=j4)
-    client.gripper(calib.grip_open_s)
-    if on_released is not None:
-        on_released()
-    if lift_after:
-        _travel(client, calib, x, y, tz, "lift after release")
-        if axis_clear_mm is not None and axis_clear_mm > 0:
+        _approach(client, calib, x, y, rz, "descend to release height", j4=wrist)
+        client.gripper(calib.grip_open_s)
+        if on_released is not None:
+            on_released()
+        if lift_after:
+            _travel(client, calib, x, y, tz, "lift after release")
             clear = stack_clear_xy(
                 x, y, float(tcp0.x), float(tcp0.y), float(axis_clear_mm),
             )
@@ -598,7 +506,18 @@ def place(
                     client, calib, clear[0], clear[1], tz,
                     "horizontal clear of stack axis",
                 )
-    return {"ok": True, "placed_at": [x, y], "release_z": rz}
+        return {"ok": True, "placed_at": [x, y], "release_z": rz}
+
+    return motion.place_at(
+        client,
+        calib,
+        Grasp(x, y),
+        j4=wrist,
+        lift_after=lift_after,
+        release_z=release_z,
+        travel_z=travel_z,
+        on_released=on_released,
+    )
 
 
 def pick_centered(
@@ -628,7 +547,7 @@ def pick_centered(
     saving the stop/settle at safe_z between the grip and the carry.
     """
     ensure_homed(client)
-    _require_mp_reachable(x, y, "pick_centered target")
+    require_mp_reachable(x, y, "pick_centered target")
     if face_align is None:
         face_align = bool(getattr(calib, "face_align_picks", True))
     # One TCP read, reused for both the face-align wrist (same result
@@ -735,7 +654,7 @@ def center_placed_cube(
     lift to ``safe_z`` before the wrist rotation, then descend for grip/release.
     """
     ensure_homed(client)
-    _require_mp_reachable(x, y, "center target")
+    require_mp_reachable(x, y, "center target")
     if lift_before_rotate:
         tcp = client.get_tcp()
         _travel(

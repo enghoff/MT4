@@ -227,3 +227,64 @@ def test_stack_clear_xy_prefers_approach_ray():
     assert clear is not None
     assert abs(math.hypot(clear[0] - sx, clear[1] - sy) - STACK_AXIS_CLEAR_MM) < 0.1
     assert clear[1] > sy  # same half-plane as the approach
+
+
+def test_place_on_stack_queues_release_as_station():
+    """Carry+seat ends on an open station in the same mq -- no blocking
+    client.gripper() round trip between descend and retreat."""
+    from mt4_vision.stackpath import StackPlanner
+    from stack_cubes import place_on_stack
+
+    calib = SimpleNamespace(
+        table_z=127.2,
+        cube_height_mm=20.0,
+        safe_z=155.0,
+        travel_speed_us=700,
+        approach_speed_us=2400,
+        grip_open_s=140,
+        grip_close_s=240,
+    )
+    sx, sy = 153.6, 156.9
+    planner = StackPlanner(calib, sx, sy)
+
+    class _Tcp:
+        def __init__(self):
+            self.x, self.y, self.z, self.j4 = 200.0, 0.0, 155.0, 0.0
+
+    class _Client:
+        def __init__(self):
+            self._tcp = _Tcp()
+            self.calls = []
+            self.gripper_calls = []
+
+        def get_tcp(self):
+            return self._tcp
+
+        def gripper(self, action):
+            self.gripper_calls.append(action)
+            return {"ok": True}
+
+        def move_path(self, waypoints, j4=None, grip=0, speed_us=0, dwell_ms=0, **kw):
+            n = len(waypoints)
+
+            def spread(v):
+                return list(v) if isinstance(v, (list, tuple)) else [v] * n
+
+            self.calls.append(
+                {
+                    "wps": list(waypoints),
+                    "grips": list(grip) if isinstance(grip, (list, tuple))
+                    else [grip] + [0] * (n - 1),
+                    "dwells": spread(dwell_ms),
+                }
+            )
+            return {"ok": True}
+
+    client = _Client()
+    place_on_stack(client, calib, planner, 1, park_xy=(200.0, 0.0))
+    assert client.gripper_calls == []
+    assert client.calls, "expected at least the carry+seat queue"
+    seat = client.calls[0]
+    assert seat["wps"][-1] == (sx, sy, planner.release_z(1))
+    assert seat["dwells"][-1] > 0
+    assert seat["grips"][-1] == calib.grip_open_s

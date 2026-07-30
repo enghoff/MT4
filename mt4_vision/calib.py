@@ -33,6 +33,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from mt4_jog.joints import GRIPPER_S_CLOSED, GRIPPER_S_OPEN
+
 DEFAULT_CALIB_PATH = Path(
     os.environ.get("MT4_VISION_CALIB", Path(__file__).resolve().parent.parent / "vision_calibration.json")
 )
@@ -86,6 +88,15 @@ class Calibration:
     # Gripper S values for this cube size (firmware absolute, 120-285).
     grip_open_s: int = 140
     grip_close_s: int = 240
+    # Linear jaw-span model, so a non-cube object can be gripped at all:
+    # span_mm = (grip_span_s_at_zero_mm - S) / grip_span_s_per_mm. Both None
+    # until measured (see grip_s_for_span_mm, which warns once and falls back
+    # to grip_close_s). This matters more than it looks: grip_close_s = 240 is
+    # the value for a 20mm cube, and closing to 240 on a ~10mm pen never
+    # touches it -- with no grip-retention sensing anywhere in the stack, the
+    # pick then reports success having done nothing.
+    grip_span_s_at_zero_mm: float | None = None
+    grip_span_s_per_mm: float | None = None
     # Cube edge length (mm), used for the parallax correction and place height.
     cube_height_mm: float = 20.0
     # Preferred cube-top correction: a second pixel -> robot-XY homography
@@ -244,6 +255,51 @@ class Calibration:
 
     def save(self, path: Path = DEFAULT_CALIB_PATH) -> None:
         path.write_text(json.dumps(self.__dict__, indent=2), encoding="utf-8")
+
+
+# How far past a measured width to close. Vision reports a *silhouette* width,
+# which on this steeply oblique mount reads wide for anything with height, and
+# too-open is the failure mode with no detector: the jaws shut on air and the
+# pick reports success. Too-closed merely squeezes, which the jaws tolerate.
+GRIP_SQUEEZE_MM = 4.0
+
+_warned_no_grip_span = False
+
+
+def grip_s_for_span_mm(calib: Calibration, span_mm: float) -> int:
+    """Gripper S that closes on an object ``span_mm`` wide.
+
+    Uses the measured linear jaw model when it is calibrated. When it is not,
+    returns ``calib.grip_close_s`` (correct for a 20mm cube, wrong for anything
+    else) and warns once -- the same one-shot-at-use-time pattern
+    ``_warn_no_cube_top_correction`` uses, and for the same reason: nothing
+    downstream fails loudly on its own. A too-open close value produces a
+    confident pick with empty jaws, and there is no grip-retention sensing to
+    catch it.
+
+    To calibrate: grip two or three objects of known width, note the S at which
+    each just holds, fit S = at_zero - per_mm * width, and store the two
+    coefficients. Seeded expectation from the one point we have (S 240 holds a
+    20mm cube) plus S 285 = fully closed is ~2.25 S/mm -- a guess to check, not
+    a substitute for measuring.
+    """
+    global _warned_no_grip_span
+    at_zero = calib.grip_span_s_at_zero_mm
+    per_mm = calib.grip_span_s_per_mm
+    if at_zero is None or per_mm is None:
+        if not _warned_no_grip_span:
+            _warned_no_grip_span = True
+            print(
+                "WARNING: grip_span_s_at_zero_mm/grip_span_s_per_mm are not "
+                f"calibrated -- falling back to grip_close_s={calib.grip_close_s} "
+                f"(the {calib.cube_height_mm:.0f}mm cube value) for a "
+                f"{span_mm:.0f}mm object. A too-open close value grips nothing "
+                "and still reports success.",
+                file=sys.stderr,
+            )
+        return int(calib.grip_close_s)
+    s = float(at_zero) - float(per_mm) * float(span_mm)
+    return int(round(min(max(s, GRIPPER_S_OPEN), GRIPPER_S_CLOSED)))
 
 
 def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> Calibration:
