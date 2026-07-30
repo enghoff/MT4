@@ -86,16 +86,18 @@ static bool parse_cj_vec(const char *arg, Vec3 *out, int8_t *j4_roll) {
   return false;
 }
 
-// Parses "<x> <y> <z> <j4|h|w> <g> [speed_us]" (mp/mq command args) without
-// relying on sscanf's %f -- avr-libc's default sscanf doesn't support float
-// conversion unless linked against a non-default scanf flavor, which this
-// build isn't. strtod/strtol are always available. The j4 slot also accepts
-// the sentinels `h` (hold world yaw) / `w` (hold wrist joint) -- see
-// Mt4J4Mode in motion.h; *j4 is left 0 for those. speed_us defaults to 0
+// Parses "<x> <y> <z> <j4|h|w> <g> [speed_us] [dwell_ms]" (mp/mq command
+// args) without relying on sscanf's %f -- avr-libc's default sscanf doesn't
+// support float conversion unless linked against a non-default scanf flavor,
+// which this build isn't. strtod/strtol are always available. The j4 slot
+// also accepts the sentinels `h` (hold world yaw) / `w` (hold wrist joint) --
+// see Mt4J4Mode in motion.h; *j4 is left 0 for those. speed_us defaults to 0
 // (leave the current jog/move step period unchanged); otherwise clamped to
-// [700, 4000] us.
+// [700, 4000] us. dwell_ms defaults to 0 and only means anything to `mq`,
+// where >0 makes the entry a grip station (see motion_queue_move).
 static bool parse_mp_args(char *arg, float *x, float *y, float *z, float *j4,
-                          uint8_t *j4_mode, long *g, long *speed_us) {
+                          uint8_t *j4_mode, long *g, long *speed_us,
+                          long *dwell_ms) {
   float vals[4];
   uint8_t mode = MT4_J4_EXPLICIT;
   for (uint8_t i = 0; i < 4; ++i) {
@@ -140,6 +142,7 @@ static bool parse_mp_args(char *arg, float *x, float *y, float *z, float *j4,
   *j4_mode = mode;
   *g = gv;
   *speed_us = 0;
+  *dwell_ms = 0;
   while (*arg == ' ') {
     ++arg;
   }
@@ -152,6 +155,19 @@ static bool parse_mp_args(char *arg, float *x, float *y, float *z, float *j4,
     return false;
   }
   *speed_us = sv;
+  arg = end;
+  while (*arg == ' ') {
+    ++arg;
+  }
+  if (!*arg) {
+    return true;
+  }
+  end = nullptr;
+  const long dv = strtol(arg, &end, 10);
+  if (end == arg) {
+    return false;
+  }
+  *dwell_ms = dv;
   arg = end;
   while (*arg == ' ') {
     ++arg;
@@ -341,9 +357,16 @@ void handle_line(char *line) {
       line[2] == ' ') {
     float x, y, z, j4;
     uint8_t j4_mode;
-    long g, speed_us;
-    if (!parse_mp_args(line + 3, &x, &y, &z, &j4, &j4_mode, &g, &speed_us)) {
+    long g, speed_us, dwell_ms;
+    if (!parse_mp_args(line + 3, &x, &y, &z, &j4, &j4_mode, &g, &speed_us,
+                       &dwell_ms)) {
       Serial.println(F("err mp <x> <y> <z> <j4|h|w> <g> [speed_us]"));
+      return;
+    }
+    if (dwell_ms != 0) {
+      /* A grip station only means something inside a queue -- a lone `mp`
+       * has nothing to hold back. Reject rather than silently ignore. */
+      Serial.println(F("err mp dwell (use mq)"));
       return;
     }
     start_absolute_move(x, y, z, j4, j4_mode, g, speed_us);
@@ -353,12 +376,14 @@ void handle_line(char *line) {
       line[2] == ' ') {
     float x, y, z, j4;
     uint8_t j4_mode;
-    long g, speed_us;
-    if (!parse_mp_args(line + 3, &x, &y, &z, &j4, &j4_mode, &g, &speed_us)) {
-      Serial.println(F("err mq <x> <y> <z> <j4|h|w> <g> [speed_us]"));
+    long g, speed_us, dwell_ms;
+    if (!parse_mp_args(line + 3, &x, &y, &z, &j4, &j4_mode, &g, &speed_us,
+                       &dwell_ms)) {
+      Serial.println(
+          F("err mq <x> <y> <z> <j4|h|w> <g> [speed_us] [dwell_ms]"));
       return;
     }
-    motion_queue_move(x, y, z, j4, j4_mode, g, speed_us);
+    motion_queue_move(x, y, z, j4, j4_mode, g, speed_us, dwell_ms);
     return;
   }
   if ((line[0] == 'm' || line[0] == 'M') && line[1] == ' ') {

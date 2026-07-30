@@ -33,7 +33,8 @@ from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import Calibration
 from mt4_vision.camera import grab_frame, open_camera
 from mt4_vision.detect import CubeDetection
-from mt4_vision.pickplace import home_arm, pick_cube, place, retreat_for_camera
+from mt4_vision.motion import Grasp, transfer
+from mt4_vision.pickplace import home_arm, retreat_for_camera
 from mt4_vision.policy import Action, plan_shuffle
 from mt4_vision.scene import Scene, capture_scene, verify_pick_place
 
@@ -372,8 +373,23 @@ def run_shuffle_loop(
                     f"-> ({mplace_x:.0f},{mplace_y:.0f})"
                 )
                 try:
-                    pick_cube(client, calib, cube)
-                    place(client, calib, mplace_x, mplace_y)
+                    # One planned transfer, not a pick then a place: the
+                    # post-grip lift folds into the carry and both grips are
+                    # firmware stations, so the whole move is one `mq` queue
+                    # instead of ~6 blocking `mp` legs and 2 gripper sleeps.
+                    transfer(
+                        client,
+                        calib,
+                        Grasp(
+                            float(cube.x), float(cube.y),
+                            yaw_deg=(
+                                cube.yaw_deg
+                                if getattr(calib, "face_align_picks", True)
+                                else None
+                            ),
+                        ),
+                        Grasp(mplace_x, mplace_y),
+                    )
                 except Mt4ClientError as exc:
                     failed_exc = exc
                     break

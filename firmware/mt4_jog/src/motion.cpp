@@ -236,6 +236,13 @@ typedef struct {
   uint8_t j4_mode;
   long g;
   long speed_us;
+  /* >0 turns this entry into a GRIP STATION: no motion is planned, the
+   * gripper is driven to `g`, and the queue holds until the sweep finishes
+   * plus this many ms of extra mechanical settle (see mq_hold_stage). A
+   * station's x/y/z must equal the pose the previous leg ended at -- it is
+   * checked, not assumed, so a host/firmware desync cannot grip somewhere
+   * the host did not intend. */
+  uint16_t dwell_ms;
 } MpWaypoint;
 
 /* `mq` pending queue: legs behind whatever `mp_path` is currently executing.
@@ -246,6 +253,39 @@ typedef struct {
 static MpWaypoint mq_queue[MQ_QUEUE_CAPACITY];
 static uint8_t mq_head = 0;
 static uint8_t mq_count = 0;
+
+/* Grip-station hold (see MpWaypoint.dwell_ms). While a hold is active the
+ * path is mid-flight even though nothing is stepping and mp_path is
+ * inactive, so:
+ *   - motion_queue_move() must treat the arm as BUSY (queue behind the
+ *     hold) rather than cold-starting a fresh path, and
+ *   - report_move_done() must not fire; the queue is not drained.
+ *
+ * Two stages, because "the servo reached its commanded S" is not "the jaws
+ * have seated on the object":
+ *   MQ_HOLD_SWEEP  -- wait for the gripper state machine itself to finish.
+ *                     Exact, and free: gripperSweepTick() already knows,
+ *                     so nothing here models GRIPPER_SWEEP_RATE or guesses
+ *                     a duration.
+ *   MQ_HOLD_SETTLE -- then wait dwell_ms of mechanical settle on top. */
+enum : uint8_t {
+  MQ_HOLD_NONE = 0,
+  MQ_HOLD_SWEEP = 1,
+  MQ_HOLD_SETTLE = 2,
+};
+static uint8_t mq_hold_stage = MQ_HOLD_NONE;
+static uint16_t mq_hold_dwell_ms = 0;
+static unsigned long mq_hold_settle_start_ms = 0;
+
+/* A station's pose may differ from the arm's actual pose by joint-step
+ * rounding and per-segment IK residue -- well under a mm. Tens of mm means
+ * the host built the queue against a pose the arm never reached. */
+static const float MQ_STATION_POSE_TOL_MM = 3.0f;
+/* A station holds the whole queue, so an implausible dwell stalls the arm
+ * with no way for the host to tell it apart from a hang. The widest real
+ * sweep (GRIPPER_S_OPEN..GRIPPER_S_CLOSED at GRIPPER_SWEEP_RATE) is ~1.4s
+ * and is waited for separately; this caps only the settle on top. */
+static const long MQ_STATION_DWELL_MAX_MS = 5000;
 
 static void mq_queue_clear() {
   mq_head = 0;
@@ -281,7 +321,11 @@ static void mp_path_cancel() {
   mp_drivers_ready = false;
   // A path that's ending (whether completed or aborted) invalidates
   // whatever was queued behind it too -- the queue only makes sense as a
-  // continuation of the path currently in flight.
+  // continuation of the path currently in flight. A pending grip-station
+  // hold is part of that queue: leaving it armed would gate the next path
+  // on a sweep nobody is waiting for any more.
+  mq_hold_stage = MQ_HOLD_NONE;
+  mq_hold_dwell_ms = 0;
   mq_queue_clear();
 }
 
@@ -894,6 +938,49 @@ static bool mp_execute_segment(uint16_t seg) {
   return true;
 }
 
+/* Arms a grip-station hold from `wp`. The arm must already be stationary --
+ * that is the whole point of a station: closing the jaws mid-travel is what
+ * the per-leg `g` cannot express, and what this exists to fix.
+ *
+ * Confirms the station's pose is where the arm actually is before touching
+ * the gripper, so a host that built its queue against a pose the arm never
+ * reached fails loudly instead of gripping at the wrong place. Prints
+ * "err mq station pose ..." and returns false in that case; the caller
+ * decides whether the surrounding path dies with it. */
+static bool mq_arm_station(const MpWaypoint &wp) {
+  const JointAnglesDeg q_now = angles_from_steps();
+  Vec3 tcp_now;
+  mt4_fk_tcp(&q_now, &tcp_now);
+  const float dx = wp.x - tcp_now.x;
+  const float dy = wp.y - tcp_now.y;
+  const float dz = wp.z - tcp_now.z;
+  if (sqrtf(dx * dx + dy * dy + dz * dz) > MQ_STATION_POSE_TOL_MM) {
+    Serial.print(F("err mq station pose want "));
+    Serial.print(wp.x, 1);
+    Serial.print(',');
+    Serial.print(wp.y, 1);
+    Serial.print(',');
+    Serial.print(wp.z, 1);
+    Serial.print(F(" at "));
+    Serial.print(tcp_now.x, 1);
+    Serial.print(',');
+    Serial.print(tcp_now.y, 1);
+    Serial.print(',');
+    Serial.println(tcp_now.z, 1);
+    return false;
+  }
+  if (wp.g != 0) {
+    gripperSweepToS(wp.g);
+  }
+  /* A station completes the path it belongs to, so its eventual completion
+   * must read as "mp done" even when it is the only entry (no plan_mp_leg
+   * ran to set this). */
+  move_done_is_mp = true;
+  mq_hold_dwell_ms = wp.dwell_ms;
+  mq_hold_stage = MQ_HOLD_SWEEP;
+  return true;
+}
+
 /* Run pending `mp`/`mq` segments until one needs async stepping or the
  * whole queue ends. On success with async motion in flight, leaves
  * mp_path.active true. On completion (queue drained), clears mp_path and
@@ -907,7 +994,11 @@ static bool mp_execute_segment(uint16_t seg) {
  * went unreachable/infeasible from wherever the arm actually ended up)
  * aborts the whole remaining queue, not just that leg: the queue was
  * planned as one sequence against an assumed pose, so once reality has
- * diverged enough to break one leg the rest can't be trusted either. */
+ * diverged enough to break one leg the rest can't be trusted either.
+ *
+ * A popped GRIP STATION (dwell_ms > 0) plans no leg at all: it fires the
+ * gripper and returns with a hold armed, leaving the rest of the queue
+ * untouched for motion_poll_mq_hold() to resume. */
 static bool mp_continue_path() {
   for (;;) {
     while (mp_path.active && mp_path.next_seg <= mp_path.num_segments) {
@@ -928,6 +1019,13 @@ static bool mp_continue_path() {
       report_move_done();
       return true;
     }
+    if (wp.dwell_ms > 0) {
+      if (!mq_arm_station(wp)) {
+        mp_path_cancel();
+        return false;
+      }
+      return true;
+    }
     if (!plan_mp_leg(wp.x, wp.y, wp.z, wp.j4, wp.j4_mode, wp.g, wp.speed_us,
                      /*splice=*/true, /*full_feasibility=*/true)) {
       mp_path_cancel();
@@ -936,6 +1034,29 @@ static bool mp_continue_path() {
     }
     // mp_path is now active for the queued leg; loop back and step it.
   }
+}
+
+/* Releases a grip-station hold once the sweep has finished and the settle
+ * has elapsed, then resumes the queue. Polled from the main loop; a no-op
+ * whenever no station is pending. */
+void motion_poll_mq_hold() {
+  if (mq_hold_stage == MQ_HOLD_NONE) {
+    return;
+  }
+  if (mq_hold_stage == MQ_HOLD_SWEEP) {
+    if (gripper_sweep != GRIP_SWEEP_STOP) {
+      return;
+    }
+    mq_hold_stage = MQ_HOLD_SETTLE;
+    mq_hold_settle_start_ms = millis();
+  }
+  /* Unsigned subtraction, so this is millis()-rollover safe. */
+  if (millis() - mq_hold_settle_start_ms < mq_hold_dwell_ms) {
+    return;
+  }
+  mq_hold_stage = MQ_HOLD_NONE;
+  mq_hold_dwell_ms = 0;
+  mp_continue_path();
 }
 
 static void report_move_done() {
@@ -1006,6 +1127,10 @@ void print_status() {
   }
   Serial.print(F("  MQ="));
   Serial.print(mq_count);
+  if (mq_hold_stage != MQ_HOLD_NONE) {
+    Serial.print(mq_hold_stage == MQ_HOLD_SWEEP ? F(" HOLD=sweep")
+                                                : F(" HOLD=settle"));
+  }
   Serial.print(F("  LIM "));
   print_limits();
   Serial.print(F("  GRIP S="));
@@ -1289,12 +1414,27 @@ bool start_absolute_move(float x, float y, float z, float j4_deg,
 
 /* "mq" command -- see motion.h for the full contract. */
 bool motion_queue_move(float x, float y, float z, float j4_deg,
-                       uint8_t j4_mode, long g, long speed_us) {
+                       uint8_t j4_mode, long g, long speed_us,
+                       long dwell_ms) {
   if (!validate_mp_request(x, y, z, g, speed_us)) {
     return false;
   }
+  if (dwell_ms < 0 || dwell_ms > MQ_STATION_DWELL_MAX_MS) {
+    Serial.print(F("err mq dwell 0-"));
+    Serial.println(MQ_STATION_DWELL_MAX_MS);
+    return false;
+  }
 
-  const bool busy = mp_path.active && jog_active;
+  // A pending grip station counts as in flight: nothing is stepping and
+  // mp_path is inactive during the hold, but the path is mid-sequence and
+  // the queue behind it is still live. Without this the next `mq` would
+  // look idle, cold-start a fresh path, and drop both the hold and
+  // everything queued behind it -- while acking "ok mq" instead of
+  // "ok mq queued N", which also miscounts the host's expected "mp done".
+  const bool busy =
+      (mp_path.active && jog_active) || mq_hold_stage != MQ_HOLD_NONE;
+  const MpWaypoint wp{x, y, z, j4_deg, j4_mode, g, speed_us,
+                      static_cast<uint16_t>(dwell_ms)};
   if (!busy) {
     // Nothing in flight: behaves exactly like a fresh `mp` cold start
     // (same stop/settle/full-sweep/ramp-from-rest), just acknowledged
@@ -1302,6 +1442,16 @@ bool motion_queue_move(float x, float y, float z, float j4_deg,
     // whatever gets queued behind it (if anything, before then) drains.
     motion_cancel_move();
     dda_stop();
+    if (wp.dwell_ms > 0) {
+      // Station with nothing in flight (e.g. "open the jaws here, settle,
+      // then continue"): the arm is already stopped, so arm the hold
+      // directly -- there is no leg to plan.
+      if (!mq_arm_station(wp)) {
+        return false;
+      }
+      Serial.println(F("ok mq"));
+      return true;
+    }
     if (!plan_mp_leg(x, y, z, j4_deg, j4_mode, g, speed_us, /*splice=*/false,
                      /*full_feasibility=*/true)) {
       return false;
@@ -1310,7 +1460,6 @@ bool motion_queue_move(float x, float y, float z, float j4_deg,
     return mp_continue_path();
   }
 
-  const MpWaypoint wp{x, y, z, j4_deg, j4_mode, g, speed_us};
   if (!mq_queue_push(wp)) {
     Serial.print(F("err mq full "));
     Serial.println(MQ_QUEUE_CAPACITY);

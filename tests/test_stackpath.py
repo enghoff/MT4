@@ -164,3 +164,83 @@ def test_slide_exits_perpendicular_to_jaws_prefer_park_side():
         assert math.isclose(abs(ex[1] - p.sy), STAGE_OFFSET_MM, abs_tol=1e-6)
     # Park side (-y of marker 3) ranks first.
     assert exits[0][1] < p.sy
+
+
+# -- site-optional (free-space) planner -----------------------------------
+#
+# StackPlanner doubles as the router for plain point-to-point moves so there is
+# only ever one safety model (see the class docstring). These pin that the
+# no-site mode is exactly the levels=0 case -- keep-out, IK and joint soft
+# limits -- and that stack-only helpers refuse rather than invent a number.
+
+
+def test_free_space_has_no_site_and_no_column_ring():
+    p = StackPlanner.free_space(CALIB)
+    assert not p.has_site
+    assert p._ring(70.0) == []
+
+
+def test_free_space_routes_straight_when_reachable():
+    p = StackPlanner.free_space(CALIB)
+    assert p.route((200.0, 0.0, 155.0), (220.0, -60.0, 155.0), 0) == [
+        (220.0, -60.0, 155.0)
+    ]
+
+
+def test_free_space_still_detours_around_the_j1_keepout():
+    # The 2026-07-24 field case: the straight chord between these bearings
+    # bottoms out at r~121, inside the 140mm keep-out.
+    a, b = (59.0, 179.0, 155.0), (160.0, -90.0, 155.0)
+    assert math.hypot(*_closest_point_to_origin(a[:2], b[:2])) < 140.0
+    p = StackPlanner.free_space(CALIB)
+    route = p.route(a, b, 0)
+    assert route is not None and len(route) > 1  # a detour, not the chord
+    assert all(math.hypot(x, y) >= 140.0 for x, y, _z in route)
+
+
+def test_free_space_pose_safe_matches_joint_reachable():
+    p = StackPlanner.free_space(CALIB)
+    for x, y, z in (
+        (220.0, -60.0, 155.0),
+        (100.0, 0.0, 155.0),      # inside keep-out
+        (340.0, 0.0, 155.0),      # past max reach
+        (200.0, 0.0, 340.0),      # over the z ceiling
+    ):
+        # levels is irrelevant with no site: no column to model.
+        assert p.pose_safe(x, y, z, 0) == joint_reachable(x, y, z)
+        assert p.pose_safe(x, y, z, 9) == joint_reachable(x, y, z)
+
+
+def test_with_site_still_applies_the_column_model():
+    """The no-site guard must not have weakened the real thing."""
+    p = planner()
+    over_column = (p.sx, p.sy, p.table_z)
+    assert not p.pose_safe(*over_column, 3)
+    assert StackPlanner.free_space(CALIB).pose_safe(*over_column, 3)
+
+
+def test_stack_only_helpers_refuse_without_a_site():
+    p = StackPlanner.free_space(CALIB)
+    for call in (
+        lambda: p.hover_z(2),
+        lambda: p.free_retreat_z(2),
+        lambda: p.slide_z(2),
+        lambda: p.stage_point(160.0, 2, prefer_xy=(200.0, 0.0)),
+        lambda: p.slide_exits(0.0, 2, prefer_xy=(200.0, 0.0)),
+    ):
+        try:
+            call()
+        except ValueError as exc:
+            assert "free space" in str(exc)
+        else:
+            raise AssertionError("expected ValueError for a site-less planner")
+
+
+def _closest_point_to_origin(a, b):
+    """Point on segment a->b nearest the origin (helper for the keep-out case)."""
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    t = -(ax * dx + ay * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    return (ax + dx * t, ay + dy * t)

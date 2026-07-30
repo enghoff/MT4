@@ -41,6 +41,10 @@ STEPS_PER_DEG: tuple[float, float, float, float] = (35.0, 35.0, 35.0, 45.0)
 # Enforced in jog firmware (g o / g c sweep); client only starts/stops sweep.
 GRIPPER_S_OPEN = 120
 GRIPPER_S_CLOSED = 285
+# Mirror firmware gripper.h GRIPPER_SWEEP_RATE: S units per second the
+# firmware's sweep state machine advances the servo. Full open->closed is
+# therefore (285-120)/120 = 1.375s, and a 20mm-cube grip (140->240) is 0.83s.
+GRIPPER_SWEEP_RATE_S_PER_S = 120
 
 # Shared jog / `mp` move step period (microseconds between DDA ticks).
 JOG_SPEED_MIN_US = 700
@@ -49,6 +53,22 @@ JOG_SPEED_MAX_US = 4000
 # Mirror firmware config.h MQ_QUEUE_CAPACITY: pending `mq` waypoints the
 # firmware holds behind the leg currently executing.
 MQ_QUEUE_CAPACITY = 8
+# Mirror firmware motion.cpp MQ_STATION_DWELL_MAX_MS: a grip station holds the
+# whole queue, so the firmware caps the settle it will honor.
+MQ_STATION_DWELL_MAX_MS = 5000
+
+
+def gripper_sweep_ms(from_s: int, to_s: int) -> float:
+    """Milliseconds the firmware's sweep takes to travel ``from_s``->``to_s``.
+
+    For host-side *timeout budgeting only* -- never as the authority on
+    whether a grip finished. A queued grip station waits on the firmware's
+    own sweep state machine (which knows exactly), and a standalone
+    ``Mt4Client.gripper()`` sleeps its own fixed settle; both are correct
+    without this. It exists so a queued path's timeout covers the time its
+    stations will spend gripping instead of tripping on them.
+    """
+    return abs(int(to_s) - int(from_s)) * 1000.0 / GRIPPER_SWEEP_RATE_S_PER_S
 
 
 @dataclass(frozen=True)

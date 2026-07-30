@@ -81,7 +81,7 @@
  *       Same "ok mp" / async "mp done pos ..." reply convention as `m`.
  *
  * Queued absolute move (multi-waypoint path, no per-waypoint round trip):
- *   mq <x> <y> <z> <j4|h|w> <g> [speed_us]
+ *   mq <x> <y> <z> <j4|h|w> <g> [speed_us] [dwell_ms]
  *       Same arguments/validation as `mp` (sentinel J4 modes included --
  *       for a queued leg they resolve when the leg is POPPED and planned,
  *       against wherever the previous leg actually ended, which is what
@@ -106,6 +106,22 @@
  *       behavior (retarget to the new target immediately) and drops
  *       whatever was still queued. The whole queue's completion reuses
  *       "mp done pos ...", same as a plain `mp`.
+ *
+ *       dwell_ms > 0 makes the entry a GRIP STATION rather than a leg: no
+ *       motion is planned, the gripper is driven to <g>, and the queue holds
+ *       until the sweep state machine reports done PLUS dwell_ms of
+ *       mechanical settle, then resumes itself. This is what lets an entire
+ *       pick-and-place be one queue. The per-leg <g> cannot do it: that
+ *       fires at leg *start* and sweeps while the arm is moving, whereas a
+ *       grasp needs the jaws to close after the descent, with the arm
+ *       stopped. A station's x/y/z must equal the pose the leg ahead of it
+ *       ended at (checked, "err mq station pose want ... at ..."), so a host
+ *       that queued against a pose the arm never reached fails loudly
+ *       instead of gripping in the wrong place; dwell is capped
+ *       ("err mq dwell 0-N") because a station holds the whole queue. A
+ *       station with <g> 0 is a pure timed pause. `?` shows HOLD=sweep or
+ *       HOLD=settle while one is pending. `mp` rejects a nonzero dwell
+ *       ("err mp dwell (use mq)") -- a lone move has nothing to hold back.
  *
  *   home [j1 j2]    widen J2/J3 off their min-angle extremes, home J1 (seek
  *                     I21, return to center), seek J2 to its raw I20
@@ -169,4 +185,8 @@ void loop() {
   gripperSweepTick();
   refresh_cartesian_jog_if_due();
   motion_poll_move_done();
+  /* After gripperSweepTick() and motion_poll_move_done(), so a station armed
+   * this same pass sees the sweep's own state, and so the leg ahead of it has
+   * already been retired. */
+  motion_poll_mq_hold();
 }

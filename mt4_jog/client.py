@@ -17,6 +17,8 @@ from mt4_jog.joints import (
     JOG_SPEED_MAX_US,
     JOG_SPEED_MIN_US,
     MQ_QUEUE_CAPACITY,
+    MQ_STATION_DWELL_MAX_MS,
+    gripper_sweep_ms,
 )
 from mt4_jog.serial import (
     FirmwareNotReadyError,
@@ -85,6 +87,39 @@ def _j4_wire_token(j4: float | str | None) -> str:
             f"j4 must be a number, None, 'hold', or 'wrist' (got {j4!r})"
         )
     return f"{float(j4):.2f}"
+
+
+def mq_wire_cmd(
+    x: float,
+    y: float,
+    z: float,
+    j4_token: str,
+    grip: int = 0,
+    speed_us: int = 0,
+    dwell_ms: int = 0,
+) -> str:
+    """One `mq` command line. Single source of the wire form.
+
+    Positional fields (see the `mq` protocol doc in
+    firmware/mt4_jog/src/main.cpp), so a nonzero ``dwell_ms`` forces an
+    explicit speed slot even when there is no speed override -- otherwise the
+    firmware would read the dwell as a step period. Speed is irrelevant to a
+    station anyway: it plans no motion.
+
+    Coordinates are printed at the firmware's own 0.1mm/0.1deg reporting
+    precision, not full float repr, because the firmware's line buffer is 64
+    bytes and a truncated line fails to parse (raised here rather than sent).
+    """
+    cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(grip)}"
+    if speed_us or dwell_ms:
+        cmd += f" {int(speed_us)}"
+    if dwell_ms:
+        cmd += f" {int(dwell_ms)}"
+    if len(cmd) >= 64:
+        raise Mt4ClientError(
+            f"mq command exceeds 64-byte firmware line buffer: {cmd!r}"
+        )
+    return cmd
 
 
 def _per_waypoint(value: object, n: int, name: str) -> list:
@@ -522,8 +557,9 @@ class Mt4Client:
         self,
         waypoints: list[tuple[float, float, float]],
         j4: float | str | None | list[float | str | None] = None,
-        grip: int = 0,
+        grip: int | list[int] = 0,
         speed_us: int | list[int] = 0,
+        dwell_ms: int | list[int] = 0,
         timeout: float = MOVE_TIMEOUT_S,
     ) -> dict[str, object]:
         """Move through a sequence of Cartesian waypoints as one continuous
@@ -571,10 +607,28 @@ class Mt4Client:
         unchanged); each list entry must be 0 or within
         [JOG_SPEED_MIN_US, JOG_SPEED_MAX_US].
 
-        `grip` (if nonzero) fires on the FIRST leg only, matching a single
-        `move_to()` call's semantics -- for a gripper action partway through
-        a route, call `gripper()` directly between `move_path()` calls
-        rather than threading it through here.
+        A scalar `grip` (if nonzero) fires on the FIRST leg only, matching a
+        single `move_to()` call's semantics -- note this is deliberately NOT
+        the broadcast-to-every-leg rule `j4`/`speed_us` follow, since
+        re-commanding the same grip on every leg would be meaningless. Pass a
+        per-waypoint LIST to place grips mid-route.
+
+        `dwell_ms` (per-waypoint list, or a scalar broadcast) turns a waypoint
+        into a firmware GRIP STATION: no motion, the gripper is driven to that
+        leg's `grip`, and the queue holds until the sweep completes plus
+        dwell_ms of settle. That is what makes a whole pick-and-place one
+        queue. A leg's own `grip` is not enough for a grasp: firmware fires it
+        at leg *start* and sweeps while the arm moves, whereas the jaws must
+        close after the descent with the arm stopped. A station's xyz must
+        equal the previous waypoint's target (firmware checks, and answers
+        "err mq station pose" otherwise), so build stations by repeating the
+        preceding position.
+
+        `timeout` is extended by each station's worst-case sweep (a full
+        GRIPPER_S_OPEN..GRIPPER_S_CLOSED travel) plus its dwell, so a path
+        does not time out on time the firmware is legitimately spending on the
+        gripper. The worst case is used rather than the actual S delta because
+        that would need a `?` probe, which this method exists to avoid.
         """
         if not waypoints:
             raise Mt4ClientError("move_path: at least one waypoint is required")
@@ -591,15 +645,37 @@ class Mt4Client:
                 raise Mt4ClientError(
                     f"speed_us must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US} (got {s})"
                 )
-        if grip and not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
-            raise Mt4ClientError(
-                f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
-            )
+        # A scalar grip means "first leg only" (move_to's semantics), NOT
+        # broadcast -- see the docstring. A list is explicitly per-leg.
+        if isinstance(grip, (list, tuple)):
+            grips = _per_waypoint(grip, len(waypoints), "grip")
+        else:
+            grips = [int(grip)] + [0] * (len(waypoints) - 1)
+        for g in grips:
+            if g and not GRIPPER_S_OPEN <= g <= GRIPPER_S_CLOSED:
+                raise Mt4ClientError(
+                    f"grip must be 0 (unchanged) or "
+                    f"{GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED} (got {g})"
+                )
+        dwells = [int(d) for d in _per_waypoint(dwell_ms, len(waypoints), "dwell_ms")]
+        for d in dwells:
+            if d < 0 or d > MQ_STATION_DWELL_MAX_MS:
+                raise Mt4ClientError(
+                    f"dwell_ms must be 0-{MQ_STATION_DWELL_MAX_MS} (got {d})"
+                )
         for x, y, z in waypoints:
             if z < GROUND_Z_MM - 0.05:
                 raise Mt4ClientError(
                     f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
                 )
+        # Each station spends real time on the gripper that no leg accounts
+        # for. Budget the worst-case sweep rather than the true S delta, which
+        # would cost the `?` probe this method exists to avoid.
+        station_budget_s = sum(
+            (gripper_sweep_ms(GRIPPER_S_OPEN, GRIPPER_S_CLOSED) + d) / 1000.0
+            for d in dwells
+            if d > 0
+        )
 
         j4_tokens = [
             _j4_wire_token(v) for v in _per_waypoint(j4, len(waypoints), "j4")
@@ -607,7 +683,10 @@ class Mt4Client:
 
         self._notify_trajectory(waypoints, multi=True)
         try:
-            return self._move_path_locked(waypoints, j4_tokens, grip, speeds, timeout)
+            return self._move_path_locked(
+                waypoints, j4_tokens, grips, speeds, dwells,
+                timeout + station_budget_s,
+            )
         finally:
             self._clear_trajectory()
 
@@ -615,22 +694,18 @@ class Mt4Client:
         self,
         waypoints: list[tuple[float, float, float]],
         j4_tokens: list[str],
-        grip: int,
+        grips: list[int],
         speeds: list[int],
+        dwells: list[int],
         timeout: float,
     ) -> dict[str, object]:
         with self._lock:
             self._ensure_connected_unlocked()
 
             def build_cmd(i: int, x: float, y: float, z: float, g: int) -> str:
-                cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_tokens[i]} {int(g)}"
-                if speeds[i]:
-                    cmd += f" {int(speeds[i])}"
-                if len(cmd) >= 64:
-                    raise Mt4ClientError(
-                        f"mq command exceeds 64-byte firmware line buffer: {cmd!r}"
-                    )
-                return cmd
+                return mq_wire_cmd(
+                    x, y, z, j4_tokens[i], g, speeds[i], dwells[i]
+                )
 
             collected: list[str] = []
             cold_starts = 0
@@ -680,7 +755,7 @@ class Mt4Client:
                 return {"ok": False, "error": error, "lines": collected}
 
             for i, (x, y, z) in enumerate(waypoints):
-                cmd = build_cmd(i, x, y, z, grip if i == 0 else 0)
+                cmd = build_cmd(i, x, y, z, grips[i])
                 batch = self._send_and_collect(cmd, wait=0.5)
                 collected.extend(batch)
                 err = scan(batch)
@@ -743,11 +818,17 @@ class Mt4Client:
         j4: float | str | None = None,
         grip: int = 0,
         speed_us: int = 0,
+        dwell_ms: int = 0,
     ) -> dict[str, object]:
         """Enqueue one Cartesian waypoint (`mq`) without waiting for it (or
         anything queued ahead of it) to finish -- the raw primitive
         `move_path()` is built on. Returns as soon as the firmware acks
         ("ok mq" / "ok mq queued N" / "err ...").
+
+        `dwell_ms` > 0 enqueues a GRIP STATION instead of a leg: no motion,
+        the gripper is driven to `grip`, and the queue holds until the sweep
+        finishes plus that settle. Its x/y/z must be the pose the leg ahead of
+        it ends at. See `move_path()` for the full contract.
 
         `j4` accepts the same field as `move_to()`: a world yaw in degrees,
         or None/"hold"/"wrist" -- sentinels the firmware resolves when the
@@ -773,6 +854,10 @@ class Mt4Client:
             raise Mt4ClientError(
                 f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
             )
+        if dwell_ms < 0 or dwell_ms > MQ_STATION_DWELL_MAX_MS:
+            raise Mt4ClientError(
+                f"dwell_ms must be 0-{MQ_STATION_DWELL_MAX_MS} (got {dwell_ms})"
+            )
         if z < GROUND_Z_MM - 0.05:
             raise Mt4ClientError(
                 f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
@@ -781,13 +866,7 @@ class Mt4Client:
 
         with self._lock:
             self._ensure_connected_unlocked()
-            cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(grip)}"
-            if speed_us:
-                cmd += f" {int(speed_us)}"
-            if len(cmd) >= 64:
-                raise Mt4ClientError(
-                    f"mq command exceeds 64-byte firmware line buffer: {cmd!r}"
-                )
+            cmd = mq_wire_cmd(x, y, z, j4_token, grip, speed_us, dwell_ms)
             lines = self._send_and_collect(cmd, wait=0.5)
             for line in lines:
                 if line.startswith("err"):

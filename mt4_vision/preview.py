@@ -389,3 +389,59 @@ class LiveFeed:
             self._recorder.close()
         if self._live_preview is not None:
             self._live_preview.close()
+
+
+# Pointing overlay palette: a grid that reads clearly without competing with
+# the desk, and entity ids in the same white as CUBE_BGR.
+GRID_BGR = (90, 200, 255)
+ENTITY_BGR = (255, 255, 255)
+ENTITY_BLOCKED_BGR = (120, 120, 120)
+POINTING_GRID_PX = 100
+
+
+def annotate_for_pointing(
+    frame: np.ndarray,
+    entities: list | None = None,
+    *,
+    grid_px: int = POINTING_GRID_PX,
+) -> np.ndarray:
+    """Frame with a labelled pixel grid and any known entity ids drawn on it.
+
+    Built for handing a frame to a vision-capable model and asking "which pixel
+    is the pen". The grid is the point: a model reading coordinates off drawn,
+    numbered gridlines is self-correcting about the coordinate space, whereas one
+    estimating them from the image alone can be confidently off by a wide margin
+    and there is no way to tell from the answer. Drawing the ids of what is
+    already detected does the other half -- it stops the model pointing at a cube
+    the entity table already covers.
+
+    ``entities`` is any sequence of objects with ``id``, ``pixel`` and
+    ``pickable`` (i.e. ``mt4_vision.entities.Entity``); entities without a pixel
+    (open slots) are skipped. Kept duck-typed so preview does not depend on the
+    entity layer.
+    """
+    out = frame.copy()
+    h, w = out.shape[:2]
+
+    # Grid first, so labels and ids sit on top of it.
+    for x in range(grid_px, w, grid_px):
+        cv2.line(out, (x, 0), (x, h), GRID_BGR, 1)
+        draw_outlined_text(out, str(x), (x + 3, 14), scale=0.4, color=GRID_BGR)
+    for y in range(grid_px, h, grid_px):
+        cv2.line(out, (0, y), (w, y), GRID_BGR, 1)
+        draw_outlined_text(out, str(y), (3, y - 3), scale=0.4, color=GRID_BGR)
+    draw_outlined_text(
+        out, f"{w}x{h}  grid {grid_px}px", (3, h - 8), scale=0.45, color=GRID_BGR
+    )
+
+    for ent in entities or []:
+        pixel = getattr(ent, "pixel", None)
+        if pixel is None:
+            continue
+        color = ENTITY_BGR if getattr(ent, "pickable", False) else ENTITY_BLOCKED_BGR
+        px, py = int(pixel[0]), int(pixel[1])
+        cv2.circle(out, (px, py), 9, color, 2)
+        draw_outlined_text(
+            out, str(getattr(ent, "id", "?")), (px + 12, py + 4), scale=0.5, color=color
+        )
+    return out
