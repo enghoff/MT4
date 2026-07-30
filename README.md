@@ -464,7 +464,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md) | Assumption audit for pick/place/stacking accuracy — what each layer relies on, how well it's known, and where accuracy actually leaks |
 | [docs/OAUTH_CHATGPT.md](docs/OAUTH_CHATGPT.md) | OAuth 2.1 via Google + ngrok for public MCP access |
 | [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md) | Grounding DINO server setup: GPU-host install, WSL2 prerequisites, systemd unit, SSH tunnel, HTTP API, troubleshooting |
-| [services/grounding_dino/README.md](services/grounding_dino/README.md) | Grounding DINO service cheat sheet (status, re-deploy, tunnel) |
+| [services/grounding_dino/README.md](services/grounding_dino/README.md) | What the deployed service files are, and the day-to-day detect commands |
 | [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf) | Printable marker sheet (DICT_4X4_50) |
 | [firmware/mt4_jog/src/main.cpp](firmware/mt4_jog/src/main.cpp) | Full serial protocol reference (header comment) |
 | [CLAUDE.md](CLAUDE.md) | Agent instructions: hardware autonomy, primary tools, typical failure patterns |

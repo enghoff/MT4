@@ -292,6 +292,6 @@ DINO service.
 
 ## See also
 
-- [services/grounding_dino/README.md](../services/grounding_dino/README.md) — the short operational cheat sheet
+- [services/grounding_dino/README.md](../services/grounding_dino/README.md) — what each deployed file is, plus the day-to-day detect commands
 - [README.md § Open-vocabulary objects](../README.md#open-vocabulary-objects) — how `obj_N` entities fit the wider stack
 - [docs/CALIBRATION.md](CALIBRATION.md) — the measurement layers a DINO box feeds into
