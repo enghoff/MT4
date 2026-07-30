@@ -269,6 +269,134 @@ def refine_at_hint(
     return got
 
 
+# GrabCut: detector AABB is probable FG; a small centre disc is sure FG so the
+# GMM has a colour sample. Marking the box border as sure BG looks tempting for
+# loose boxes but eats thin rotated objects whose tips sit in that border.
+GRABCUT_ITERS = 5
+GRABCUT_MARGIN_PX = 32  # desk context around the box for the GMM
+GRABCUT_SURE_FG_RADIUS_PX = 10
+GRABCUT_MIN_AREA_FRAC = 0.02  # refuse if FG is tiny vs the box
+
+
+def _clip_box(
+    frame: np.ndarray, x1: float, y1: float, x2: float, y2: float
+) -> tuple[int, int, int, int] | None:
+    h, w = frame.shape[:2]
+    xa, xb = sorted((int(math.floor(x1)), int(math.ceil(x2))))
+    ya, yb = sorted((int(math.floor(y1)), int(math.ceil(y2))))
+    xa = max(0, min(xa, w - 1))
+    xb = max(0, min(xb, w))
+    ya = max(0, min(ya, h - 1))
+    yb = max(0, min(yb, h))
+    if xb - xa < 4 or yb - ya < 4:
+        return None
+    return xa, ya, xb, yb
+
+
+def _segment_grabcut(
+    frame: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    exclude: np.ndarray | None = None,
+    *,
+    iters: int = GRABCUT_ITERS,
+    margin_px: int = GRABCUT_MARGIN_PX,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """Foreground mask from a detector AABB via GrabCut.
+
+    The box is a strong prior from Grounding DINO; GrabCut turns it into a
+    silhouette that desk-deviation segmentation often cannot find (low contrast,
+    textured objects, soft shadows). Marker paper is forced to sure background.
+    """
+    clipped = _clip_box(frame, x1, y1, x2, y2)
+    if clipped is None:
+        return None
+    bx0, by0, bx1, by1 = clipped
+    h, w = frame.shape[:2]
+    # Crop with margin so GrabCut sees real desk outside the box.
+    cx0 = max(0, bx0 - margin_px)
+    cy0 = max(0, by0 - margin_px)
+    cx1 = min(w, bx1 + margin_px)
+    cy1 = min(h, by1 + margin_px)
+    crop = np.ascontiguousarray(frame[cy0:cy1, cx0:cx1])
+    if crop.size == 0 or min(crop.shape[:2]) < 8:
+        return None
+
+    lx0, ly0 = bx0 - cx0, by0 - cy0
+    lx1, ly1 = bx1 - cx0, by1 - cy0
+    bw, bh = lx1 - lx0, ly1 - ly0
+
+    gc = np.full(crop.shape[:2], cv2.GC_BGD, dtype=np.uint8)
+    gc[ly0:ly1, lx0:lx1] = cv2.GC_PR_FGD
+    # Seed sure FG at the box centre so GrabCut has an object colour sample
+    # even when most of a loose AABB is desk.
+    hx = max(0, min((lx0 + lx1) // 2, crop.shape[1] - 1))
+    hy = max(0, min((ly0 + ly1) // 2, crop.shape[0] - 1))
+    r = max(3, min(GRABCUT_SURE_FG_RADIUS_PX, bw // 4, bh // 4))
+    cv2.circle(gc, (hx, hy), r, int(cv2.GC_FGD), thickness=-1)
+
+    if exclude is not None:
+        ex = exclude[cy0:cy1, cx0:cx1]
+        if ex.shape[:2] == gc.shape:
+            gc[ex.astype(bool)] = cv2.GC_BGD
+
+    bgd = np.zeros((1, 65), np.float64)
+    fgd = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(crop, gc, None, bgd, fgd, iters, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return None
+
+    fg = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    # Keep only the component under the box centre (or nearest inside the box).
+    n, labels = cv2.connectedComponents(fg)
+    if n <= 1:
+        return None
+    want = int(labels[hy, hx])
+    if want == 0:
+        ys, xs = np.nonzero(labels)
+        if not len(ys):
+            return None
+        # Prefer components that overlap the detector box.
+        in_box = (
+            (xs >= lx0) & (xs < lx1) & (ys >= ly0) & (ys < ly1) & (labels[ys, xs] > 0)
+        )
+        if in_box.any():
+            ys, xs = ys[in_box], xs[in_box]
+        d2 = (ys - hy) ** 2 + (xs - hx) ** 2
+        i = int(d2.argmin())
+        want = int(labels[ys[i], xs[i]])
+    mask = (labels == want).astype(np.uint8)
+    area = int(mask.sum())
+    box_area = max(1, bw * bh)
+    if area < max(16, int(box_area * GRABCUT_MIN_AREA_FRAC)):
+        return None
+    return mask, (cx0, cy0, cx1, cy1)
+
+
+def refine_at_box(
+    frame: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    *,
+    exclude: np.ndarray | None = None,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """GrabCut mask for a detector AABB (preview / measure path)."""
+    got = _segment_grabcut(frame, x1, y1, x2, y2, exclude)
+    if got is None:
+        raise LocateError(
+            f"GrabCut found no foreground in box "
+            f"({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})"
+        )
+    return got
+
+
 def _rect_from_mask(
     mask: np.ndarray, origin: tuple[int, int]
 ) -> tuple[tuple[float, float], list[tuple[float, float]]]:
@@ -358,21 +486,19 @@ def _median_width_px(mask: np.ndarray, long_axis_deg_px: float) -> float:
     return float(np.median(nz)) if nz.size else 0.0
 
 
-def _measure_one(
+def _object_from_mask(
     frame: np.ndarray,
-    px: float,
-    py: float,
+    mask: np.ndarray,
+    origin: tuple[int, int],
     calib: Calibration,
-    win: int,
-    exclude: np.ndarray | None,
     object_height_mm: float | None,
-) -> tuple[LocatedObject, np.ndarray] | None:
-    """One window's measurement, or None if nothing could be segmented."""
-    got = _segment(frame, px, py, win, exclude)
-    if got is None:
+) -> LocatedObject | None:
+    """Geometry from a crop-local mask; None if the silhouette is degenerate."""
+    x0, y0 = origin
+    try:
+        centroid, corners = _rect_from_mask(mask, (x0, y0))
+    except LocateError:
         return None
-    mask, (x0, y0, _x1, _y1) = got
-    centroid, corners = _rect_from_mask(mask, (x0, y0))
     robot = [calib.pixel_to_robot(cx, cy, on_cube_top=False) for cx, cy in corners]
     cx, cy = calib.pixel_to_robot(centroid[0], centroid[1], on_cube_top=False)
 
@@ -422,7 +548,7 @@ def _measure_one(
         cx, cy = _unproject(calib, centroid[0], centroid[1], height / 2.0)
 
     th, tw = mask.shape[:2]
-    obj = LocatedObject(
+    return LocatedObject(
         label="",
         px=centroid[0],
         py=centroid[1],
@@ -436,6 +562,25 @@ def _measure_one(
         template=np.ascontiguousarray(frame[y0 : y0 + th, x0 : x0 + tw]),
         mask_area_px=float(mask.sum()),
     )
+
+
+def _measure_one(
+    frame: np.ndarray,
+    px: float,
+    py: float,
+    calib: Calibration,
+    win: int,
+    exclude: np.ndarray | None,
+    object_height_mm: float | None,
+) -> tuple[LocatedObject, np.ndarray] | None:
+    """One window's measurement, or None if nothing could be segmented."""
+    got = _segment(frame, px, py, win, exclude)
+    if got is None:
+        return None
+    mask, (x0, y0, _x1, _y1) = got
+    obj = _object_from_mask(frame, mask, (x0, y0), calib, object_height_mm)
+    if obj is None:
+        return None
     return obj, mask
 
 
@@ -625,6 +770,44 @@ def measure_box(
     )
 
 
+def measure_grabcut(
+    frame: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    calib: Calibration,
+    label: str,
+    *,
+    confidence: float = 1.0,
+    marker_xy: Sequence[tuple[float, float]] = (),
+    object_height_mm: float | None = None,
+) -> LocatedObject:
+    """Measure via GrabCut seeded by a detector AABB.
+
+    Tighter than ``measure_box`` (axis-aligned AABB) when the object contrasts
+    with the desk; still refuses on empty / flooded masks.
+    """
+    exclude = marker_paper_mask(frame, calib, marker_xy) if marker_xy else None
+    got = _segment_grabcut(frame, x1, y1, x2, y2, exclude)
+    if got is None:
+        raise LocateError(
+            f"GrabCut found no foreground in box "
+            f"({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})"
+        )
+    mask, (ox, oy, _x1, _y1) = got
+    obj = _object_from_mask(frame, mask, (ox, oy), calib, object_height_mm)
+    if obj is None:
+        raise LocateError("GrabCut mask produced a degenerate silhouette")
+    if not MIN_PLAUSIBLE_LONG_MM <= obj.long_mm <= MAX_PLAUSIBLE_LONG_MM:
+        raise LocateError(
+            f"GrabCut measured {obj.long_mm:.0f}x{obj.short_mm:.0f}mm, outside "
+            f"the plausible {MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm "
+            "range -- the mask has most likely flooded the desk"
+        )
+    return replace(obj, label=label, confidence=float(confidence))
+
+
 def measure_with_box_fallback(
     frame: np.ndarray,
     px: float,
@@ -638,7 +821,16 @@ def measure_with_box_fallback(
     marker_xy: Sequence[tuple[float, float]] = (),
     object_height_mm: float | None = None,
 ) -> LocatedObject:
-    """``measure`` at the hint; on failure, fall back to ``measure_box`` if given."""
+    """Prefer GrabCut from ``box``; else desk ``measure``; else raw ``measure_box``."""
+    if box is not None:
+        try:
+            return measure_grabcut(
+                frame, box[0], box[1], box[2], box[3], calib, label,
+                confidence=confidence, marker_xy=marker_xy,
+                object_height_mm=object_height_mm,
+            )
+        except LocateError:
+            pass
     try:
         return measure(
             frame, px, py, calib, label,

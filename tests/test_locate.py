@@ -314,6 +314,9 @@ def test_measure_falls_back_to_box_when_mask_is_unstable() -> None:
         )
 
     mod._measure_one = shifted
+    # Force GrabCut to fail so we exercise desk then final AABB fallback.
+    real_gc = mod._segment_grabcut
+    mod._segment_grabcut = lambda *a, **k: None
     try:
         # Mask path would refuse; box around the pen still yields a pose.
         half_l, half_s = PEN_LONG_PX / 2.0, PEN_SHORT_PX / 2.0
@@ -327,6 +330,88 @@ def test_measure_falls_back_to_box_when_mask_is_unstable() -> None:
         )
     finally:
         mod._measure_one = real
+        mod._segment_grabcut = real_gc
+    assert abs(obj.x - PEN_CX * MM_PER_PX) < 6.0
+    assert abs(obj.y - PEN_CY * MM_PER_PX) < 6.0
+
+
+def test_grabcut_measures_pen_from_loose_box() -> None:
+    """GrabCut turns a DINO-style AABB (of the rotated silhouette) into a mask."""
+    from mt4_vision.locate import measure_grabcut, refine_at_box
+
+    pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
+    pad = 12.0
+    box = (
+        float(pts[:, 0].min()) - pad,
+        float(pts[:, 1].min()) - pad,
+        float(pts[:, 0].max()) + pad,
+        float(pts[:, 1].max()) + pad,
+    )
+    mask, _origin = refine_at_box(pen_frame(), *box)
+    assert mask.sum() > 2000
+    # Mask should be tighter than the padded box area.
+    box_area = (box[2] - box[0]) * (box[3] - box[1])
+    assert mask.sum() < 0.7 * box_area
+
+    obj = measure_grabcut(pen_frame(), *box, CALIB, "pen", confidence=0.55)
+    assert abs(obj.x - PEN_CX * MM_PER_PX) < 8.0
+    assert abs(obj.y - PEN_CY * MM_PER_PX) < 8.0
+    assert obj.short_mm < 25.0
+    assert obj.confidence == 0.55
+
+
+def test_measure_prefers_grabcut_when_box_given() -> None:
+    """With a detector box, GrabCut runs first (desk measure is not needed)."""
+    from mt4_vision import locate as mod
+    from mt4_vision.locate import measure_with_box_fallback
+
+    real = mod.measure
+
+    def boom(*_a, **_k):
+        raise LocateError("desk path should not run when GrabCut succeeds")
+
+    pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
+    pad = 12.0
+    box = (
+        float(pts[:, 0].min()) - pad,
+        float(pts[:, 1].min()) - pad,
+        float(pts[:, 0].max()) + pad,
+        float(pts[:, 1].max()) + pad,
+    )
+    mod.measure = boom
+    try:
+        obj = measure_with_box_fallback(
+            pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", box=box,
+        )
+    finally:
+        mod.measure = real
+    assert abs(obj.x - PEN_CX * MM_PER_PX) < 8.0
+    assert abs(obj.y - PEN_CY * MM_PER_PX) < 8.0
+    box_area = (box[2] - box[0]) * (box[3] - box[1])
+    assert obj.mask_area_px < 0.7 * box_area
+
+
+def test_measure_falls_back_to_desk_when_grabcut_fails() -> None:
+    from mt4_vision import locate as mod
+    from mt4_vision.locate import measure_with_box_fallback
+
+    real_gc = mod._segment_grabcut
+    mod._segment_grabcut = lambda *a, **k: None
+    try:
+        pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
+        pad = 12.0
+        obj = measure_with_box_fallback(
+            pen_frame(), PEN_CX, PEN_CY, CALIB, "pen",
+            box=(
+                float(pts[:, 0].min()) - pad,
+                float(pts[:, 1].min()) - pad,
+                float(pts[:, 0].max()) + pad,
+                float(pts[:, 1].max()) + pad,
+            ),
+            win=PEN_WIN,
+        )
+    finally:
+        mod._segment_grabcut = real_gc
     assert abs(obj.x - PEN_CX * MM_PER_PX) < 6.0
     assert abs(obj.y - PEN_CY * MM_PER_PX) < 6.0
 

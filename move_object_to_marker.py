@@ -47,6 +47,7 @@ from mt4_vision.locate import (
     LocatedObject,
     grasp_feasibility,
     measure_with_box_fallback,
+    refine_at_box,
     refine_at_hint,
 )
 from mt4_vision.motion import Grasp, transfer
@@ -186,10 +187,14 @@ def _annotate_track(
     for i, d in enumerate(dets):
         color = (0, 255, 255) if i == 0 else (180, 180, 80)
         try:
-            mask, origin = refine_at_hint(frame, d.cx, d.cy)
+            mask, origin = refine_at_box(frame, d.x1, d.y1, d.x2, d.y2)
             _overlay_mask(out, mask, origin, color=color)
         except LocateError:
-            pass
+            try:
+                mask, origin = refine_at_hint(frame, d.cx, d.cy)
+                _overlay_mask(out, mask, origin, color=color)
+            except LocateError:
+                pass
         cv2.rectangle(
             out, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), color, 2,
         )
