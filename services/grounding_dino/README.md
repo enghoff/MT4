@@ -4,6 +4,10 @@ Open-vocabulary detector for the MT4 desk camera. Runs on the GPU host
 `media` (RTX 3070) and is reached from the MT4 Windows machine through an
 SSH local forward.
 
+Operational cheat sheet. Full setup — from-scratch install, WSL2
+prerequisites, systemd unit, HTTP API, troubleshooting — is in
+[docs/GROUNDING_DINO.md](../../docs/GROUNDING_DINO.md).
+
 ## On media
 
 ```bash
