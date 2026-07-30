@@ -172,7 +172,7 @@ def cmd_locate(args: argparse.Namespace) -> int:
 
 
 def cmd_grounding(args: argparse.Namespace) -> int:
-    """Open-vocab detect via Grounding DINO on media (SSH tunnel required)."""
+    """Open-vocab detect via the Grounding DINO service (MT4_GROUNDING_URL)."""
     from mt4_vision.grounding import GroundingError, detect, health
 
     try:
@@ -484,7 +484,7 @@ def main() -> None:
 
     p = sub.add_parser(
         "grounding",
-        help="open-vocab detect via Grounding DINO on media (needs SSH tunnel)",
+        help="open-vocab detect via the Grounding DINO service (MT4_GROUNDING_URL)",
     )
     p.add_argument("--prompt", required=True, help='e.g. "pen" or "pen. red cube."')
     p.add_argument("--label", default="", help="override label when --locate/--pick")

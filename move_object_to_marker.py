@@ -9,7 +9,8 @@ Repeatedly asks for an object description, then::
     motion.transfer         -> pick with 180° long-axis wrist, place on free marker
 
 While a prompt is active, a background thread re-runs DINO on fresh camera
-frames and updates the preview -- paced by detection latency (~0.3s on media).
+frames and updates the preview -- paced by detection latency (~0.3s against a
+CUDA service; slower on CPU).
 Re-parks after every transfer so the next planning capture is clear. Objects
 that cannot be segmented, are out of reach, fail grasp feasibility, or have no
 free marker are skipped. Loops until Ctrl+C / EOF.

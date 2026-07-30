@@ -1,8 +1,9 @@
-"""Client for the Grounding DINO service on media (via SSH tunnel).
+"""Client for the Grounding DINO service.
 
-The detector runs on the GPU host ``media`` and is reached at
-``MT4_GROUNDING_URL`` (default ``http://127.0.0.1:8765``), which should be an
-SSH local forward started with ``scripts/start_grounding_tunnel.ps1``.
+The detector is an HTTP service reached at ``MT4_GROUNDING_URL`` (default
+``http://127.0.0.1:8765``). It may run on this machine or on another host --
+if the latter and you reach it by SSH forward, see
+``scripts/start_grounding_tunnel.ps1``. Setup: ``docs/GROUNDING_DINO.md``.
 
 Boxes feed the existing locate path: take a box centre (or best interior
 point) and pass it to :func:`mt4_vision.locate.measure`.
@@ -62,7 +63,8 @@ def health(url: str = DEFAULT_URL, timeout: float = 5.0) -> dict:
     except urllib.error.URLError as exc:
         raise GroundingError(
             f"grounding service unreachable at {url} ({exc}); "
-            "start the tunnel: .\\scripts\\start_grounding_tunnel.ps1"
+            "start the service, or -- if it runs on another host reached by "
+            "SSH forward -- .\\scripts\\start_grounding_tunnel.ps1"
         ) from exc
 
 
@@ -114,7 +116,8 @@ def detect(
     except urllib.error.URLError as exc:
         raise GroundingError(
             f"grounding service unreachable at {url} ({exc}); "
-            "start the tunnel: .\\scripts\\start_grounding_tunnel.ps1"
+            "start the service, or -- if it runs on another host reached by "
+            "SSH forward -- .\\scripts\\start_grounding_tunnel.ps1"
         ) from exc
 
     if not payload.get("ok", True):

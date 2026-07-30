@@ -111,8 +111,8 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             "something the cube detector cannot see (a pen, a key). Call "
             "mt4_camera_view, read its pixel off the drawn grid, and register "
             "it with mt4_locate_at_pixel; then it has an id like the rest. "
-            "Alternatively mt4_locate_by_prompt runs Grounding DINO (via the "
-            "SSH tunnel to media) and registers the top hit the same way.\n\n"
+            "Alternatively mt4_locate_by_prompt runs Grounding DINO and "
+            "registers the top hit the same way.\n\n"
             "Do not substitute a target. When a referent cannot be resolved, "
             "or an entity reports pickable/placeable false, say so and quote "
             "the reason field -- the physical constraint it names (keep-out, "
@@ -459,12 +459,14 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         box_threshold: float = 0.35,
         text_threshold: float = 0.25,
     ) -> dict[str, Any]:
-        """Find an object by open-vocab text via Grounding DINO on media, then
-        register the top hit as `obj_N` the same way mt4_locate_at_pixel does.
+        """Find an object by open-vocab text via Grounding DINO, then register
+        the top hit as `obj_N` the same way mt4_locate_at_pixel does.
 
-        Requires the SSH tunnel to media (`scripts/start_grounding_tunnel.ps1`)
-        so `http://127.0.0.1:8765` reaches the GPU service. Prefer mt4_scene ids
-        for coloured cubes; use this for things HSV cannot name (pen, key, ...).
+        Requires the Grounding DINO service reachable at `MT4_GROUNDING_URL`
+        (default `http://127.0.0.1:8765`); if it runs on another host behind an
+        SSH forward, `scripts/start_grounding_tunnel.ps1` opens it. Prefer
+        mt4_scene ids for coloured cubes; use this for things HSV cannot name
+        (pen, key, ...).
 
         Args:
             prompt: What to look for, e.g. "pen" or "screwdriver".

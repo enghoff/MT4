@@ -1,7 +1,11 @@
-# SSH local forward to the Grounding DINO service on media.
+# SSH local forward to a Grounding DINO service running on another host.
 #
-# On media the service listens on 127.0.0.1:8765. This opens the same port on
-# this machine so mt4_vision.grounding (MT4_GROUNDING_URL) can reach it.
+# Only needed when the service is remote and bound to that host's loopback.
+# This opens the same port here so mt4_vision.grounding (MT4_GROUNDING_URL)
+# can reach it. If the service runs on this machine, you do not need this.
+#
+# The defaults below match the setup this was developed against -- override
+# -RemoteHost / -User / -IdentityFile for yours. See docs/GROUNDING_DINO.md.
 #
 # Usage:
 #   .\scripts\start_grounding_tunnel.ps1

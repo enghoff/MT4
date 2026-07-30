@@ -28,8 +28,9 @@ building a stack on a calibrated marker, with the live vision overlay
 - [PlatformIO](https://platformio.org/) + avrdude (only to flash firmware)
 - For vision: an overhead USB camera and printed ArUco markers
   (DICT_4X4_50; sheet in [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf))
-- Optional, for open-vocab grounding: a CUDA GPU host running the Grounding
-  DINO service (see [Open-vocabulary objects](#open-vocabulary-objects))
+- Optional, for open-vocab grounding: somewhere to run the Grounding DINO
+  service — a CUDA GPU on this machine or another host (CPU works, slowly).
+  See [Open-vocabulary objects](#open-vocabulary-objects)
 
 Serial ports auto-detect the CH340 USB-UART when `--port` / `MT4_SERIAL_PORT`
 are omitted (COM numbers often change after a re-plug). The camera is
@@ -206,19 +207,22 @@ registered as an `obj_N` entity in one of two ways:
 - **Text prompt** — Grounding DINO returns candidate boxes for a phrase, and
   the top hit goes through the same measurement path.
 
-The detector runs as a systemd service on a separate GPU host and is reached
-over an SSH local forward, so the MT4 machine needs no CUDA:
+The detector is an HTTP service you run wherever your GPU is — on this machine
+if it has one, or on another host reached over an SSH tunnel or a LAN bind (it
+also runs on CPU, slowly). The arm side only needs `MT4_GROUNDING_URL`
+(default `http://127.0.0.1:8765`):
 
 ```powershell
-.\scripts\start_grounding_tunnel.ps1          # leave running
 python -m mt4_vision grounding --prompt "pen" --locate
 ```
 
-Model `IDEA-Research/grounding-dino-base`; service URL via
-`MT4_GROUNDING_URL` (default `http://127.0.0.1:8765`). Full server setup:
-[docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md); re-deploy cheat sheet:
-[services/grounding_dino/README.md](services/grounding_dino/README.md).
-Everything else in this repo works without it.
+If the service is on another host and you tunnel to it, open the forward first
+and leave it running — `.\scripts\start_grounding_tunnel.ps1` does that.
+
+Model `IDEA-Research/grounding-dino-base`. Full server setup — install,
+supervision, remote access, HTTP API, troubleshooting:
+[docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md). Everything else in this repo
+works without it.
 
 ## MCP server
 
