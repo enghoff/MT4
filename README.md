@@ -460,6 +460,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 |-----|----------|
 | [docs/CALIBRATION.md](docs/CALIBRATION.md) | Step-by-step calibration guide: the five layers, each script's procedure and output, re-calibration decision matrix, troubleshooting, field reference |
 | [docs/MT4_ARCHITECTURE.md](docs/MT4_ARCHITECTURE.md) | Hardware and pin-map reference, ATmega2560 flash path |
+| [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md) | Assumption audit for pick/place/stacking accuracy — what each layer relies on, how well it's known, and where accuracy actually leaks |
 | [docs/OAUTH_CHATGPT.md](docs/OAUTH_CHATGPT.md) | OAuth 2.1 via Google + ngrok for public MCP access |
 | [services/grounding_dino/README.md](services/grounding_dino/README.md) | Grounding DINO service deployment and tunnel |
 | [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf) | Printable marker sheet (DICT_4X4_50) |

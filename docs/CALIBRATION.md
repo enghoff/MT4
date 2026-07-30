@@ -85,7 +85,9 @@ This is why layer 3 exists as its own measurement.
 
 The residual error at large ±Y is lens **barrel distortion**, which a single
 radial model cannot express and nothing in this pipeline undistorts. A real fix
-would need `cv2.calibrateCamera` intrinsics plus an undistort pass.
+would need `cv2.calibrateCamera` intrinsics plus an undistort pass. Full detail,
+including which rows of the older top-down analysis this superseded, is in
+[ASSUMPTIONS.md](ASSUMPTIONS.md) section B.
 
 ---
 
@@ -660,6 +662,7 @@ suspecting the arm.
 
 | Doc | Contents |
 |-----|----------|
+| [ASSUMPTIONS.md](ASSUMPTIONS.md) | Every assumption the accuracy chain rests on, how well each is known, and where error actually leaks. Section B covers camera geometry |
 | [MT4_ARCHITECTURE.md](MT4_ARCHITECTURE.md) | Hardware, pin map, flash path |
 | [mt4_vision/calib.py](../mt4_vision/calib.py) | The `Calibration` dataclass and the transform functions |
 | [mt4_vision/table_fit.py](../mt4_vision/table_fit.py) | The bundle + similarity fit, and why it is not one least-squares call |
