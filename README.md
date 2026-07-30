@@ -87,8 +87,9 @@ Top-level scripts, each driving the arm end to end:
 An overhead USB camera watches the work surface, which carries ArUco markers.
 A one-time calibration maps camera pixels to robot-frame XY on the table plane
 — no camera intrinsics needed. Despite the name, the camera is **steeply
-oblique** on this rig (nadir far off-desk), so height parallax is modelled
-radially from a measured nadir; see [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
+oblique** on this rig (measured nadir ≈ (518, −35) robot, lens ≈ 244 mm up), so
+height parallax is modelled radially from that nadir and grows with height —
+see [docs/CALIBRATION.md](docs/CALIBRATION.md).
 
 ### Entity model
 
@@ -118,6 +119,9 @@ python -m mt4_vision entities
 ```
 
 ### Calibration
+
+Step-by-step guide, including how to read each fit report and what invalidates
+what: **[docs/CALIBRATION.md](docs/CALIBRATION.md)**.
 
 ```powershell
 python -m mt4_vision markers        # verify the markers are seen
@@ -157,14 +161,21 @@ markers:
 
 ```powershell
 python recalibrate_camera.py
-python calibrate_height.py    # refit cube-top map (cleared by recalibrate)
+python calibrate_height.py          # cube-top map (cleared by recalibrate)
+python calibrate_camera_nadir.py    # camera pose (cleared by recalibrate)
 ```
 
 Calibration lands in `vision_calibration.json` (table transform, `table_z` /
 `safe_z`, gripper S values, cube-top homography, camera nadir + height, HSV
-overrides — tuning fields carry over when re-calibrating). Cubes are detected
-by HSV threshold inside the marker quadrilateral; detections outside it (the
-arm's own orange body, off-desk clutter) are rejected.
+overrides). Steps 3–5 are **not optional after step 2**: a fresh
+`calibrate_vision.py` run clears the cube-top map, camera pose, and colour
+offsets, and nothing downstream fails when they are missing — cube picks just
+silently regain 15–30 mm of parallax error. See
+[docs/CALIBRATION.md](docs/CALIBRATION.md#what-each-entry-point-preserves) for
+the full preserve/clear matrix.
+
+Cubes are detected by HSV threshold inside the marker quadrilateral; detections
+outside it (the arm's own orange body, off-desk clutter) are rejected.
 
 ### CLI
 
@@ -447,10 +458,9 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 
 | Doc | Contents |
 |-----|----------|
+| [docs/CALIBRATION.md](docs/CALIBRATION.md) | Step-by-step calibration guide: the five layers, each script's procedure and output, re-calibration decision matrix, troubleshooting, field reference |
 | [docs/MT4_ARCHITECTURE.md](docs/MT4_ARCHITECTURE.md) | Hardware and pin-map reference, ATmega2560 flash path |
-| [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md) | Assumption audit for pick/place/stacking accuracy — what each layer relies on, how well it's known, and where accuracy actually leaks |
 | [docs/OAUTH_CHATGPT.md](docs/OAUTH_CHATGPT.md) | OAuth 2.1 via Google + ngrok for public MCP access |
-| [docs/SORT_OCCUPANCY_REQUIREMENTS.md](docs/SORT_OCCUPANCY_REQUIREMENTS.md) | Spec for the (unimplemented) sort-into-rows shuffle behavior |
 | [services/grounding_dino/README.md](services/grounding_dino/README.md) | Grounding DINO service deployment and tunnel |
 | [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf) | Printable marker sheet (DICT_4X4_50) |
 | [firmware/mt4_jog/src/main.cpp](firmware/mt4_jog/src/main.cpp) | Full serial protocol reference (header comment) |
