@@ -44,6 +44,7 @@ from mt4_vision.detect import CubeDetection
 
 # _travel/_approach/_check are pickplace's single-segment movers; the stack
 # executor below sequences them along StackPlanner routes.
+from mt4_vision.motion import plan_route_legs, send_legs, station
 from mt4_vision.pickplace import (
     CAMERA_PARK_X,
     CAMERA_PARK_Y,
@@ -567,9 +568,9 @@ def place_on_stack(
 
     1. carry: vertical lift to ``safe_z``, then routed (usually one diagonal
        ``mp``) to a stage point STAGE_OFFSET_MM beside the stack, arriving at
-       hover height -- lift + route + hop + descend all one queued mq
-    2. hop over the stack top at hover, slow descend, release
-    3. retreat: lift free when the z ceiling allows the fingertips above
+       hover height -- lift + route + hop + descend + release station all
+       one queued mq
+    2. retreat: lift free when the z ceiling allows the fingertips above
        the placed cube (levels <= ~8), else lift a few mm and slide out
        perpendicular to the jaw axis so the open fingers sweep off the
        cube faces without pushing it (level 9's only option)
@@ -593,21 +594,24 @@ def place_on_stack(
     # Lift the just-gripped cube straight up to safe_z (``lift_to``, held at
     # wrist so the gripped orientation is preserved -- a no-op if already
     # high), route to the stage point beside the column, hop horizontally
-    # over the stack top to (sx, sy), then descend to release height -- lift +
-    # route + hop + descend all one queued mq, so there's no stop/settle
-    # after the grip, at the stage point, OR at hover over the stack. The
-    # vertical lift stays clear of pick-site neighbours (route()'s safety
-    # model covers the column, not the table); the hop clears the column by
+    # over the stack top to (sx, sy), descend to release height, then open
+    # as a firmware station -- lift + route + hop + descend + release all
+    # one queued mq, so there's no stop/settle after the grip, at the stage
+    # point, at hover, OR for a host-side gripper round trip. The vertical
+    # lift stays clear of pick-site neighbours (route()'s safety model
+    # covers the column, not the table); the hop clears the column by
     # construction (hz = hover height, fingers above the top cube); the
     # descend is a pure vertical drop down the column axis to rz, run slow
-    # (approach speed) like the old standalone _approach so the cube seats at
-    # the same speed.
-    routed_travel(
-        client, calib, planner, stage[0], stage[1], hz, built,
+    # (approach speed) like the old standalone _approach so the cube seats
+    # at the same speed.
+    legs = plan_route_legs(
+        calib, planner, (float(tcp.x), float(tcp.y), float(tcp.z)),
+        stage[0], stage[1], hz, built,
         j4=j4, lift_to=calib.safe_z, then=[(sx, sy, hz)], descend=(sx, sy, rz),
         step=f"level {level} carry+seat",
     )
-    _check(client.gripper(calib.grip_open_s), "stack release")
+    legs.append(station((sx, sy, rz), int(calib.grip_open_s), j4=j4))
+    send_legs(client, legs, step=f"level {level} carry+seat")
     fz = planner.free_retreat_z(level)
     if fz is not None:
         # Retreat AND transit to the camera park in one queued mq: lift

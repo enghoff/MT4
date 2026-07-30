@@ -39,11 +39,12 @@ from jog import console_focused, flush_console_input, key_down
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibration
 from mt4_vision.camera import FrameStream, capture_frame
+from dataclasses import replace
+
+from mt4_vision.motion import Leg, barrier, plan_route_legs, send_legs, station
 from mt4_vision.pickplace import (
     CAMERA_PARK_X,
     CAMERA_PARK_Y,
-    _approach,
-    _travel,
     ensure_homed,
     go_camera_park,
     home_arm,
@@ -266,10 +267,11 @@ def pick_from_stack(
     the column at the same clearance height that cube was placed at,
     descend to the same grip line stack_cubes.py used to seat it
     (``grip_top_z(level - 1)`` -- identical to a table ``table_z`` grip shifted
-    up by the cubes still below it), close the gripper, then lift straight
-    back out along the column axis before transiting away. Column obstacle
+    up by the cubes still below it), close as a firmware station, then lift
+    straight back out along the column axis before exiting. Column obstacle
     height is ``level`` (this cube hasn't left yet) for the approach and
-    grasp, dropping to ``level - 1`` once it's lifted clear.
+    grasp, dropping to ``level - 1`` once it's lifted clear. The whole
+    approach → barrier → descend → close → lift → exit is one `mq` queue.
     """
     sx, sy = planner.sx, planner.sy
     ensure_homed(client)
@@ -281,24 +283,39 @@ def pick_from_stack(
     tcp = client.get_tcp()
     if tcp is None:
         raise Mt4ClientError("stack pick: could not read TCP")
-    stage = planner.stage_point(hz, level, prefer_xy=(float(tcp.x), float(tcp.y)))
+    start = (float(tcp.x), float(tcp.y), float(tcp.z))
+    stage = planner.stage_point(hz, level, prefer_xy=start[:2])
     if stage is None:
         raise Mt4ClientError(f"level {level}: no reachable hover stage")
-    client.gripper(calib.grip_open_s)
-    routed_travel(
-        client, calib, planner, stage[0], stage[1], hz, level,
-        j4=j4, step=f"level {level} approach",
+    # Same shape as motion.plan_pick_legs, but column-routed: open on the
+    # first transit leg, barrier at hover before the slow descend, close
+    # station at grip height, lift clear, optional exit hop -- one mq, no
+    # blocking gripper round trips.
+    legs = plan_route_legs(
+        calib, planner, start, stage[0], stage[1], hz, level,
+        j4=j4, then=[(sx, sy, hz)], descend=(sx, sy, grip_z),
+        step=f"level {level} approach",
     )
-    _travel(client, calib, sx, sy, hz, "hover over stack", j4=j4)
-    _approach(client, calib, sx, sy, grip_z, "descend to stack grip", j4=j4)
-    result = client.gripper(calib.grip_close_s)
-    if not result.get("ok"):
-        _travel(client, calib, sx, sy, hz, "lift after failed grip")
-        raise Mt4ClientError(f"stack gripper close failed: {result}")
-    _travel(client, calib, sx, sy, hz, "lift clear of stack", j4=j4)
+    if legs:
+        legs[0] = replace(legs[0], grip=int(calib.grip_open_s))
+        legs.insert(-1, barrier((sx, sy, hz), j4=j4))
+    else:
+        legs = [station((sx, sy, grip_z), int(calib.grip_open_s), j4=j4)]
+    legs.append(
+        station((sx, sy, grip_z), int(calib.grip_close_s), j4=j4)
+    )
+    legs.append(
+        Leg(sx, sy, hz, j4=j4, speed_us=int(calib.travel_speed_us))
+    )
     exit_pt = planner.stage_point(hz, level - 1, prefer_xy=approach_prefer_xy)
     if exit_pt is not None:
-        _travel(client, calib, exit_pt[0], exit_pt[1], hz, "exit stack hover", j4=j4)
+        legs.append(
+            Leg(
+                exit_pt[0], exit_pt[1], hz,
+                j4=j4, speed_us=int(calib.travel_speed_us),
+            )
+        )
+    send_legs(client, legs, step=f"level {level} pick")
 
 
 def main() -> int:

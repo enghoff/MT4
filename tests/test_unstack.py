@@ -134,3 +134,85 @@ def test_pick_grip_height_matches_stack_release_line():
     for level in (1, 2, 3):
         grip_z = planner.grip_top_z(level - 1)
         assert abs(grip_z - (release_z_for_level(calib, level) - 4.0)) < 1e-9
+
+
+def test_pick_from_stack_queues_open_barrier_and_close():
+    """Approach opens on the first transit leg, barriers at hover, closes
+    as a station at grip height -- no blocking client.gripper() calls."""
+    from types import SimpleNamespace
+
+    from mt4_vision.motion import BARRIER_DWELL_MS
+    from mt4_vision.stackpath import StackPlanner
+    from unstack_cubes import pick_from_stack
+
+    calib, _markers, site = _calib_and_markers()
+    # Live calib already has grip_open_s / grip_close_s; pin speeds the
+    # FakeClient's move_path recording expects from send_legs.
+    planner = StackPlanner(calib, site.x, site.y)
+    grip_z = planner.grip_top_z(0)
+    hz = planner.hover_z(1)
+    assert hz is not None
+
+    class _Tcp:
+        def __init__(self):
+            self.x, self.y, self.z, self.j4 = 200.0, 0.0, float(calib.safe_z), 0.0
+
+    class _Client:
+        def __init__(self):
+            self._tcp = _Tcp()
+            self.calls = []
+            self.gripper_calls = []
+
+        def get_tcp(self):
+            return self._tcp
+
+        def get_status(self):
+            return SimpleNamespace(homed=True, joints={"j4": 0})
+
+        def gripper(self, action):
+            self.gripper_calls.append(action)
+            return {"ok": True}
+
+        def move_path(self, waypoints, j4=None, grip=0, speed_us=0, dwell_ms=0, **kw):
+            n = len(waypoints)
+
+            def spread(v):
+                return list(v) if isinstance(v, (list, tuple)) else [v] * n
+
+            self.calls.append(
+                {
+                    "wps": list(waypoints),
+                    "grips": list(grip) if isinstance(grip, (list, tuple))
+                    else [grip] + [0] * (n - 1),
+                    "dwells": spread(dwell_ms),
+                    "speeds": spread(speed_us),
+                }
+            )
+            return {"ok": True}
+
+    client = _Client()
+    pick_from_stack(
+        client, calib, planner, 1, approach_prefer_xy=(200.0, 0.0),
+    )
+    assert client.gripper_calls == []
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    # Open rides the first transit leg; a barrier sits at hover before the
+    # slow descend; close station repeats the grip pose.
+    assert call["grips"][0] == int(calib.grip_open_s)
+    # Find barrier (dwell=1, grip=0) then close station at grip_z.
+    barrier_i = next(
+        i for i, (d, g) in enumerate(zip(call["dwells"], call["grips"]))
+        if d == BARRIER_DWELL_MS and g == 0
+    )
+    assert call["wps"][barrier_i] == (site.x, site.y, hz)
+    close_i = next(
+        i for i, (wp, d, g) in enumerate(
+            zip(call["wps"], call["dwells"], call["grips"])
+        )
+        if d > BARRIER_DWELL_MS and g == int(calib.grip_close_s)
+    )
+    assert call["wps"][close_i] == (site.x, site.y, grip_z)
+    assert barrier_i < close_i
+    # Station pose must match its predecessor (firmware "err mq station pose").
+    assert call["wps"][close_i] == call["wps"][close_i - 1]
