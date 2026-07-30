@@ -589,6 +589,60 @@ def place_at(
     return out
 
 
+def plan_transfer_legs(
+    client: Mt4Client,
+    calib: Calibration,
+    src: Grasp,
+    dst: Grasp,
+    *,
+    planner: StackPlanner | None = None,
+    levels: int = 0,
+    start: tuple[float, float, float] | None = None,
+    release_z: float | None = None,
+    travel_z: float | None = None,
+) -> tuple[list[Leg], tuple[float, float, float], float | None, float | None]:
+    """Composable legs for one ``src`` → ``dst`` transfer, plus the end pose.
+
+    Same pick+place fusion ``transfer`` sends, lifted out so a caller can
+    concatenate several transfers into one ``send_legs`` (shuffle lookahead)
+    without a stop/settle between them. ``start`` defaults to the live TCP;
+    pass the previous plan's end pose when chaining so composition does not
+    need a mid-plan status read. ``src.center`` cannot be planned this way
+    (the ±90° re-grip is an unqueueable relative ``m``) -- raise and let the
+    caller fall back to ``transfer``.
+    """
+    if src.center:
+        raise Mt4ClientError(
+            "plan_transfer_legs: centered grasp cannot be queued; use transfer()"
+        )
+    require_mp_reachable(src.x, src.y, "pick target")
+    require_mp_reachable(dst.x, dst.y, "place target")
+    if start is None:
+        tcp = client.get_tcp()
+        if tcp is None:
+            raise Mt4ClientError("transfer: could not read TCP")
+        start = (float(tcp.x), float(tcp.y), float(tcp.z))
+
+    pick_legs, pick_j4 = plan_pick_legs(
+        client, calib, src, planner=planner, levels=levels,
+        start=start, lift_after=False,
+    )
+    # The carry's own lift-off replaces the pick's lift leg: one vertical rise,
+    # planned by the router, with no stop at the top.
+    grab_xyz = (src.x, src.y, src.grasp_z(calib))
+    place_legs, place_j4 = plan_place_legs(
+        client, calib, dst, planner=planner, levels=levels,
+        start=grab_xyz, lift_from=float(calib.safe_z),
+        release_z=release_z, travel_z=travel_z,
+    )
+    legs = pick_legs + place_legs
+    if not legs:
+        end = start
+    else:
+        end = legs[-1].xyz
+    return legs, end, pick_j4, place_j4
+
+
 def transfer(
     client: Mt4Client,
     calib: Calibration,
@@ -635,24 +689,11 @@ def transfer(
             "centered": True,
         }
 
-    tcp = client.get_tcp()
-    if tcp is None:
-        raise Mt4ClientError("transfer: could not read TCP")
-    start = (float(tcp.x), float(tcp.y), float(tcp.z))
-
-    pick_legs, pick_j4 = plan_pick_legs(
-        client, calib, src, planner=planner, levels=levels,
-        start=start, lift_after=False,
-    )
-    # The carry's own lift-off replaces the pick's lift leg: one vertical rise,
-    # planned by the router, with no stop at the top.
-    grab_xyz = (src.x, src.y, src.grasp_z(calib))
-    place_legs, place_j4 = plan_place_legs(
-        client, calib, dst, planner=planner, levels=levels,
-        start=grab_xyz, lift_from=float(calib.safe_z),
+    legs, _end, pick_j4, place_j4 = plan_transfer_legs(
+        client, calib, src, dst, planner=planner, levels=levels,
         release_z=release_z, travel_z=travel_z,
     )
-    queues = send_legs(client, pick_legs + place_legs, step="transfer")
+    queues = send_legs(client, legs, step="transfer")
     if on_grasped is not None:
         on_grasped()
     if on_released is not None:

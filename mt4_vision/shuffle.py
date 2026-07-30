@@ -14,12 +14,12 @@ cube if it is the only pickable one.
 
 Lookahead: before executing a planned move, also ask plan_shuffle (via
 _lookahead_action) whether a *second*, independent move is already visible
-in that same capture. If so, both moves run back to back under one
-continuous begin_motion()/end_motion() span -- no capture, settle pause, or
-verification happens between them, only after the pair. This trades
-verifying the first move immediately for fewer pauses; a first move that
-actually failed still shows up as a pickable cube on the next real capture,
-just one cycle later than it otherwise would.
+in that same capture. If so, both moves' legs are planned and sent through
+one ``send_legs`` call -- no capture, settle pause, verification, OR
+stop/settle between the two transfers. This trades verifying the first move
+immediately for fewer pauses; a first move that actually failed still shows
+up as a pickable cube on the next real capture, just one cycle later than
+it otherwise would.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import Calibration
 from mt4_vision.camera import grab_frame, open_camera
 from mt4_vision.detect import CubeDetection
-from mt4_vision.motion import Grasp, transfer
+from mt4_vision.motion import Grasp, ensure_homed, plan_transfer_legs, send_legs
 from mt4_vision.pickplace import home_arm, retreat_for_camera
 from mt4_vision.policy import Action, plan_shuffle
 from mt4_vision.scene import Scene, capture_scene, verify_pick_place
@@ -354,54 +354,58 @@ def run_shuffle_loop(
                     f"capture, chaining it in (no capture in between)"
                 )
 
-            # One continuous motion span across all queued moves: the
-            # prefetch keeps draining throughout, and we only capture+verify
-            # once, after the last move -- the capture between chained moves
-            # is exactly what's being skipped.
+            # One continuous motion span across all queued moves: plan every
+            # transfer's legs up front and send them as one (station-aware
+            # chunked) queue, so chained lookahead has no stop/settle between
+            # moves. Capture+verify still runs once after the last move.
             executed: list[tuple[float, float, str, float, float]] = []
             failed_exc: Mt4ClientError | None = None
             prefetch.begin_motion()
-            for cube, mplace_x, mplace_y in moves:
-                yaw = (
-                    f" yaw={cube.yaw_deg:.0f}°"
-                    if cube.yaw_deg is not None
-                    else ""
-                )
-                print(
-                    f"Pick-and-place: {cube.color} "
-                    f"({cube.x:.0f},{cube.y:.0f}){yaw} "
-                    f"-> ({mplace_x:.0f},{mplace_y:.0f})"
-                )
-                try:
-                    # One planned transfer, not a pick then a place: the
-                    # post-grip lift folds into the carry and both grips are
-                    # firmware stations, so the whole move is one `mq` queue
-                    # instead of ~6 blocking `mp` legs and 2 gripper sleeps.
-                    transfer(
-                        client,
-                        calib,
-                        Grasp(
-                            float(cube.x), float(cube.y),
-                            yaw_deg=(
-                                cube.yaw_deg
-                                if getattr(calib, "face_align_picks", True)
-                                else None
-                            ),
+            try:
+                ensure_homed(client)
+                all_legs: list = []
+                start: tuple[float, float, float] | None = None
+                planned: list[tuple[float, float, str, float, float]] = []
+                for cube, mplace_x, mplace_y in moves:
+                    yaw = (
+                        f" yaw={cube.yaw_deg:.0f}°"
+                        if cube.yaw_deg is not None
+                        else ""
+                    )
+                    print(
+                        f"Pick-and-place: {cube.color} "
+                        f"({cube.x:.0f},{cube.y:.0f}){yaw} "
+                        f"-> ({mplace_x:.0f},{mplace_y:.0f})"
+                    )
+                    src = Grasp(
+                        float(cube.x), float(cube.y),
+                        yaw_deg=(
+                            cube.yaw_deg
+                            if getattr(calib, "face_align_picks", True)
+                            else None
                         ),
-                        Grasp(mplace_x, mplace_y),
                     )
-                except Mt4ClientError as exc:
-                    failed_exc = exc
-                    break
-                executed.append(
-                    (
-                        float(cube.x),
-                        float(cube.y),
-                        cube.color,
-                        mplace_x,
-                        mplace_y,
+                    dst = Grasp(mplace_x, mplace_y)
+                    legs, start, _pj, _qj = plan_transfer_legs(
+                        client, calib, src, dst, start=start,
                     )
+                    all_legs.extend(legs)
+                    planned.append(
+                        (
+                            float(cube.x),
+                            float(cube.y),
+                            cube.color,
+                            mplace_x,
+                            mplace_y,
+                        )
+                    )
+                send_legs(
+                    client, all_legs,
+                    step="shuffle" if len(moves) == 1 else "shuffle lookahead",
                 )
+                executed = planned
+            except Mt4ClientError as exc:
+                failed_exc = exc
             prefetch.end_motion()
 
             if executed:

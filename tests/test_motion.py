@@ -340,6 +340,34 @@ def test_transfer_is_one_queue_with_two_stations() -> None:
     assert c.gripper_calls == []
 
 
+def test_chained_transfers_are_one_send() -> None:
+    """Shuffle lookahead: two transfers planned back-to-back share one send_legs
+    (and therefore no stop/settle between the first place and the second pick)."""
+    from mt4_vision.motion import plan_transfer_legs, send_legs
+
+    c = FakeClient()
+    start = (200.0, 0.0, 260.0)
+    legs1, end1, _, _ = plan_transfer_legs(
+        c, CALIB, Grasp(*PICK_XY, yaw_deg=10.0), Grasp(*PLACE_XY), start=start,
+    )
+    legs2, _end2, _, _ = plan_transfer_legs(
+        c, CALIB,
+        Grasp(200.0, 80.0, yaw_deg=0.0), Grasp(160.0, -100.0),
+        start=end1,
+    )
+    assert c.calls == []  # planning only
+    queues = send_legs(c, legs1 + legs2, step="lookahead")
+    # Two transfers fit in one firmware-depth queue for these short free-space
+    # routes; if they ever need chunking, split_legs still cuts on stations.
+    assert queues >= 1
+    stations = [leg for leg in c.legs() if leg.is_station and leg.grip]
+    # close+open per transfer
+    assert len(stations) == 4
+    assert c.gripper_calls == []
+    # Second pick's transit starts from where the first place left the arm.
+    assert end1 == legs1[-1].xyz
+
+
 def test_transfer_fuses_the_post_grip_lift_into_the_carry() -> None:
     """One vertical rise off the grab, planned by the router as the carry's
     lift-off -- not a lift leg followed by a separate carry."""
