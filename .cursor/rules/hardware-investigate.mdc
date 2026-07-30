@@ -11,7 +11,7 @@ Tasks involving the arm, camera, serial, or physical outcomes are **live-debuggi
 
 1. **Arm state** — `mt4_status` (MCP): homed, TCP xyz/j4, joint steps, gripper S
 2. **Scene** — `mt4_scene` (MCP): cube positions, markers, yaw
-3. **Logs** — read Cursor `terminals/*.txt` and script stderr for firmware lines
+3. **Logs** — read terminal output and script stderr for firmware lines
 4. **Camera** — run capture / scene detection; try `--camera 1` if the default index is empty
 5. **Serial conflicts** — only one process owns the port; stop `jog.py`, `mt4_mcp`, and other clients before flash or a competing script
 
