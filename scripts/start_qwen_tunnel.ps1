@@ -18,7 +18,8 @@ param(
     [string]$RemoteHost = "media",
     [string]$RemoteBind = "127.0.0.1:8766",
     [string]$User = "root",
-    [string]$IdentityFile = "$env:USERPROFILE\.ssh\id_ed25519_media"
+    [string]$IdentityFile = "$env:USERPROFILE\.ssh\id_ed25519_media",
+    [int]$RetrySeconds = 5
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,13 +41,39 @@ if (-not (Test-Path $IdentityFile)) {
 }
 
 Write-Host "Tunnel: localhost:$LocalPort -> ${User}@${RemoteHost}:$RemoteBind"
-Write-Host "Leave this window open. Ctrl+C to stop."
+Write-Host "Reconnects automatically. Leave this window open. Ctrl+C to stop."
 Write-Host ""
 
-ssh -4 -N `
-    -i $IdentityFile `
-    -o IdentitiesOnly=yes `
-    -o ExitOnForwardFailure=yes `
-    -o ServerAliveInterval=30 `
-    -L "${LocalPort}:${RemoteBind}" `
-    "${User}@${RemoteHost}"
+# A single ssh invocation dies with the first network hiccup ("client_loop:
+# send disconnect: Connection reset"), and nothing says so except every
+# subsequent request failing as "service unreachable". That is a bad failure
+# mode for ask_qwen.py's watcher, which asks unattended -- so reconnect, and
+# timestamp each drop so the log shows how flaky the link really is.
+$attempt = 0
+while ($true) {
+    $attempt++
+    $since = Get-Date -Format "HH:mm:ss"
+    if ($attempt -gt 1) { Write-Host "[$since] reconnecting (attempt $attempt)..." }
+
+    ssh -4 -N `
+        -i $IdentityFile `
+        -o IdentitiesOnly=yes `
+        -o ExitOnForwardFailure=yes `
+        -o ServerAliveInterval=30 `
+        -o ServerAliveCountMax=3 `
+        -o StrictHostKeyChecking=accept-new `
+        -L "${LocalPort}:${RemoteBind}" `
+        "${User}@${RemoteHost}"
+
+    $code = $LASTEXITCODE
+    $now = Get-Date -Format "HH:mm:ss"
+    Write-Host "[$now] tunnel exited (code $code) after starting at $since"
+
+    # A local port already in use means another tunnel won the race; retrying
+    # would spin forever against a working forward we did not open.
+    if (Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue) {
+        Write-Host "Port $LocalPort is listening again from elsewhere - stopping."
+        break
+    }
+    Start-Sleep -Seconds $RetrySeconds
+}
