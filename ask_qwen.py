@@ -18,6 +18,10 @@ Coordinates come back in whichever space this model build uses (see
 ``parse_regions``); ``/coords`` flips the interpretation so you can settle it
 by eye in two keystrokes rather than guessing.
 
+It is a monitor by default: the desk is watched from startup and anything that
+moves gets asked about, with whatever you last typed as the standing question.
+``--no-watch`` makes it request/response only.
+
 Prereqs:
   * The service running, and ``.\\scripts\\start_qwen_tunnel.ps1`` if remote
   * A camera. No calibration, no serial, no arm (unless ``--park``)
@@ -25,6 +29,7 @@ Prereqs:
 Example::
 
     python ask_qwen.py --camera 1
+    python ask_qwen.py --camera 1 --no-watch
     python ask_qwen.py --prompt "how many cubes are on the desk?" --save
 """
 
@@ -123,8 +128,11 @@ HELP = """commands (anything else is asked verbatim):
                       video  = one sequence; change right, direction not, ~1x
                       montage= tiled into one picture; needs no server support
   /sample           toggle greedy (default) vs sampling at temperature 0.7
-  /watch <question> ask it automatically whenever the desk moves and settles,
-                      handing over the before/after pair. /watch off to stop
+  /watch            ON BY DEFAULT: asks the standing question whenever the desk
+                      moves and settles, with the before/after pair. Anything
+                      you type becomes that question. /watch off to stop,
+                      /watch <question> to set it without asking it now
+  /once <question>  ask without changing what the watcher is watching for
   /sens X           motion trigger threshold (default 0.0005; noise floor is
                       0.00016, a 25px object moving is ~0.0014)
   /noimage          ask the next question text-only (no frame)
@@ -764,6 +772,13 @@ class QwenWorker:
 # mean 0.00008, max 0.00016. A 25x25px object moving produces ~0.0014, so this
 # sits ~3x above the worst observed noise and ~3x below the smallest real event.
 MOTION_THRESHOLD = 0.0005
+# Asked on every motion event until the user types something, which replaces it.
+# Deliberately open-ended: at startup the harness has no idea what you care
+# about, and "what changed" is the one question that is always meaningful.
+DEFAULT_WATCH_QUESTION = (
+    "These are two frames of the same scene, before and after something moved. "
+    "What changed between them? Answer in one sentence."
+)
 MOTION_DELTA = 25          # per-pixel grayscale change that counts
 MOTION_SETTLE_TICKS = 3    # consecutive quiet ticks before calling it settled
 MOTION_MAX_S = 8.0         # fire anyway if motion never settles
@@ -825,6 +840,7 @@ class MotionWatcher:
         self._lock = threading.Lock()
         self.threshold = threshold
         self._prompt: str | None = None
+        self._last_prompt = DEFAULT_WATCH_QUESTION
         self._state = "off"
         self._score = 0.0
         self._events = 0
@@ -836,11 +852,13 @@ class MotionWatcher:
 
     def arm(self, prompt: str) -> None:
         with self._lock:
-            self._prompt = prompt
+            self._prompt = self._last_prompt = prompt
             self._state = "quiet"
             self._events = self._skipped = 0
 
     def disarm(self) -> None:
+        # _last_prompt outlives the disarm so a bare /watch can resume the same
+        # question rather than silently reverting to the generic default.
         with self._lock:
             self._prompt = None
             self._state = "off"
@@ -849,6 +867,11 @@ class MotionWatcher:
     def armed(self) -> bool:
         with self._lock:
             return self._prompt is not None
+
+    @property
+    def last_question(self) -> str:
+        with self._lock:
+            return self._last_prompt
 
     def snapshot(self) -> tuple[str, float, int, int, list[tuple[int, int, int, int]]]:
         with self._lock:
@@ -1123,24 +1146,45 @@ def handle_command(
     elif cmd == "watch":
         if watcher is None:
             ui.set_status("no watcher (needs the camera stream)")
-        elif not rest or rest[0].lower() in ("off", "stop", "no"):
+        elif rest and rest[0].lower() in ("off", "stop", "no"):
             was = watcher.armed
-            watcher.disarm()
             _st, _sc, events, skipped, _b = watcher.snapshot()
+            watcher.disarm()
             ui.set_status(
                 f"watch off after {events} event(s)"
                 + (f", {skipped} skipped while busy" if skipped else "")
-                if was else "watch was not on"
+                if was else "watch was already off"
             )
+        elif not rest:
+            # Bare /watch reports when on and resumes when off -- it must not
+            # be the way to turn monitoring off, now that it starts on.
+            if watcher.armed:
+                state, score, events, skipped, _b = watcher.snapshot()
+                ui.emit(f"  watching for: {watcher.last_question}")
+                ui.set_status(
+                    f"{state}, score {score:.5f}, {events} event(s)"
+                    + (f", {skipped} skipped" if skipped else "")
+                    + f", threshold {watcher.threshold:.5f}"
+                )
+            else:
+                watcher.arm(watcher.last_question)
+                ui.emit(f"  watching for: {watcher.last_question}")
+                ui.set_status("watching again (/watch off to stop)")
         elif opts.pinned is not None:
             ui.set_status("frame is frozen -- /thaw first, the watcher needs live frames")
         else:
             question = " ".join(rest)
             watcher.arm(question)
-            ui.emit(f"  watching: {question}")
+            ui.emit(f"  watching for: {question}")
             ui.set_status(
-                f"armed -- will ask on motion above {watcher.threshold:.5f} (/watch off)"
+                f"watching -- asks on motion above {watcher.threshold:.5f} (/watch off)"
             )
+    elif cmd == "once":
+        question = " ".join(rest)
+        if not question:
+            ui.set_status("usage: /once <question>")
+        else:
+            worker.ask(question)
     elif cmd == "sens":
         if watcher is None:
             ui.set_status("no watcher (needs the camera stream)")
@@ -1329,11 +1373,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p.add_argument(
-        "--watch", default="",
+        "--watch", default=DEFAULT_WATCH_QUESTION, metavar="QUESTION",
         help=(
-            "arm the motion watcher with this question: it is asked, with the "
-            "before/after pair, whenever the desk moves and settles"
+            "the standing question the motion watcher asks, with the "
+            "before/after pair, whenever the desk moves and settles. Watching "
+            "is on by default; whatever you type at the prompt replaces this"
         ),
+    )
+    p.add_argument(
+        "--no-watch", action="store_true",
+        help="start with the motion watcher disarmed (/watch <q> arms it later)",
     )
     p.add_argument(
         "--sens", type=float, default=MOTION_THRESHOLD,
@@ -1412,13 +1461,19 @@ def main(argv: list[str] | None = None) -> int:
         watcher = MotionWatcher(stream, worker, ui, threshold=args.sens)
         if not args.no_preview:
             view = HarnessPreview(stream, worker, svc=svc, watcher=watcher)
-        if args.watch:
+        if not args.no_watch and args.watch:
             watcher.arm(args.watch)
-            ui.emit(f"  watching: {args.watch}")
 
         ui.emit(f"qwen3-vl probe -- {svc}")
         ui.emit("/help for commands, /preset for capability probes")
-        ui.set_status("ready")
+        if watcher.armed:
+            ui.emit(
+                f"  watching the desk (motion > {watcher.threshold:.5f}); what you "
+                "type becomes the standing question. /watch off to stop."
+            )
+            ui.set_status("watching -- type a question, or wait for movement")
+        else:
+            ui.set_status("ready")
         while True:
             if view is not None and view.stopped_by_user():
                 break
@@ -1435,6 +1490,14 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 continue
             worker.ask(line)
+            # A typed question answers now AND becomes what the watcher keeps
+            # asking, so "watch this for me" needs no second command. Only
+            # while already armed -- after an explicit /watch off, typing must
+            # not quietly switch monitoring back on. Commands (/preset,
+            # /again, /noimage) stay one-off and leave the standing question be.
+            if watcher is not None and watcher.armed:
+                watcher.arm(line)
+                ui.set_status(f"asking, and watching for: {line[:44]}")
         # Clean exit (EOF or window closed): let a question already with the
         # model finish, so a piped batch reports every answer.
         worker.drain()

@@ -147,7 +147,8 @@ stays in the corner so you can keep aiming the camera.
 | `/frames N [gap]` | Capture N frames, `gap` seconds apart |
 | `/mode M` | How they reach the model: `single`, `montage`, `images`, `video`. Set `/frames` once, then flip `/mode` and `/again` to A/B the representations on the same question |
 | `/sample` | Toggle greedy (default) vs the model's temperature 0.7. Greedy is what makes two answers comparable |
-| `/watch <q>` | Ask `<q>` automatically whenever the desk moves and settles, handing over the before/after pair — see below |
+| `/watch` | Watching is **on by default** — whatever you type becomes the standing question, re-asked on every movement. `/watch off` stops it; see below |
+| `/once <q>` | Ask without changing what the watcher is watching for |
 | `/sens X` | Motion trigger threshold |
 | `/preset` | A capability checklist: description, inventory, counting, colors, grounding, pointing, OCR, fiducial tags, spatial relations, graspability, arm-occlusion |
 | `/save` | Write the sent frame, the annotated view and a JSON record to `qwen_probes/` |
@@ -196,17 +197,35 @@ Video's direction failure is the model, not the plumbing — verified by
 comparing tensors for forward vs reversed frame lists (they differ correctly,
 all frames present, order preserved).
 
-### Watching for movement (`/watch`)
+### Watching for movement (on by default)
 
 ```powershell
-python ask_qwen.py --camera 1 --watch "What changed between these two images?"
+python ask_qwen.py --camera 1              # already watching
+python ask_qwen.py --camera 1 --no-watch   # request/response only
 ```
+
+The harness is a **monitor by default**: it watches the desk from startup and
+asks about anything that moves. Until you type something it asks the generic
+"what changed between these two frames"; after that, **whatever you last typed
+becomes the standing question**, asked again on every event. So
+
+```
+ask: is the red cube still on its marker?
+```
+
+answers immediately *and* keeps answering that same question each time the desk
+changes — no second command. Commands are the exception: `/preset`, `/again`,
+`/noimage` and `/once <q>` are one-offs and leave the standing question alone.
+`/watch off` stops; a bare `/watch` reports state when on and resumes when off
+(it is deliberately not the way to turn it off, now that it starts on).
 
 An answer costs 3-5s and the GPU serializes them, so polling the model to ask
 "has anything moved" would run at ~0.2 Hz and keep the GPU busy permanently. A
 frame diff answers that question at camera rate for nothing, so it gates
 everything: the model is asked once the scene has **moved and settled**, and is
-handed the last quiet frame plus the first new quiet one, as two images.
+handed the last quiet frame plus the first new quiet one, as two images. While
+disarmed the watcher thread does not even read the camera, so `--no-watch`
+costs nothing.
 
 Waiting for the settle is the part that matters — firing on the first changed
 frame catches the arm mid-sweep or a hand still over the desk. Events that
