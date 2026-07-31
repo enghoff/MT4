@@ -9,9 +9,14 @@ import threading
 import cv2
 import numpy as np
 
-# -1 = auto-detect: scan indices for the camera that sees ArUco markers
-# (distinguishes the overhead work camera from e.g. a laptop's built-in one).
-DEFAULT_CAMERA_INDEX = int(os.environ.get("MT4_CAMERA_INDEX", "-1"))
+# Index used when no --camera is given. MT4_CAMERA_INDEX is the per-machine
+# setting (which USB index the overhead work camera landed on -- 1 on a laptop
+# whose built-in camera takes 0); 0 is the fallback when it is unset. Set it to
+# -1 for auto-detect: scan indices for the camera that sees ArUco markers,
+# which costs seconds per candidate but needs no per-machine configuration.
+# Read at import from the real environment, not .env (only mt4_mcp loads that):
+# a shell started before the variable was set inherits a copy without it.
+DEFAULT_CAMERA_INDEX = int(os.environ.get("MT4_CAMERA_INDEX", "0"))
 AUTO_SCAN_MAX_INDEX = 5
 # The driver's default UVC mode is 640x480, where each ArUco marker (already
 # viewed at a steep angle from this overhead mount, and small relative to a

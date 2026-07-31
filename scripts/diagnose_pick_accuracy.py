@@ -32,7 +32,7 @@ if str(ROOT) not in sys.path:
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_jog.ports import resolve_port
 from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration, reprojection_errors
-from mt4_vision.camera import capture_frame
+from mt4_vision.camera import DEFAULT_CAMERA_INDEX, capture_frame
 from mt4_vision.detect import detect_cubes, detect_markers
 
 
@@ -186,12 +186,12 @@ def cube_top_gap(calib, frame, backup_path: Path | None) -> dict:
     }
 
 
-def detection_noise(calib, camera: int | None, n_frames: int = NOISE_FRAMES) -> dict:
+def detection_noise(calib, camera: int = DEFAULT_CAMERA_INDEX, n_frames: int = NOISE_FRAMES) -> dict:
     """Multi-frame centroid RMS per color (nearest-neighbor track)."""
     # Per-frame detections as list of (color, px, py)
     frames: list[list[tuple[str, float, float]]] = []
     for i in range(n_frames):
-        frame = capture_frame(camera if camera is not None else -1)
+        frame = capture_frame(camera)
         cubes = detect_cubes(frame, calibration=calib)
         frames.append([(c.color, c.px, c.py) for c in cubes])
         if i + 1 < n_frames:
@@ -315,7 +315,7 @@ def main() -> int:
     args = parser.parse_args()
 
     calib = load_calibration(Path(args.calib))
-    cam = args.camera if args.camera is not None else -1
+    cam = args.camera if args.camera is not None else DEFAULT_CAMERA_INDEX
 
     print("Capturing scene...")
     frame = capture_frame(cam)
