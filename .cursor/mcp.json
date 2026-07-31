@@ -3,7 +3,7 @@
     "mt4": {
       "command": "C:\\Users\\enghoff\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
       "args": ["-m", "mt4_mcp", "--stdio"],
-      "cwd": "D:\\mt4"
+      "cwd": "D:\\MT4"
     }
   }
 }
