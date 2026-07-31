@@ -43,6 +43,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -323,6 +324,25 @@ def _inset(canvas: np.ndarray, frame: np.ndarray, tag: str) -> None:
     draw_outlined_text(canvas, tag, (x0 + 6, y0 + 18), scale=0.5, color=(220, 220, 220))
 
 
+class WatchState(NamedTuple):
+    """What ``MotionWatcher`` currently sees, for the panel to draw.
+
+    A NamedTuple rather than a plain tuple because appending a field to a
+    positionally-unpacked one silently broke the whole preview once: the panel
+    unpacked 5 values, ``send`` became a 6th, every ``compose`` call raised
+    ValueError, and ``HarnessPreview``'s draw-error guard swallowed it -- so the
+    window simply never opened, with nothing on screen or in the log saying why.
+    Attribute access cannot drift that way.
+    """
+
+    state: str
+    score: float
+    events: int
+    skipped: int
+    boxes: list[tuple[int, int, int, int]]
+    send: str
+
+
 def render_panel(
     height: int,
     *,
@@ -384,18 +404,18 @@ def render_panel(
     # Labelled "typed" because a watch event ignores this and sends its
     # before/after pair as 2 images -- the footer's "sent:" is what actually
     # went for the answer on screen, and the two disagreeing is normal.
-    label = "typed ask" if (watch is not None and watch[0] != "off") else "send"
+    watching = watch is not None and watch.state != "off"
+    label = "typed ask" if watching else "send"
     draw_outlined_text(panel, f"{label}: {send}", (x, y), scale=0.4, color=DIM)
-    if watch is not None and watch[0] != "off":
+    if watch is not None and watching:
         y += BODY_LINE_PX
-        state, score, events, skipped, _boxes = watch
-        kind = "track" if len(watch) > 5 and watch[5] == "latest" else "watch"
-        line = f"{kind}: {state}  {score:.5f}  {events} event(s)"
-        if skipped:
-            line += f"  {skipped} skipped"
+        kind = "track" if watch.send == "latest" else "watch"
+        line = f"{kind}: {watch.state}  {watch.score:.5f}  {watch.events} event(s)"
+        if watch.skipped:
+            line += f"  {watch.skipped} skipped"
         draw_outlined_text(
             panel, line, (x, y), scale=0.4,
-            color=WARN_BGR if state == "moving" else A_BGR,
+            color=WARN_BGR if watch.state == "moving" else A_BGR,
         )
     y = rule(y + 10)
 
@@ -457,9 +477,6 @@ def render_panel(
             (x, footer + 36), scale=0.42, color=WARN_BGR,
         )
     return panel
-
-
-WatchState = tuple[str, float, int, int, list]
 
 
 def compose(
@@ -948,10 +965,12 @@ class MotionWatcher:
         with self._lock:
             return self._send
 
-    def snapshot(self) -> tuple:
+    def snapshot(self) -> WatchState:
         with self._lock:
-            return (self._state, self._score, self._events, self._skipped,
-                    list(self._boxes), self._send)
+            return WatchState(
+                state=self._state, score=self._score, events=self._events,
+                skipped=self._skipped, boxes=list(self._boxes), send=self._send,
+            )
 
     def _fire(self, before: np.ndarray, after: np.ndarray, peak: float) -> None:
         prompt = self._prompt
@@ -1037,13 +1056,15 @@ class HarnessPreview:
     """Composites the live feed, the submitted frame and the answer panel."""
 
     def __init__(
-        self, stream: FrameStream, worker: QwenWorker, *, svc: str,
+        self, stream: FrameStream, worker: QwenWorker, *, svc: str, ui: BottomUI,
         watcher: MotionWatcher | None = None,
     ) -> None:
         self._stream = stream
         self._worker = worker
         self._svc = svc
+        self._ui = ui
         self._watcher = watcher
+        self._draw_errors: set[str] = set()
         self._preview = LivePreview("qwen probe (q or Esc to stop)")
         self._latest: np.ndarray | None = None
         self._lock = threading.Lock()
@@ -1073,7 +1094,16 @@ class HarnessPreview:
                     live, answer=answer, pending=pending, elapsed=elapsed,
                     opts=self._worker.opts, svc=self._svc, watch=watch,
                 )
-            except Exception:  # noqa: BLE001 -- a draw bug must not kill the feed
+            except Exception as exc:  # noqa: BLE001 -- a draw bug must not kill the feed
+                # ...but it must not be invisible either. Swallowing this
+                # silently is how a compose() crash presented as "the preview
+                # feature just doesn't work": no window, no error, nothing to
+                # search for. Report the first one (and each new kind after it)
+                # while still keeping the feed alive.
+                sig = f"{type(exc).__name__}: {exc}"
+                if sig not in self._draw_errors:
+                    self._draw_errors.add(sig)
+                    self._ui.emit(f"  preview draw failed -- {sig}")
                 time.sleep(0.2)
                 continue
             with self._lock:
@@ -1567,7 +1597,7 @@ def main(argv: list[str] | None = None) -> int:
         worker = QwenWorker(stream=stream, url=args.url, opts=opts, ui=ui)
         watcher = MotionWatcher(stream, worker, ui, threshold=args.sens)
         if not args.no_preview:
-            view = HarnessPreview(stream, worker, svc=svc, watcher=watcher)
+            view = HarnessPreview(stream, worker, svc=svc, ui=ui, watcher=watcher)
         if not args.no_watch and args.watch:
             watcher.arm(args.watch)
 

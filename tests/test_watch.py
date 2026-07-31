@@ -8,12 +8,18 @@ moving, ~0.0014). These tests pin that gap.
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from ask_qwen import (
     MOTION_THRESHOLD,
+    MotionWatcher,
+    Options,
+    WatchState,
     _prep,
     changed_boxes,
+    compose,
     montage,
     motion_score,
 )
@@ -114,3 +120,69 @@ def test_montage_tiles_without_losing_frames() -> None:
     # 4 frames -> 2x2 of half-size tiles, so the canvas keeps the frame size.
     assert out.shape[0] == (H // 2) * 2
     assert out.shape[1] == (W // 2) * 2
+
+
+# -- the panel draws what the watcher reports ------------------------------- #
+#
+# compose() runs on the preview thread behind a catch-all draw guard, so
+# anything it raises costs the whole window rather than one frame. Armed is the
+# default, so these run the default path -- a fixed-arity unpack of the watcher
+# snapshot broke exactly this and the window silently never opened.
+
+
+def armed_snapshot(**over: object) -> WatchState:
+    """A real MotionWatcher snapshot, not a hand-written stand-in.
+
+    Building the tuple by hand here would have kept passing while the watcher
+    grew a field, which is the drift that caused the outage.
+    """
+    watcher = MotionWatcher.__new__(MotionWatcher)  # no camera, no threads
+    watcher._lock = threading.Lock()
+    watcher._state = "quiet"
+    watcher._score = 0.0
+    watcher._events = 0
+    watcher._skipped = 0
+    watcher._boxes = []
+    watcher._send = "pair"
+    for name, value in over.items():
+        setattr(watcher, f"_{name}", value)
+    return watcher.snapshot()
+
+
+def compose_with(watch: WatchState | None) -> np.ndarray:
+    return compose(
+        blank(), answer=None, pending=None, elapsed=0.0,
+        opts=Options(), svc="probe", watch=watch,
+    )
+
+
+def test_panel_draws_while_watching() -> None:
+    canvas = compose_with(armed_snapshot())
+    assert canvas.shape[0] == H
+    assert canvas.shape[1] > W  # frame + panel
+
+
+def test_panel_draws_for_every_watcher_state() -> None:
+    for state in ("off", "quiet", "moving"):
+        for send in ("pair", "latest"):
+            assert compose_with(armed_snapshot(state=state, send=send)) is not None
+
+
+def test_panel_draws_with_events_and_boxes() -> None:
+    snap = armed_snapshot(
+        state="moving", score=0.0123, events=3, skipped=1,
+        boxes=[(10, 10, 90, 90), (200, 100, 260, 180)],
+    )
+    assert compose_with(snap) is not None
+
+
+def test_panel_draws_with_no_watcher_at_all() -> None:
+    assert compose_with(None) is not None
+
+
+def test_watch_snapshot_is_read_by_name() -> None:
+    """Guards the drift directly: fields are addressable, order is not load-bearing."""
+    snap = armed_snapshot(state="moving", send="latest")
+    assert snap.state == "moving"
+    assert snap.send == "latest"
+    assert snap.boxes == []
