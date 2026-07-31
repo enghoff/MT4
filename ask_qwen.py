@@ -199,6 +199,10 @@ class Answer:
     had_image: bool = True
     send_mode: str = "single"
     reply: Reply | None = None   # service metadata: groups, timestamps, tokens
+    # Size of ONE frame as POSTed. Not sent.shape: for the multi-frame modes
+    # sent is a display tiling at a fraction of the real size, and reporting
+    # that as the frame size understates what the model actually got.
+    frame_hw: tuple[int, int] | None = None
 
     def sent_label(self) -> str:
         """How the frames actually reached the model -- never guessed from the view."""
@@ -354,7 +358,11 @@ def render_panel(
     send = opts.send_mode
     if send != "single":
         send += f" x{opts.frames} @{opts.frame_gap_s:g}s"
-    draw_outlined_text(panel, f"send: {send}", (x, y), scale=0.4, color=DIM)
+    # Labelled "typed" because a watch event ignores this and sends its
+    # before/after pair as 2 images -- the footer's "sent:" is what actually
+    # went for the answer on screen, and the two disagreeing is normal.
+    label = "typed ask" if (watch is not None and watch[0] != "off") else "send"
+    draw_outlined_text(panel, f"{label}: {send}", (x, y), scale=0.4, color=DIM)
     if watch is not None and watch[0] != "off":
         y += BODY_LINE_PX
         state, score, events, skipped, _boxes = watch
@@ -454,10 +462,9 @@ def compose(
                 main, f"VIEW: tiled for display - sent as {answer.send_mode}",
                 (14, 28), scale=0.55, color=(0, 200, 255),
             )
-        # Where the trigger saw change, so a human can tell whether it fired on
-        # the object of interest or on a shadow.
-        for bx in (watch[4] if watch else []):
-            cv2.rectangle(main, (bx[0], bx[1]), (bx[2], bx[3]), (0, 200, 255), 1)
+        # Change boxes are drawn per-frame before tiling, in _build_payload --
+        # not here, where main may be a scaled composite and the boxes would
+        # land in the wrong coordinate space.
         _inset(main, live, "LIVE")
     elif pending is not None:
         main = live.copy()
@@ -465,11 +472,16 @@ def compose(
         main = live.copy()
         draw_outlined_text(main, "LIVE", (14, 28), scale=0.55, color=(220, 220, 220))
 
+    # The size the MODEL was given, which for a tiled view is not the size of
+    # what is on screen.
+    shape = (
+        answer.frame_hw if answer is not None and answer.frame_hw is not None
+        else (live.shape[0], live.shape[1])
+    )
     panel = render_panel(
         main.shape[0],
         answer=answer, pending=pending, elapsed=elapsed, opts=opts, svc=svc,
-        frame_shape=(main.shape[0], main.shape[1]), region_counts=counts,
-        watch=watch,
+        frame_shape=shape, region_counts=counts, watch=watch,
     )
     return np.hstack([main, panel])
 
@@ -646,6 +658,7 @@ class QwenWorker:
 
     def _build_payload(
         self, prompt: str, opts: Options, frames: list[np.ndarray] | None = None,
+        mark_changes: bool = False,
     ) -> tuple[list[np.ndarray], np.ndarray, str, str]:
         """Return (frames_to_post, image_to_display, sent_prompt, send_mode).
 
@@ -680,7 +693,21 @@ class QwenWorker:
         if opts.grid:
             posted = [annotate_for_pointing(f) for f in posted]
 
-        display = posted[0] if len(posted) == 1 else montage(posted)
+        # Change boxes go on COPIES used only for the view. Drawing them on the
+        # posted frames would alter what the model sees, and marking up the very
+        # difference we are asking it to find would make the answer worthless.
+        # Drawing them per-frame before tiling also keeps them in each frame's
+        # own coordinate space, so montage scales them along with the pixels --
+        # boxes drawn onto the finished composite land in the wrong place.
+        shown = posted
+        if mark_changes and len(posted) == 2:
+            boxes = changed_boxes(posted[0], posted[1])
+            shown = [f.copy() for f in posted]
+            for frame in shown:
+                for x1, y1, x2, y2 in boxes:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
+
+        display = shown[0] if len(shown) == 1 else montage(shown)
         return posted, display, preamble + prompt, mode
 
     def _loop(self) -> None:
@@ -703,6 +730,7 @@ class QwenWorker:
             sent_prompt, error, text = prompt, None, ""
             reply: Reply | None = None
             send_mode = "single"
+            frame_hw: tuple[int, int] | None = None
             img = np.full((360, 640, 3), 40, dtype=np.uint8)
             draw_outlined_text(
                 img, "text-only prompt (no image sent)", (24, 190),
@@ -713,7 +741,10 @@ class QwenWorker:
                 if with_image:
                     posted, img, sent_prompt, send_mode = self._build_payload(
                         prompt, opts, frames=job.frames,
+                        mark_changes=bool(job.note),
                     )
+                    if posted:
+                        frame_hw = (posted[0].shape[0], posted[0].shape[1])
                 reply = ask(
                     sent_prompt,
                     posted if with_image else None,
@@ -743,6 +774,7 @@ class QwenWorker:
                 had_image=with_image,
                 send_mode=send_mode,
                 reply=reply,
+                frame_hw=frame_hw,
             )
             with self._lock:
                 self._answer = answer
