@@ -164,7 +164,8 @@ def main() -> int:
     parser.add_argument("--port", default=None, help="serial port (auto-detect if omitted)")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--camera", type=int, default=None,
-                        help="camera index (auto-detect via markers if omitted)")
+                        help="camera index (MT4_CAMERA_INDEX, else 0, if omitted; "
+                             "-1 auto-detects via markers)")
     parser.add_argument("--dict", default="4x4_50", help="ArUco dictionary name")
     parser.add_argument("--output", default=None, help="calibration JSON path")
     parser.add_argument("--poll-ms", type=int, default=POLL_MS)

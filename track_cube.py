@@ -561,7 +561,8 @@ def main() -> int:
     )
     parser.add_argument("--port", default=None, help="serial port (auto-detect if omitted)")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
-    parser.add_argument("--camera", type=int, default=None, help="camera index (auto-detect if omitted)")
+    parser.add_argument("--camera", type=int, default=None,
+                        help="camera index (MT4_CAMERA_INDEX, else 0, if omitted; -1 auto-detects)")
     parser.add_argument("--calib", default=str(DEFAULT_CALIB_PATH))
     parser.add_argument(
         "--hover-mm", type=float, default=DEFAULT_HOVER_MM,

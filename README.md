@@ -33,10 +33,13 @@ building a stack on a calibrated marker, with the live vision overlay
   See [Open-vocabulary objects](#open-vocabulary-objects)
 
 Serial ports auto-detect the CH340 USB-UART when `--port` / `MT4_SERIAL_PORT`
-are omitted (COM numbers often change after a re-plug). The camera is
-auto-detected by scanning for the one that sees the markers (override with
-`MT4_CAMERA_INDEX` or `--camera`); the MCP camera tools instead default to
-USB index **1** and take a `camera` argument.
+are omitted (COM numbers often change after a re-plug). The camera index comes
+from `--camera`, else `MT4_CAMERA_INDEX`, else **0**; set that variable to
+whichever USB index your overhead camera landed on (`setx MT4_CAMERA_INDEX 1`
+on a laptop whose built-in camera takes 0 — then restart any shell that was
+already open, since it inherited an environment without it). Either can be
+**-1** to auto-detect by scanning for the camera that sees the markers. The MCP
+camera tools instead default to USB index **1** and take a `camera` argument.
 
 ## Quick start
 
