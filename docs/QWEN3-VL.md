@@ -147,6 +147,8 @@ stays in the corner so you can keep aiming the camera.
 | `/frames N [gap]` | Capture N frames, `gap` seconds apart |
 | `/mode M` | How they reach the model: `single`, `montage`, `images`, `video`. Set `/frames` once, then flip `/mode` and `/again` to A/B the representations on the same question |
 | `/sample` | Toggle greedy (default) vs the model's temperature 0.7. Greedy is what makes two answers comparable |
+| `/watch <q>` | Ask `<q>` automatically whenever the desk moves and settles, handing over the before/after pair — see below |
+| `/sens X` | Motion trigger threshold |
 | `/preset` | A capability checklist: description, inventory, counting, colors, grounding, pointing, OCR, fiducial tags, spatial relations, graspability, arm-occlusion |
 | `/save` | Write the sent frame, the annotated view and a JSON record to `qwen_probes/` |
 
@@ -193,6 +195,42 @@ them reliably index frames.
 Video's direction failure is the model, not the plumbing — verified by
 comparing tensors for forward vs reversed frame lists (they differ correctly,
 all frames present, order preserved).
+
+### Watching for movement (`/watch`)
+
+```powershell
+python ask_qwen.py --camera 1 --watch "What changed between these two images?"
+```
+
+An answer costs 3-5s and the GPU serializes them, so polling the model to ask
+"has anything moved" would run at ~0.2 Hz and keep the GPU busy permanently. A
+frame diff answers that question at camera rate for nothing, so it gates
+everything: the model is asked once the scene has **moved and settled**, and is
+handed the last quiet frame plus the first new quiet one, as two images.
+
+Waiting for the settle is the part that matters — firing on the first changed
+frame catches the arm mid-sweep or a hand still over the desk. Events that
+arrive while an answer is still generating are dropped and counted, not queued,
+because a backlog of stale before/after pairs reads as current.
+
+Threshold defaults to `0.0005`, from measurement on the desk camera: 60 static
+frames gave a noise floor of mean `0.00008` / max `0.00016`, while a 25x25px
+object moving produces ~`0.0014`. So it sits ~3x above the worst noise and ~3x
+below the smallest real event. `/sens` retunes it; the live score is in the
+panel, and changed regions are outlined on the view so you can see whether it
+fired on the object you care about or on a shadow.
+
+**The gate is more reliable than the model.** Verified with arm-driven motion:
+a 0.063 event (390x the noise floor) was described correctly, but a 0.027 event
+(169x noise) came back as *"no discernible change between the two frames"*.
+Treat the diff score as the authority on **whether** something moved, and the
+model only as the answer to **what** — if it contradicts a trigger, believe the
+trigger.
+
+For actually tracking an object's position, use Grounding DINO instead
+([docs/GROUNDING_DINO.md](GROUNDING_DINO.md)): ~3 Hz, real boxes, and already
+running here. This is for the semantics — what changed, did it fall over, is
+the arm in the way.
 
 ### The frame-dropping trap
 

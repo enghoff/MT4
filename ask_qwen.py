@@ -123,6 +123,10 @@ HELP = """commands (anything else is asked verbatim):
                       video  = one sequence; change right, direction not, ~1x
                       montage= tiled into one picture; needs no server support
   /sample           toggle greedy (default) vs sampling at temperature 0.7
+  /watch <question> ask it automatically whenever the desk moves and settles,
+                      handing over the before/after pair. /watch off to stop
+  /sens X           motion trigger threshold (default 0.0005; noise floor is
+                      0.00016, a 25px object moving is ~0.0014)
   /noimage          ask the next question text-only (no frame)
   /preset [N]       list capability probes, or run one
   /save [name]      write the sent image, the view and a JSON record
@@ -156,6 +160,22 @@ class Options:
     def fps(self) -> float:
         """Capture rate implied by the gap -- what video timestamps are built from."""
         return 1.0 / self.frame_gap_s if self.frame_gap_s > 0 else 1.0
+
+
+@dataclass
+class Job:
+    """One queued question. ``frames`` pre-empts capturing.
+
+    The watcher supplies its own before/after pair, which must not be replaced
+    by a fresh capture taken seconds later -- by then the thing that moved has
+    stopped being news.
+    """
+
+    prompt: str
+    with_image: bool = True
+    frames: list[np.ndarray] | None = None
+    mode: str | None = None      # overrides Options.send_mode
+    note: str = ""               # transcript prefix, e.g. a motion score
 
 
 @dataclass
@@ -278,6 +298,7 @@ def render_panel(
     svc: str,
     frame_shape: tuple[int, int],
     region_counts: tuple[int, int] | None,
+    watch: WatchState | None = None,
 ) -> np.ndarray:
     panel = np.full((height, PANEL_W, 3), BG, dtype=np.uint8)
     x = PANEL_PAD
@@ -326,6 +347,16 @@ def render_panel(
     if send != "single":
         send += f" x{opts.frames} @{opts.frame_gap_s:g}s"
     draw_outlined_text(panel, f"send: {send}", (x, y), scale=0.4, color=DIM)
+    if watch is not None and watch[0] != "off":
+        y += BODY_LINE_PX
+        state, score, events, skipped, _boxes = watch
+        line = f"watch: {state}  {score:.5f}  {events} event(s)"
+        if skipped:
+            line += f"  {skipped} skipped"
+        draw_outlined_text(
+            panel, line, (x, y), scale=0.4,
+            color=WARN_BGR if state == "moving" else A_BGR,
+        )
     y = rule(y + 10)
 
     if pending is not None:
@@ -388,6 +419,9 @@ def render_panel(
     return panel
 
 
+WatchState = tuple[str, float, int, int, list]
+
+
 def compose(
     live: np.ndarray,
     *,
@@ -396,6 +430,7 @@ def compose(
     elapsed: float,
     opts: Options,
     svc: str,
+    watch: WatchState | None = None,
 ) -> np.ndarray:
     """Main pane (submitted frame, or live when nothing is being shown) + panel."""
     counts: tuple[int, int] | None = None
@@ -411,6 +446,10 @@ def compose(
                 main, f"VIEW: tiled for display - sent as {answer.send_mode}",
                 (14, 28), scale=0.55, color=(0, 200, 255),
             )
+        # Where the trigger saw change, so a human can tell whether it fired on
+        # the object of interest or on a shadow.
+        for bx in (watch[4] if watch else []):
+            cv2.rectangle(main, (bx[0], bx[1]), (bx[2], bx[3]), (0, 200, 255), 1)
         _inset(main, live, "LIVE")
     elif pending is not None:
         main = live.copy()
@@ -422,6 +461,7 @@ def compose(
         main.shape[0],
         answer=answer, pending=pending, elapsed=elapsed, opts=opts, svc=svc,
         frame_shape=(main.shape[0], main.shape[1]), region_counts=counts,
+        watch=watch,
     )
     return np.hstack([main, panel])
 
@@ -485,7 +525,7 @@ class QwenWorker:
         self._ui = ui
         self._lock = threading.Lock()
         self.opts = opts
-        self._queue: list[tuple[str, bool]] = []  # (prompt, with_image)
+        self._queue: list[Job] = []
         self._submitted: tuple[str, bool] | None = None  # most recent ask()
         self._pending: str | None = None
         self._started = 0.0
@@ -497,15 +537,32 @@ class QwenWorker:
 
     # -- called from the main thread ---------------------------------------
 
-    def ask(self, prompt: str, *, with_image: bool = True) -> None:
+    def ask(
+        self,
+        prompt: str,
+        *,
+        with_image: bool = True,
+        frames: list[np.ndarray] | None = None,
+        mode: str | None = None,
+        note: str = "",
+        quiet: bool = False,
+    ) -> None:
+        job = Job(prompt=prompt, with_image=with_image, frames=frames,
+                  mode=mode, note=note)
         with self._lock:
-            self._queue.append((prompt, with_image))
+            self._queue.append(job)
             self._submitted = (prompt, with_image)
             waiting = len(self._queue) + (1 if self._pending else 0)
         self._wake.set()
-        self._ui.set_status(
-            "asking..." if waiting == 1 else f"queued ({waiting} waiting)"
-        )
+        if not quiet:
+            self._ui.set_status(
+                "asking..." if waiting == 1 else f"queued ({waiting} waiting)"
+            )
+
+    def busy(self) -> bool:
+        """True if anything is in flight or waiting -- the watcher's back-off."""
+        with self._lock:
+            return self._pending is not None or bool(self._queue)
 
     def cancel_queued(self) -> int:
         """Drop everything not yet started. Returns how many were dropped."""
@@ -580,7 +637,7 @@ class QwenWorker:
         return frames
 
     def _build_payload(
-        self, prompt: str, opts: Options,
+        self, prompt: str, opts: Options, frames: list[np.ndarray] | None = None,
     ) -> tuple[list[np.ndarray], np.ndarray, str, str]:
         """Return (frames_to_post, image_to_display, sent_prompt, send_mode).
 
@@ -589,7 +646,8 @@ class QwenWorker:
         visible at once. ``Answer.sent_label`` names what actually went, so the
         view can never be mistaken for the payload.
         """
-        frames = self._capture(opts)
+        if frames is None:
+            frames = self._capture(opts)
         mode = opts.send_mode if len(frames) > 1 else "single"
 
         preamble = ""
@@ -624,13 +682,15 @@ class QwenWorker:
             with self._lock:
                 job = self._queue.pop(0) if self._queue else None
                 if job is not None:
-                    self._pending = job[0]
+                    self._pending = job.prompt
                     self._started = time.monotonic()
                 opts = replace(self.opts)
             if job is None:
                 continue
 
-            prompt, with_image = job
+            prompt, with_image = job.prompt, job.with_image
+            if job.mode is not None:
+                opts = replace(opts, send_mode=job.mode)
             started = time.monotonic()
             sent_prompt, error, text = prompt, None, ""
             reply: Reply | None = None
@@ -643,7 +703,9 @@ class QwenWorker:
             try:
                 posted: list[np.ndarray] = []
                 if with_image:
-                    posted, img, sent_prompt, send_mode = self._build_payload(prompt, opts)
+                    posted, img, sent_prompt, send_mode = self._build_payload(
+                        prompt, opts, frames=job.frames,
+                    )
                 reply = ask(
                     sent_prompt,
                     posted if with_image else None,
@@ -697,15 +759,190 @@ class QwenWorker:
                 self._ui.set_status(f"answered in {note}")
 
 
+# Fraction of pixels that must change (after blur, above MOTION_DELTA) to count
+# as motion. Measured noise floor on the desk camera over 60 static frames:
+# mean 0.00008, max 0.00016. A 25x25px object moving produces ~0.0014, so this
+# sits ~3x above the worst observed noise and ~3x below the smallest real event.
+MOTION_THRESHOLD = 0.0005
+MOTION_DELTA = 25          # per-pixel grayscale change that counts
+MOTION_SETTLE_TICKS = 3    # consecutive quiet ticks before calling it settled
+MOTION_MAX_S = 8.0         # fire anyway if motion never settles
+MOTION_TICK_S = 0.1
+
+
+def _prep(frame: np.ndarray) -> np.ndarray:
+    """Grayscale + blur: the blur is what keeps sensor noise under threshold."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.GaussianBlur(gray, (5, 5), 0)
+
+
+def motion_score(a: np.ndarray, b: np.ndarray) -> float:
+    """Fraction of pixels that changed meaningfully between two prepped frames."""
+    return float((cv2.absdiff(a, b) > MOTION_DELTA).mean())
+
+
+def changed_boxes(
+    before: np.ndarray, after: np.ndarray, *, max_boxes: int = 4,
+) -> list[tuple[int, int, int, int]]:
+    """Bounding boxes of what changed, largest first -- drawn on the view.
+
+    Not sent to the model; this is so a human can see at a glance whether the
+    trigger fired on the thing they care about or on a shadow.
+    """
+    diff = cv2.absdiff(_prep(before), _prep(after))
+    mask = (diff > MOTION_DELTA).astype(np.uint8) * 255
+    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = [cv2.boundingRect(c) for c in contours]
+    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+    return [(x, y, x + w, y + h) for x, y, w, h in boxes[:max_boxes]]
+
+
+class MotionWatcher:
+    """Fires one before/after question at the model when the desk changes.
+
+    A VLM answer costs 3-5s and the GPU serializes them, so polling it to ask
+    "has anything moved" would run at ~0.2Hz and be busy permanently. A frame
+    diff answers that same question at camera rate for free, so it gates
+    everything: the model is only asked once the scene has moved *and settled*,
+    and is handed the last quiet frame plus the first new quiet one.
+
+    Waiting for the settle is what makes the pair useful -- firing on the first
+    changed frame would catch the arm mid-sweep, or a hand still over the desk.
+    """
+
+    def __init__(
+        self,
+        stream: FrameStream,
+        worker: QwenWorker,
+        ui: BottomUI,
+        *,
+        threshold: float = MOTION_THRESHOLD,
+    ) -> None:
+        self._stream = stream
+        self._worker = worker
+        self._ui = ui
+        self._lock = threading.Lock()
+        self.threshold = threshold
+        self._prompt: str | None = None
+        self._state = "off"
+        self._score = 0.0
+        self._events = 0
+        self._skipped = 0
+        self._boxes: list[tuple[int, int, int, int]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="motion", daemon=True)
+        self._thread.start()
+
+    def arm(self, prompt: str) -> None:
+        with self._lock:
+            self._prompt = prompt
+            self._state = "quiet"
+            self._events = self._skipped = 0
+
+    def disarm(self) -> None:
+        with self._lock:
+            self._prompt = None
+            self._state = "off"
+
+    @property
+    def armed(self) -> bool:
+        with self._lock:
+            return self._prompt is not None
+
+    def snapshot(self) -> tuple[str, float, int, int, list[tuple[int, int, int, int]]]:
+        with self._lock:
+            return self._state, self._score, self._events, self._skipped, list(self._boxes)
+
+    def _fire(self, before: np.ndarray, after: np.ndarray, peak: float) -> None:
+        prompt = self._prompt
+        if prompt is None:
+            return
+        boxes = changed_boxes(before, after)
+        with self._lock:
+            self._boxes = boxes
+        # Dropping an event is honest; queueing them all would build a backlog
+        # of stale before/after pairs the user would read as current.
+        if self._worker.busy():
+            with self._lock:
+                self._skipped += 1
+            self._ui.emit(f"  [motion {peak:.5f}] skipped -- still answering the last one")
+            return
+        with self._lock:
+            self._events += 1
+            n = self._events
+        self._ui.emit("")
+        self._ui.emit(f"  [motion #{n}, score {peak:.5f}] {len(boxes)} changed region(s)")
+        self._worker.ask(
+            prompt,
+            frames=[before, after],
+            mode="images",   # video makes a coordinate's frame ambiguous
+            note=f"motion {peak:.5f}",
+            quiet=True,
+        )
+
+    def _loop(self) -> None:
+        before: np.ndarray | None = None
+        prev: np.ndarray | None = None
+        quiet_ticks = 0
+        started = 0.0
+        peak = 0.0
+        while not self._stop.is_set():
+            time.sleep(MOTION_TICK_S)
+            if not self.armed:
+                prev = before = None
+                continue
+            try:
+                frame = self._stream.fresh(min_advance=1)
+            except CameraError:
+                continue
+            cur = _prep(frame)
+            if prev is None:
+                prev, before = cur, frame
+                continue
+            score = motion_score(prev, cur)
+            prev = cur
+            with self._lock:
+                self._score = score
+                state = self._state
+
+            if state == "quiet":
+                if score > self.threshold:
+                    with self._lock:
+                        self._state = "moving"
+                    quiet_ticks, started, peak = 0, time.monotonic(), score
+                else:
+                    before = frame  # rolling last-known-quiet frame
+            elif state == "moving":
+                peak = max(peak, score)
+                if score <= self.threshold:
+                    quiet_ticks += 1
+                else:
+                    quiet_ticks = 0
+                timed_out = time.monotonic() - started > MOTION_MAX_S
+                if quiet_ticks >= MOTION_SETTLE_TICKS or timed_out:
+                    with self._lock:
+                        self._state = "quiet"
+                    if before is not None:
+                        self._fire(before, frame, peak)
+                    before = frame
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+
 class HarnessPreview:
     """Composites the live feed, the submitted frame and the answer panel."""
 
     def __init__(
         self, stream: FrameStream, worker: QwenWorker, *, svc: str,
+        watcher: MotionWatcher | None = None,
     ) -> None:
         self._stream = stream
         self._worker = worker
         self._svc = svc
+        self._watcher = watcher
         self._preview = LivePreview("qwen probe (q or Esc to stop)")
         self._latest: np.ndarray | None = None
         self._lock = threading.Lock()
@@ -729,10 +966,11 @@ class HarnessPreview:
                 time.sleep(0.2)
                 continue
             answer, pending, elapsed = self._worker.snapshot()
+            watch = self._watcher.snapshot() if self._watcher is not None else None
             try:
                 canvas = compose(
                     live, answer=answer, pending=pending, elapsed=elapsed,
-                    opts=self._worker.opts, svc=self._svc,
+                    opts=self._worker.opts, svc=self._svc, watch=watch,
                 )
             except Exception:  # noqa: BLE001 -- a draw bug must not kill the feed
                 time.sleep(0.2)
@@ -789,7 +1027,7 @@ def save_probe(
 
 def handle_command(
     line: str, *, worker: QwenWorker, ui: BottomUI, view: HarnessPreview | None,
-    url: str, outdir: Path,
+    url: str, outdir: Path, watcher: MotionWatcher | None = None,
 ) -> bool:
     """Run a ``/command``. Returns False if the line was not a command."""
     if not line.startswith("/"):
@@ -882,6 +1120,40 @@ def handle_command(
             + (f", {opts.frames} frames {opts.frame_gap_s:g}s apart"
                if opts.send_mode != "single" else "")
         )
+    elif cmd == "watch":
+        if watcher is None:
+            ui.set_status("no watcher (needs the camera stream)")
+        elif not rest or rest[0].lower() in ("off", "stop", "no"):
+            was = watcher.armed
+            watcher.disarm()
+            _st, _sc, events, skipped, _b = watcher.snapshot()
+            ui.set_status(
+                f"watch off after {events} event(s)"
+                + (f", {skipped} skipped while busy" if skipped else "")
+                if was else "watch was not on"
+            )
+        elif opts.pinned is not None:
+            ui.set_status("frame is frozen -- /thaw first, the watcher needs live frames")
+        else:
+            question = " ".join(rest)
+            watcher.arm(question)
+            ui.emit(f"  watching: {question}")
+            ui.set_status(
+                f"armed -- will ask on motion above {watcher.threshold:.5f} (/watch off)"
+            )
+    elif cmd == "sens":
+        if watcher is None:
+            ui.set_status("no watcher (needs the camera stream)")
+            return True
+        try:
+            watcher.threshold = max(0.0, float(rest[0]))
+        except (IndexError, ValueError):
+            _st, score, _e, _s, _b = watcher.snapshot()
+            ui.set_status(
+                f"usage: /sens X (now {watcher.threshold:.5f}, live score {score:.5f})"
+            )
+        else:
+            ui.set_status(f"motion threshold {watcher.threshold:.5f}")
     elif cmd == "sample":
         opts.greedy = not opts.greedy
         ui.set_status(
@@ -1056,6 +1328,17 @@ def main(argv: list[str] | None = None) -> int:
             "into one picture)"
         ),
     )
+    p.add_argument(
+        "--watch", default="",
+        help=(
+            "arm the motion watcher with this question: it is asked, with the "
+            "before/after pair, whenever the desk moves and settles"
+        ),
+    )
+    p.add_argument(
+        "--sens", type=float, default=MOTION_THRESHOLD,
+        help=f"motion trigger threshold (default {MOTION_THRESHOLD})",
+    )
     p.add_argument("--frames", type=int, default=1, help="frames to capture")
     p.add_argument("--gap", type=float, default=0.5, help="seconds between frames")
     p.add_argument(
@@ -1121,12 +1404,17 @@ def main(argv: list[str] | None = None) -> int:
     view: HarnessPreview | None = None
     ui = BottomUI("ask")
     worker: QwenWorker | None = None
+    watcher: MotionWatcher | None = None
     try:
         # Held open even with --no-preview: see QwenWorker.grab.
         stream = FrameStream(args.camera)
         worker = QwenWorker(stream=stream, url=args.url, opts=opts, ui=ui)
+        watcher = MotionWatcher(stream, worker, ui, threshold=args.sens)
         if not args.no_preview:
-            view = HarnessPreview(stream, worker, svc=svc)
+            view = HarnessPreview(stream, worker, svc=svc, watcher=watcher)
+        if args.watch:
+            watcher.arm(args.watch)
+            ui.emit(f"  watching: {args.watch}")
 
         ui.emit(f"qwen3-vl probe -- {svc}")
         ui.emit("/help for commands, /preset for capability probes")
@@ -1143,7 +1431,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if handle_command(
                 line, worker=worker, ui=ui, view=view, url=args.url,
-                outdir=Path(args.outdir),
+                outdir=Path(args.outdir), watcher=watcher,
             ):
                 continue
             worker.ask(line)
@@ -1158,6 +1446,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"camera: {exc}\n{camera_hint()}", file=sys.stderr)
         return 1
     finally:
+        if watcher is not None:
+            watcher.close()
         if worker is not None:
             worker.close()
         ui.close()
