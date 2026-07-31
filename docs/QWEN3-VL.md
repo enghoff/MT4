@@ -219,6 +219,20 @@ changes — no second command. Commands are the exception: `/preset`, `/again`,
 `/watch off` stops; a bare `/watch` reports state when on and resumes when off
 (it is deliberately not the way to turn it off, now that it starts on).
 
+**A typed question is asked about the new frame alone, not the pair.** Almost
+every question is about the state of the scene — "where is the stapler", "how
+many cubes" — and handing that a before/after pair silently reframes it as a
+comparison. That is how the pair framing kept answering *"it has not moved"*
+for changes the frame diff had already proven. Only two things use both frames:
+the built-in "what changed" default, and an explicit `/watch <question>`.
+
+For tracking one object, `/track <object>` arms the same single-frame path with
+a grounding prompt, so each event redraws its box:
+
+```
+ask: /track stapler
+```
+
 An answer costs 3-5s and the GPU serializes them, so polling the model to ask
 "has anything moved" would run at ~0.2 Hz and keep the GPU busy permanently. A
 frame diff answers that question at camera rate for nothing, so it gates
@@ -250,6 +264,27 @@ For actually tracking an object's position, use Grounding DINO instead
 ([docs/GROUNDING_DINO.md](GROUNDING_DINO.md)): ~3 Hz, real boxes, and already
 running here. This is for the semantics — what changed, did it fall over, is
 the arm in the way.
+
+### Getting a JSON object list instead of prose
+
+`identify all objects` returns a paragraph. Asking for "JSON" returns JSON of
+the wrong shape. **The schema has to be named.** Measured on one frame, greedy,
+3 runs each:
+
+| Prompt | Boxes returned |
+|---|---|
+| `identify all objects` | **0** — prose, "Based on the image provided…" |
+| `Identify all objects. Reply in JSON.` | **0** — valid JSON, but `{"objects":[{"name","description"}]}` |
+| Explicit `bbox_2d` schema + "no prose, no markdown" | **10** ✓ |
+
+All three were 3/3 reproducible under greedy decoding, so this is a property of
+the prompt, not luck. No constrained decoding needed — the model complies once
+told the keys. `/objects` has the working prompt baked in (`OBJECTS_PROMPT` in
+`ask_qwen.py`), and `/objects watch` re-lists on every scene change.
+
+Budget tokens for it: roughly 35 per boxed object, so the 256 default truncates
+a busy desk mid-array. `parse_regions` recovers the complete entries, but the
+tail goes missing silently — use `/tokens 600` or more.
 
 ### The frame-dropping trap
 

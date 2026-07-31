@@ -88,6 +88,22 @@ REGION_BGR = [
     (0, 255, 128), (128, 128, 255), (255, 255, 0),
 ]
 
+TRACK_PROMPT = (
+    'Locate the {obj} in this image. Reply ONLY with JSON, nothing else: '
+    '[{{"bbox_2d": [x1, y1, x2, y2], "label": "{obj}"}}]'
+)
+# Naming the schema is the whole trick. Measured, greedy, 3 runs each on one
+# frame: "identify all objects" returned prose and zero boxes 3/3; "identify all
+# objects, reply in JSON" returned JSON of the wrong shape
+# ({"objects":[{"name","description"}]}) and zero boxes 3/3; spelling out
+# bbox_2d and forbidding prose returned 10 boxes 3/3. No constrained decoding
+# needed -- the model complies, it just has to be told the keys.
+OBJECTS_PROMPT = (
+    "Detect every distinct object on the desk surface.\n"
+    "Reply with ONLY a JSON array, no prose, no explanation, no markdown fence:\n"
+    '[{"bbox_2d": [x1, y1, x2, y2], "label": "<short noun>"}]\n'
+    "Begin your reply with [ and end it with ]. Exclude the desk itself."
+)
 # Capability probes worth running against any new VLM build before trusting
 # it for anything on the desk. Ordered easiest-to-hardest: description and
 # counting usually pass, grounding and fine spatial relations are where a
@@ -97,8 +113,7 @@ PRESETS: list[tuple[str, str]] = [
     ("inventory", "List every distinct object you can see. One per line, no commentary."),
     ("count", "How many cubes are in this image? Reply with a single number and nothing else."),
     ("colors", "List each cube and its color, one per line, as 'color: cube'."),
-    ("ground", 'Locate every object on the desk. Reply ONLY with JSON: '
-               '[{"bbox_2d": [x1, y1, x2, y2], "label": "<name>"}]'),
+    ("ground", OBJECTS_PROMPT),
     ("point", 'Point at the object nearest the centre of the desk. Reply ONLY with JSON: '
               '[{"point_2d": [x, y], "label": "<name>"}]'),
     ("ocr", "Read any text, numbers or codes visible in the image, verbatim."),
@@ -113,7 +128,7 @@ PRESETS: list[tuple[str, str]] = [
 ]
 
 HELP = """commands (anything else is asked verbatim):
-  <text>            ask about the current frame
+  <text>            ask it now, and keep answering it on every scene change
   <Enter>           back to the live feed
   /help             this list
   /freeze  /thaw    pin the current frame, so repeat asks use one identical image
@@ -128,10 +143,15 @@ HELP = """commands (anything else is asked verbatim):
                       video  = one sequence; change right, direction not, ~1x
                       montage= tiled into one picture; needs no server support
   /sample           toggle greedy (default) vs sampling at temperature 0.7
-  /watch            ON BY DEFAULT: asks the standing question whenever the desk
-                      moves and settles, with the before/after pair. Anything
-                      you type becomes that question. /watch off to stop,
-                      /watch <question> to set it without asking it now
+  /objects [watch]  JSON list of every object with boxes ("identify all objects"
+                      alone returns prose -- the schema has to be named).
+                      Add 'watch' to re-list on every change
+  /track <object>   locate that object on each NEW frame after movement, box
+                      drawn on it
+  /watch            ON BY DEFAULT. Anything you type becomes the standing
+                      question, re-asked on the NEW frame after every change.
+                      /watch off to stop; /watch <q> uses the before/after
+                      PAIR instead, for explicitly comparative questions
   /once <question>  ask without changing what the watcher is watching for
   /sens X           motion trigger threshold (default 0.0005; noise floor is
                       0.00016, a 25px object moving is ~0.0014)
@@ -184,6 +204,9 @@ class Job:
     frames: list[np.ndarray] | None = None
     mode: str | None = None      # overrides Options.send_mode
     note: str = ""               # transcript prefix, e.g. a motion score
+    # Change regions to outline on the VIEW only, in posted-frame coordinates.
+    # Supplied by the watcher, which already computed them to decide to fire.
+    boxes: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -366,7 +389,8 @@ def render_panel(
     if watch is not None and watch[0] != "off":
         y += BODY_LINE_PX
         state, score, events, skipped, _boxes = watch
-        line = f"watch: {state}  {score:.5f}  {events} event(s)"
+        kind = "track" if len(watch) > 5 and watch[5] == "latest" else "watch"
+        line = f"{kind}: {state}  {score:.5f}  {events} event(s)"
         if skipped:
             line += f"  {skipped} skipped"
         draw_outlined_text(
@@ -565,10 +589,11 @@ class QwenWorker:
         frames: list[np.ndarray] | None = None,
         mode: str | None = None,
         note: str = "",
+        boxes: list[tuple[int, int, int, int]] | None = None,
         quiet: bool = False,
     ) -> None:
         job = Job(prompt=prompt, with_image=with_image, frames=frames,
-                  mode=mode, note=note)
+                  mode=mode, note=note, boxes=list(boxes or []))
         with self._lock:
             self._queue.append(job)
             self._submitted = (prompt, with_image)
@@ -658,7 +683,7 @@ class QwenWorker:
 
     def _build_payload(
         self, prompt: str, opts: Options, frames: list[np.ndarray] | None = None,
-        mark_changes: bool = False,
+        boxes: list[tuple[int, int, int, int]] | None = None,
     ) -> tuple[list[np.ndarray], np.ndarray, str, str]:
         """Return (frames_to_post, image_to_display, sent_prompt, send_mode).
 
@@ -700,8 +725,7 @@ class QwenWorker:
         # own coordinate space, so montage scales them along with the pixels --
         # boxes drawn onto the finished composite land in the wrong place.
         shown = posted
-        if mark_changes and len(posted) == 2:
-            boxes = changed_boxes(posted[0], posted[1])
+        if boxes:
             shown = [f.copy() for f in posted]
             for frame in shown:
                 for x1, y1, x2, y2 in boxes:
@@ -740,8 +764,7 @@ class QwenWorker:
                 posted: list[np.ndarray] = []
                 if with_image:
                     posted, img, sent_prompt, send_mode = self._build_payload(
-                        prompt, opts, frames=job.frames,
-                        mark_changes=bool(job.note),
+                        prompt, opts, frames=job.frames, boxes=job.boxes,
                     )
                     if posted:
                         frame_hw = (posted[0].shape[0], posted[0].shape[1])
@@ -807,6 +830,10 @@ MOTION_THRESHOLD = 0.0005
 # Asked on every motion event until the user types something, which replaces it.
 # Deliberately open-ended: at startup the harness has no idea what you care
 # about, and "what changed" is the one question that is always meaningful.
+# /track <object> builds this. Grounding on ONE frame is the combination that
+# actually worked in testing -- boxes landed on the objects, whereas the
+# before/after "did it move" framing repeatedly answered "it has not moved"
+# for changes the frame diff had already proven.
 DEFAULT_WATCH_QUESTION = (
     "These are two frames of the same scene, before and after something moved. "
     "What changed between them? Answer in one sentence."
@@ -873,6 +900,7 @@ class MotionWatcher:
         self.threshold = threshold
         self._prompt: str | None = None
         self._last_prompt = DEFAULT_WATCH_QUESTION
+        self._send = "pair"
         self._state = "off"
         self._score = 0.0
         self._events = 0
@@ -882,9 +910,19 @@ class MotionWatcher:
         self._thread = threading.Thread(target=self._loop, name="motion", daemon=True)
         self._thread.start()
 
-    def arm(self, prompt: str) -> None:
+    def arm(self, prompt: str, send: str = "pair") -> None:
+        """``send="pair"`` asks about before+after; ``"latest"`` about the new
+        frame alone.
+
+        "What changed" needs both frames. "Where is it now" wants only the new
+        one -- a coordinate is about a single image, and asking for one against
+        a pair leaves it ambiguous which frame it refers to. The pair framing
+        also draws repeated false negatives ("it has not moved") on small
+        changes, where a plain locate-it question on one frame does not.
+        """
         with self._lock:
             self._prompt = self._last_prompt = prompt
+            self._send = send
             self._state = "quiet"
             self._events = self._skipped = 0
 
@@ -905,9 +943,15 @@ class MotionWatcher:
         with self._lock:
             return self._last_prompt
 
-    def snapshot(self) -> tuple[str, float, int, int, list[tuple[int, int, int, int]]]:
+    @property
+    def send(self) -> str:
         with self._lock:
-            return self._state, self._score, self._events, self._skipped, list(self._boxes)
+            return self._send
+
+    def snapshot(self) -> tuple:
+        with self._lock:
+            return (self._state, self._score, self._events, self._skipped,
+                    list(self._boxes), self._send)
 
     def _fire(self, before: np.ndarray, after: np.ndarray, peak: float) -> None:
         prompt = self._prompt
@@ -926,13 +970,15 @@ class MotionWatcher:
         with self._lock:
             self._events += 1
             n = self._events
+            send = self._send
         self._ui.emit("")
         self._ui.emit(f"  [motion #{n}, score {peak:.5f}] {len(boxes)} changed region(s)")
         self._worker.ask(
             prompt,
-            frames=[before, after],
+            frames=[after] if send == "latest" else [before, after],
             mode="images",   # video makes a coordinate's frame ambiguous
             note=f"motion {peak:.5f}",
+            boxes=boxes,
             quiet=True,
         )
 
@@ -1180,7 +1226,7 @@ def handle_command(
             ui.set_status("no watcher (needs the camera stream)")
         elif rest and rest[0].lower() in ("off", "stop", "no"):
             was = watcher.armed
-            _st, _sc, events, skipped, _b = watcher.snapshot()
+            _st, _sc, events, skipped, *_ = watcher.snapshot()
             watcher.disarm()
             ui.set_status(
                 f"watch off after {events} event(s)"
@@ -1191,7 +1237,7 @@ def handle_command(
             # Bare /watch reports when on and resumes when off -- it must not
             # be the way to turn monitoring off, now that it starts on.
             if watcher.armed:
-                state, score, events, skipped, _b = watcher.snapshot()
+                state, score, events, skipped, *_ = watcher.snapshot()
                 ui.emit(f"  watching for: {watcher.last_question}")
                 ui.set_status(
                     f"{state}, score {score:.5f}, {events} event(s)"
@@ -1211,6 +1257,35 @@ def handle_command(
             ui.set_status(
                 f"watching -- asks on motion above {watcher.threshold:.5f} (/watch off)"
             )
+    elif cmd in ("objects", "obj"):
+        # "identify all objects" gets prose; the schema has to be named. See
+        # OBJECTS_PROMPT for the measurement behind that.
+        standing = bool(rest) and rest[0].lower() in ("watch", "keep", "on")
+        # ~35 tokens per boxed object, so a busy desk overruns the default 256
+        # and the array is cut mid-entry. parse_regions still recovers the
+        # complete entries, but the tail is silently missing.
+        if opts.tokens < 500:
+            ui.emit(f"  note: /tokens {opts.tokens} may truncate the list; 600+ is safer")
+        if standing and watcher is not None:
+            watcher.arm(OBJECTS_PROMPT, send="latest")
+            ui.set_status("re-listing objects on every change (/watch off to stop)")
+        worker.ask(OBJECTS_PROMPT)
+    elif cmd == "track":
+        if watcher is None:
+            ui.set_status("no watcher (needs the camera stream)")
+            return True
+        obj = " ".join(rest)
+        if not obj:
+            ui.set_status("usage: /track <object>, e.g. /track stapler")
+            return True
+        if opts.pinned is not None:
+            ui.set_status("frame is frozen -- /thaw first, tracking needs live frames")
+            return True
+        question = TRACK_PROMPT.format(obj=obj)
+        watcher.arm(question, send="latest")
+        ui.emit(f"  tracking: {obj} -- locating it on each new frame after movement")
+        ui.set_status(f"tracking {obj} (motion > {watcher.threshold:.5f}); /watch off to stop")
+        worker.ask(question)   # a box straight away, not only after the next move
     elif cmd == "once":
         question = " ".join(rest)
         if not question:
@@ -1224,7 +1299,7 @@ def handle_command(
         try:
             watcher.threshold = max(0.0, float(rest[0]))
         except (IndexError, ValueError):
-            _st, score, _e, _s, _b = watcher.snapshot()
+            _st, score, *_ = watcher.snapshot()
             ui.set_status(
                 f"usage: /sens X (now {watcher.threshold:.5f}, live score {score:.5f})"
             )
@@ -1528,8 +1603,15 @@ def main(argv: list[str] | None = None) -> int:
             # not quietly switch monitoring back on. Commands (/preset,
             # /again, /noimage) stay one-off and leave the standing question be.
             if watcher is not None and watcher.armed:
-                watcher.arm(line)
-                ui.set_status(f"asking, and watching for: {line[:44]}")
+                # "latest", not "pair": a typed question is almost always about
+                # the state of the scene ("where is the stapler", "how many
+                # cubes"), and handing that a before/after pair reframes it as a
+                # comparison -- which is how the pair framing kept answering
+                # "it has not moved" instead of saying where things were. Only
+                # the built-in "what changed" default and an explicit
+                # /watch <q> want both frames.
+                watcher.arm(line, send="latest")
+                ui.set_status(f"answering this on every change: {line[:38]}")
         # Clean exit (EOF or window closed): let a question already with the
         # model finish, so a piped batch reports every answer.
         worker.drain()
