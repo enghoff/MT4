@@ -224,6 +224,22 @@ supervision, remote access, HTTP API, troubleshooting:
 [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md). Everything else in this repo
 works without it.
 
+### Asking a VLM about the scene
+
+A second, optional GPU service wraps `Qwen/Qwen3-VL-4B-Instruct` and answers
+questions about a frame in free text — describing, counting, reading labels,
+judging graspability — rather than returning boxes. Nothing in the arm stack
+depends on it; it exists to find out what a VLM can and cannot see on this desk.
+
+```powershell
+python ask_qwen.py --camera 1        # interactive: ask, see the answer on the sent frame
+```
+
+The harness shows the answer next to *the exact frame that was POSTed*, draws
+any coordinates the model returned, and can freeze a frame to re-ask the same
+question on identical pixels. Setup, commands, and the measured coordinate-space
+and accuracy findings: [docs/QWEN3-VL.md](docs/QWEN3-VL.md).
+
 ## MCP server
 
 `mt4_mcp` exposes the arm to any MCP client over Streamable HTTP or stdio.
@@ -423,7 +439,7 @@ Full hardware detail (board, drivers, flash path) is in
 |------|---------|
 | [firmware/mt4_jog/](firmware/mt4_jog/) | Custom Arduino firmware: `config`/`pins`/`gripper`/`dda`/`motion`/`homing`/`commands`/`kinematics` |
 | [mt4_jog/](mt4_jog/) | Python client library: serial protocol, joint map, kinematics, gamepad |
-| [mt4_vision/](mt4_vision/) | Vision + motion: calibration, detection, entity table, grounding, grasp/place primitives, path planning, preview |
+| [mt4_vision/](mt4_vision/) | Vision + motion: calibration, detection, entity table, grounding, VLM client, grasp/place primitives, path planning, preview |
 | [mt4_mcp/](mt4_mcp/) | MCP server (HTTP or stdio) + OAuth |
 | [services/grounding_dino/](services/grounding_dino/) | Grounding DINO GPU service (deployed to a separate host) |
 | [scripts/](scripts/) | Diagnostics (`diagnose_pick_accuracy.py`, `validate_scene_live.py`), ngrok + grounding-tunnel launchers |
@@ -433,9 +449,10 @@ Full hardware detail (board, drivers, flash path) is in
 
 Key `mt4_vision` modules: `calib` (calibration + pixel↔robot transforms),
 `detect`/`scene` (cube detection), `entities` (the addressable snapshot),
-`locate`/`grounding` (non-cube objects), `motion`/`pickplace` (grasp and place
-primitives), `stackpath`/`landing`/`workspace` (path and site planning),
-`preview` (annotated overlay).
+`locate`/`grounding` (non-cube objects), `qwen` (VLM question-answering),
+`motion`/`pickplace` (grasp and place primitives),
+`stackpath`/`landing`/`workspace` (path and site planning),
+`preview` (annotated overlay), `console` (bottom-pinned interactive UI).
 
 ## Tests
 
@@ -469,6 +486,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | [docs/OAUTH_CHATGPT.md](docs/OAUTH_CHATGPT.md) | OAuth 2.1 via Google + ngrok for public MCP access |
 | [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md) | Grounding DINO server setup: GPU-host install, WSL2 prerequisites, systemd unit, SSH tunnel, HTTP API, troubleshooting |
 | [services/grounding_dino/README.md](services/grounding_dino/README.md) | What the deployed service files are, and the day-to-day detect commands |
+| [docs/QWEN3-VL.md](docs/QWEN3-VL.md) | Qwen3-VL service: start/stop, HTTP API, SSH tunnel, the `ask_qwen.py` harness, measured coordinate space and accuracy |
 | [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf) | Printable marker sheet (DICT_4X4_50) |
 | [firmware/mt4_jog/src/main.cpp](firmware/mt4_jog/src/main.cpp) | Full serial protocol reference (header comment) |
 | [CLAUDE.md](CLAUDE.md) | Agent instructions: hardware autonomy, primary tools, typical failure patterns |

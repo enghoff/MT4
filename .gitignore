@@ -24,6 +24,9 @@ Desktop.ini
 # Vision: generated diagnostics and per-setup calibration
 vision_calibration.json
 
+# ask_qwen.py /save records (frames + JSON transcripts)
+qwen_probes/
+
 # demonstration collection + converted dataset output (images -- not for git)
 data/
 .mcp.json
