@@ -22,8 +22,8 @@ import os
 import re
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -33,6 +33,14 @@ DEFAULT_URL = os.environ.get("MT4_QWEN_URL", "http://127.0.0.1:8766")
 # few hundred tokens, and generation is serialized on the GPU -- so a queued
 # request waits for the one ahead of it. Well clear of both.
 DEFAULT_TIMEOUT_S = 180.0
+# Frames per second the service should be told a frame sequence represents.
+# Only used to label video timestamps; it must match the real capture spacing
+# or "when did it happen" answers are wrong by the ratio of the two.
+DEFAULT_FPS = 2.0
+# The vision encoder pairs adjacent frames into one temporal patch, so video
+# costs about half the tokens of the same frames sent as separate images
+# (measured on the reference deployment: 695 vs 1341 prompt tokens for 6).
+TEMPORAL_PATCH_SIZE = 2
 
 _UNREACHABLE_HINT = (
     "start the service (`systemctl start qwen3-vl` on the GPU host), or -- if "
@@ -100,6 +108,46 @@ class Region:
         )
 
 
+@dataclass(frozen=True)
+class Reply:
+    """A service response, with enough metadata to tell whether it lied.
+
+    ``text`` is the answer; everything else describes what the model was
+    actually given. That matters because the video path's original failure was
+    silent -- frames past the fourth were dropped and the answer still read
+    fluently. :meth:`frame_warning` is the check worth making on every
+    multi-frame call.
+    """
+
+    text: str
+    mode: str = "text"
+    frames_sent: int = 0
+    images_encoded: int | None = None
+    temporal_groups: int | None = None
+    timestamps_s: tuple[float, ...] = ()
+    prompt_tokens: int | None = None
+    raw: dict = field(default_factory=dict)
+
+    def frame_warning(self) -> str | None:
+        """Non-None when the service encoded fewer frames than were sent."""
+        if self.mode == "video" and self.temporal_groups is not None:
+            # Frames are paired, so N frames should give ceil(N/2) groups.
+            expected = (self.frames_sent + 1) // 2
+            if self.temporal_groups < expected:
+                return (
+                    f"service encoded {self.temporal_groups} temporal groups for "
+                    f"{self.frames_sent} frames (expected {expected}) -- frames "
+                    "were dropped"
+                )
+        if self.mode in ("image", "images") and self.images_encoded is not None:
+            if self.images_encoded < self.frames_sent:
+                return (
+                    f"service encoded {self.images_encoded} of {self.frames_sent} "
+                    "images -- frames were dropped"
+                )
+        return None
+
+
 def health(url: str = DEFAULT_URL, timeout: float = 5.0) -> dict:
     """GET /health. Raises QwenError if the tunnel/service is down."""
     try:
@@ -111,47 +159,91 @@ def health(url: str = DEFAULT_URL, timeout: float = 5.0) -> dict:
         raise QwenError(f"qwen service unreachable at {url} ({exc}); {_UNREACHABLE_HINT}") from exc
 
 
-def generate(
+def _jpeg(frame: np.ndarray, quality: int) -> bytes:
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise QwenError("failed to JPEG-encode frame")
+    return bytes(buf)
+
+
+def ask(
     prompt: str,
-    frame: np.ndarray | None = None,
+    frames: Sequence[np.ndarray] | np.ndarray | None = None,
     *,
+    mode: str = "images",
+    fps: float = DEFAULT_FPS,
     url: str = DEFAULT_URL,
     max_new_tokens: int = 256,
+    do_sample: bool | None = None,
+    temperature: float | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
     jpeg_quality: int = 90,
-) -> str:
-    """Ask the model ``prompt``, optionally about a BGR OpenCV ``frame``.
+) -> Reply:
+    """Ask about zero or more BGR OpenCV frames. Returns a :class:`Reply`.
 
-    Returns the answer text. Omit ``frame`` for a text-only prompt (useful
-    for checking the service is really answering rather than echoing).
+    ``mode`` decides how several frames are presented, and the two are not
+    interchangeable -- measured against a moving-square stimulus on the
+    reference deployment:
+
+    * ``"images"`` -- independent images. Costs one full token budget each.
+      The model compares them explicitly and gets *direction* right (and
+      flips its answer when the frames are reversed, which video does not).
+    * ``"video"`` -- one frame sequence with ``fps`` labelling the real
+      capture rate. About half the tokens, and detects *that* something moved
+      just as reliably, but answered direction invariantly in testing.
+
+    So: ``video`` for "did anything change", ``images`` for "which way".
+    A single frame is sent as one image regardless of ``mode``.
+
+    ``do_sample=False`` forces greedy decoding. Worth passing whenever an
+    answer is being compared against another: the model's own config samples
+    at temperature 0.7, so two identical requests otherwise differ.
     """
     text = prompt.strip()
     if not text:
         raise QwenError("empty prompt")
+    if mode not in ("images", "video"):
+        raise QwenError(f"mode must be 'images' or 'video', got {mode!r}")
+
+    if frames is None:
+        seq: list[np.ndarray] = []
+    elif isinstance(frames, np.ndarray) and frames.ndim == 3:
+        seq = [frames]  # a single frame, passed bare
+    else:
+        seq = list(frames)
+
+    # Video needs at least two frames to be a sequence at all; one frame is
+    # an image whatever the caller asked for.
+    field_name = "video" if (mode == "video" and len(seq) > 1) else "image"
 
     boundary = "----mt4qwen"
-    parts = [
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="prompt"\r\n\r\n'
-        f"{text}\r\n"
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="max_new_tokens"\r\n\r\n'
-        f"{int(max_new_tokens)}\r\n".encode("utf-8")
+    fields: list[tuple[str, str]] = [
+        ("prompt", text),
+        ("max_new_tokens", str(int(max_new_tokens))),
     ]
-    if frame is not None:
-        ok, buf = cv2.imencode(
-            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
-        )
-        if not ok:
-            raise QwenError("failed to JPEG-encode frame")
+    if field_name == "video":
+        fields.append(("fps", repr(float(fps))))
+    if do_sample is not None:
+        fields.append(("do_sample", "true" if do_sample else "false"))
+    if temperature is not None:
+        fields.append(("temperature", repr(float(temperature))))
+
+    parts = [
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+        ).encode("utf-8")
+        for name, value in fields
+    ]
+    for i, frame in enumerate(seq):
         parts.append(
             (
                 f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="image"; '
-                f'filename="frame.jpg"\r\n'
+                f'Content-Disposition: form-data; name="{field_name}"; '
+                f'filename="frame{i}.jpg"\r\n'
                 f"Content-Type: image/jpeg\r\n\r\n"
             ).encode("utf-8")
-            + bytes(buf)
+            + _jpeg(frame, jpeg_quality)
             + b"\r\n"
         )
     parts.append(f"--{boundary}--\r\n".encode("utf-8"))
@@ -173,7 +265,43 @@ def generate(
 
     if not payload.get("ok", True):
         raise QwenError(payload.get("error", "generate failed"))
-    return str(payload.get("response", ""))
+
+    stamps = payload.get("timestamps_s") or ()
+    return Reply(
+        text=str(payload.get("response", "")),
+        mode=str(payload.get("mode", "text")),
+        frames_sent=int(payload.get("frames_sent", len(seq))),
+        images_encoded=payload.get("images_encoded"),
+        temporal_groups=payload.get("temporal_groups"),
+        timestamps_s=tuple(float(s) for s in stamps),
+        prompt_tokens=payload.get("prompt_tokens"),
+        raw=payload,
+    )
+
+
+def generate(
+    prompt: str,
+    frame: np.ndarray | None = None,
+    *,
+    url: str = DEFAULT_URL,
+    max_new_tokens: int = 256,
+    timeout: float = DEFAULT_TIMEOUT_S,
+    jpeg_quality: int = 90,
+) -> str:
+    """Ask about a single optional frame and return just the answer text.
+
+    The simple case, kept as its own function because most callers want a
+    string. Use :func:`ask` for several frames, video, greedy decoding, or
+    the metadata that says what the service really encoded.
+    """
+    return ask(
+        prompt,
+        frame,
+        url=url,
+        max_new_tokens=max_new_tokens,
+        timeout=timeout,
+        jpeg_quality=jpeg_quality,
+    ).text
 
 
 def _json_spans(text: str) -> Iterator[str]:

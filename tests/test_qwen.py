@@ -8,7 +8,15 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from mt4_vision.qwen import QwenError, Region, generate, health, parse_regions
+from mt4_vision.qwen import (
+    QwenError,
+    Region,
+    Reply,
+    ask,
+    generate,
+    health,
+    parse_regions,
+)
 
 
 def _resp(payload: dict) -> MagicMock:
@@ -65,6 +73,108 @@ def test_generate_without_image_omits_the_part() -> None:
 def test_generate_rejects_empty_prompt() -> None:
     with pytest.raises(QwenError, match="empty prompt"):
         generate("   ")
+
+
+# -- multi-frame and video framing ---------------------------------------- #
+
+
+def _frames(n: int) -> list[np.ndarray]:
+    return [np.full((16, 24, 3), i * 10, dtype=np.uint8) for i in range(n)]
+
+
+def test_several_frames_post_repeated_image_fields() -> None:
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_resp({"ok": True, "response": "x", "mode": "images",
+                            "frames_sent": 3, "images_encoded": 3}),
+    ) as open_:
+        r = ask("q", _frames(3))
+    body = open_.call_args[0][0].data
+    assert body.count(b'name="image"') == 3
+    assert b'name="video"' not in body
+    assert b'name="fps"' not in body  # fps is meaningless for images
+    assert r.mode == "images" and r.frames_sent == 3
+
+
+def test_video_mode_posts_video_fields_and_fps() -> None:
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_resp({"ok": True, "response": "x", "mode": "video",
+                            "frames_sent": 4, "temporal_groups": 2,
+                            "timestamps_s": [0.2, 1.2]}),
+    ) as open_:
+        r = ask("q", _frames(4), mode="video", fps=2.0)
+    body = open_.call_args[0][0].data
+    assert body.count(b'name="video"') == 4
+    assert b'name="image"' not in body
+    assert b'name="fps"' in body and b"2.0" in body
+    assert r.temporal_groups == 2 and r.timestamps_s == (0.2, 1.2)
+
+
+def test_one_frame_in_video_mode_falls_back_to_image() -> None:
+    """A single frame is not a sequence; the service would reject video."""
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_resp({"ok": True, "response": "x", "mode": "image"}),
+    ) as open_:
+        ask("q", _frames(1), mode="video")
+    body = open_.call_args[0][0].data
+    assert b'name="image"' in body and b'name="video"' not in body
+
+
+def test_bare_single_frame_is_accepted() -> None:
+    with patch(
+        "urllib.request.urlopen", return_value=_resp({"ok": True, "response": "x"})
+    ) as open_:
+        ask("q", np.zeros((8, 8, 3), dtype=np.uint8))
+    assert open_.call_args[0][0].data.count(b'name="image"') == 1
+
+
+def test_greedy_and_temperature_are_only_sent_when_asked() -> None:
+    with patch(
+        "urllib.request.urlopen", return_value=_resp({"ok": True, "response": "x"})
+    ) as open_:
+        ask("q", None)
+    assert b'name="do_sample"' not in open_.call_args[0][0].data
+
+    with patch(
+        "urllib.request.urlopen", return_value=_resp({"ok": True, "response": "x"})
+    ) as open_:
+        ask("q", None, do_sample=False)
+    body = open_.call_args[0][0].data
+    assert b'name="do_sample"' in body and b"false" in body
+
+
+def test_ask_rejects_unknown_mode() -> None:
+    with pytest.raises(QwenError, match="mode must be"):
+        ask("q", _frames(2), mode="film")
+
+
+# -- the frame-drop guard -------------------------------------------------- #
+
+
+def test_frame_warning_catches_dropped_video_frames() -> None:
+    """The exact failure the service used to have: 6 frames in, 2 groups out."""
+    dropped = Reply(text="fluent but wrong", mode="video", frames_sent=6,
+                    temporal_groups=2)
+    warning = dropped.frame_warning()
+    assert warning is not None and "dropped" in warning
+    assert "expected 3" in warning
+
+
+def test_frame_warning_silent_when_every_frame_landed() -> None:
+    assert Reply(text="x", mode="video", frames_sent=6, temporal_groups=3).frame_warning() is None
+    assert Reply(text="x", mode="video", frames_sent=5, temporal_groups=3).frame_warning() is None
+    assert Reply(text="x", mode="images", frames_sent=4, images_encoded=4).frame_warning() is None
+
+
+def test_frame_warning_catches_dropped_images() -> None:
+    warning = Reply(text="x", mode="images", frames_sent=6, images_encoded=4).frame_warning()
+    assert warning is not None and "4 of 6" in warning
+
+
+def test_frame_warning_ignores_text_only_replies() -> None:
+    assert Reply(text="x", mode="text").frame_warning() is None
 
 
 # -- region parsing -------------------------------------------------------- #

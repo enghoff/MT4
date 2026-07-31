@@ -48,8 +48,16 @@ Multipart form fields:
 | Field | Required | Default | Notes |
 |---|---|---|---|
 | `prompt` | yes | — | The text prompt / question |
-| `image` | no | — | Image file (jpg/png/etc). Omit for text-only chat |
+| `image` | no | — | Image file. **Repeatable** — send it N times for N independent images. Omit for text-only |
+| `video` | no | — | Frame file, **repeatable**, 2+ required. Sent as one time sequence. Mutually exclusive with `image` |
+| `fps` | no | `2.0` | Video only. The *real* capture rate; timestamps are built from it |
 | `max_new_tokens` | no | `256` | Generation length cap |
+| `do_sample` | no | model config | `false` for greedy/reproducible. The model's own config samples at temperature 0.7 |
+| `temperature` | no | model config | Implies `do_sample=true` |
+
+Every response reports what the model actually received — `mode`, `frames_sent`,
+`prompt_tokens`, plus `images_encoded` or `temporal_groups` and `timestamps_s`.
+That is not decoration: see the frame-dropping trap below.
 
 **With an image:**
 
@@ -110,8 +118,9 @@ MCP tools and Grounding DINO all work with this service absent.
 
 | Entry point | What it does |
 |-------------|--------------|
-| [mt4_vision/qwen.py](../mt4_vision/qwen.py) | Client. `health()`, `generate(prompt, frame)` → answer text, `parse_regions(text)` → the boxes/points Qwen named. Raises `QwenError` when unreachable. `MT4_QWEN_URL` overrides the default URL |
+| [mt4_vision/qwen.py](../mt4_vision/qwen.py) | Client. `ask(prompt, frames, mode=...)` → `Reply` (text plus what the service really encoded, incl. `frame_warning()`); `generate(prompt, frame)` → just text for the one-frame case; `parse_regions(text)` → the boxes/points Qwen named; `health()`. Raises `QwenError` when unreachable. `MT4_QWEN_URL` overrides the default URL |
 | [ask_qwen.py](../ask_qwen.py) | Interactive harness — see below |
+| [services/qwen3_vl/](../services/qwen3_vl/) | The deployed service itself: `server.py`, `requirements.txt`, systemd unit |
 
 ### The interactive harness
 
@@ -135,7 +144,9 @@ stays in the corner so you can keep aiming the camera.
 | `/again` | Re-ask the same question; with `/freeze`, the same question on the same pixels |
 | `/coords abs\|norm` | Reinterpret returned coordinates — see below |
 | `/grid` | Draw a labelled pixel grid on the sent image (`annotate_for_pointing`), which measurably helps pointing |
-| `/montage N [S]` | Ask about N frames S seconds apart, tiled and numbered as one image — the only way to probe temporal reasoning through a single-image API |
+| `/frames N [gap]` | Capture N frames, `gap` seconds apart |
+| `/mode M` | How they reach the model: `single`, `montage`, `images`, `video`. Set `/frames` once, then flip `/mode` and `/again` to A/B the representations on the same question |
+| `/sample` | Toggle greedy (default) vs the model's temperature 0.7. Greedy is what makes two answers comparable |
 | `/preset` | A capability checklist: description, inventory, counting, colors, grounding, pointing, OCR, fiducial tags, spatial relations, graspability, arm-occlusion |
 | `/save` | Write the sent frame, the annotated view and a JSON record to `qwen_probes/` |
 
@@ -149,6 +160,55 @@ camera sees the calibrated desk". This harness needs no calibration and no
 markers, and the desk tags are routinely occluded by the very objects being
 probed — so if auto-detect gives up it prints the openable indices and you pass
 one explicitly.
+
+### Multiple frames: images vs video (measured)
+
+The same frames cost very different amounts and produce different answers, so
+the two are not packaging choices. Measured on the reference deployment, 6
+frames at 1280x720:
+
+| Sent as | Prompt tokens | What the model gets |
+|---|---|---|
+| `montage` (tiled into one image) | ~950 | one still; sequence only from drawn numbers |
+| `video` | ~1830 | temporal patching, real timestamps, N/2 groups |
+| `images` | ~2700 | N independent full-budget images, nothing temporal |
+
+Video is about half the cost of images because the encoder pairs adjacent
+frames into one temporal patch (`temporal_patch_size: 2`).
+
+**Capability, tested against ground truth** — a synthetic moving square, and
+real desk frames with the arm driven to known positions:
+
+| Question | montage | images | video |
+|---|---|---|---|
+| Did anything move? (vs. static control) | correct | correct | correct |
+| Which direction did it move? | — | **correct**, and flips when frames are reversed | **wrong, and invariant to reversal** |
+| Which numbered frame is the object furthest left? | wrong | wrong | wrong |
+
+So: **video for "did anything change"** (same answer, ~2/3 the tokens of
+images), **images for "which way"**, and do not trust frame-index or
+superlative questions in any mode. All three detect change reliably; none of
+them reliably index frames.
+
+Video's direction failure is the model, not the plumbing — verified by
+comparing tensors for forward vs reversed frame lists (they differ correctly,
+all frames present, order preserved).
+
+### The frame-dropping trap
+
+The video processor defaults to `do_sample_frames=True`, `fps=2`,
+`min_frames=4`, and *resamples* whatever it is handed as though it were raw
+footage needing decimation. With no metadata it assumes the source was 24 fps,
+so **5, 6, 8 and 9 frames all collapsed to an identical 2-group tensor** —
+frames silently discarded, answer still fluent. Timestamps came from the same
+false assumption: 0.2 s reported for frames actually spanning 2.5 s.
+
+`server.py` fixes both (`do_sample_frames=False` plus real `video_metadata`),
+but note `video_metadata` is only honoured on a **direct processor call** —
+through `apply_chat_template` it is ignored or raises, which is why the video
+path builds text and tensors in two steps. If you ever rewrite that function,
+check `temporal_groups` in the response against `ceil(frames/2)`;
+`mt4_vision.qwen.Reply.frame_warning()` is that assertion.
 
 ### Coordinate space (measured, not assumed)
 
@@ -196,6 +256,21 @@ Set these in `/etc/systemd/system/qwen3-vl.service` (then `sudo systemctl daemon
 
 Model weights are cached under `~/.cache/huggingface/hub/` the first time the
 service loads them (~8GB download), not inside `/opt/qwen3-vl` itself.
+
+### Re-deploying after editing server.py
+
+The source of truth is [services/qwen3_vl/](../services/qwen3_vl/) in this repo;
+`/opt/qwen3-vl` is a deployment of it. Push, restart, confirm:
+
+```powershell
+scp services/qwen3_vl/server.py root@media:/opt/qwen3-vl/server.py
+ssh root@media "systemctl restart qwen3-vl && sleep 30 && curl -s http://127.0.0.1:8766/health"
+```
+
+Model load takes ~20-30s, so a `/health` immediately after the restart reports
+`loaded: false` rather than failing. If the unit file changed, `install -m 644`
+it into `/etc/systemd/system/` and `systemctl daemon-reload` first — `scp` alone
+leaves the old unit in force.
 
 ## Known gotcha
 

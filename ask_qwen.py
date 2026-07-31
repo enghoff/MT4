@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -49,7 +50,16 @@ from mt4_vision.preview import (
     annotate_for_pointing,
     draw_outlined_text,
 )
-from mt4_vision.qwen import DEFAULT_URL, QwenError, Region, generate, health, parse_regions
+from mt4_vision.qwen import (
+    DEFAULT_URL,
+    QwenError,
+    Region,
+    Reply,
+    ask,
+    generate,
+    health,
+    parse_regions,
+)
 
 PANEL_W = 440
 PANEL_PAD = 14
@@ -107,12 +117,26 @@ HELP = """commands (anything else is asked verbatim):
   /grid             toggle the labelled pixel grid drawn on the sent image
   /coords abs|norm  reinterpret returned coords as pixels or 0-1000 normalized
   /tokens N         max_new_tokens (default 256)
-  /montage N [S]    ask about N frames S seconds apart, tiled as one image
+  /frames N [gap]   capture N frames, gap seconds apart (N=1 for one still)
+  /mode M           how they reach the model: single|montage|images|video
+                      images = N separate images; direction right, ~2x tokens
+                      video  = one sequence; change right, direction not, ~1x
+                      montage= tiled into one picture; needs no server support
+  /sample           toggle greedy (default) vs sampling at temperature 0.7
   /noimage          ask the next question text-only (no frame)
   /preset [N]       list capability probes, or run one
   /save [name]      write the sent image, the view and a JSON record
   /health           re-query the service
   Ctrl+C / Ctrl+Z   quit"""
+
+
+# How a multi-frame capture is presented to the model. These are not
+# interchangeable -- measured against a moving-square stimulus, "video"
+# detects that something moved at half the token cost but answers direction
+# invariantly, while "images" gets direction right and flips its answer when
+# the frames are reversed. "montage" tiles them into one picture and needs no
+# multi-frame support at all, which is its only advantage. See docs/QWEN3-VL.md.
+SEND_MODES = ("single", "montage", "images", "video")
 
 
 @dataclass
@@ -122,22 +146,45 @@ class Options:
     # This build answers in 0-1000 normalized coords, verified against the
     # desk camera -- see mt4_vision.qwen.parse_regions. /coords flips it.
     coord_mode: str = "norm"  # "norm" | "abs"
-    montage: int = 1
-    montage_gap_s: float = 1.0
+    send_mode: str = "single"
+    frames: int = 1
+    frame_gap_s: float = 0.5
+    greedy: bool = True
     pinned: np.ndarray | None = None
+
+    @property
+    def fps(self) -> float:
+        """Capture rate implied by the gap -- what video timestamps are built from."""
+        return 1.0 / self.frame_gap_s if self.frame_gap_s > 0 else 1.0
 
 
 @dataclass
 class Answer:
     prompt: str            # what the user typed
     sent_prompt: str       # what was actually POSTed (montage preamble etc.)
-    sent: np.ndarray       # the exact image POSTed (None-image asks: a placeholder)
+    sent: np.ndarray       # what to DISPLAY: the posted image, or frames tiled
     text: str = ""
     regions: list[Region] = field(default_factory=list)
     latency_s: float = 0.0
     error: str | None = None
     tokens: int = 256
     had_image: bool = True
+    send_mode: str = "single"
+    reply: Reply | None = None   # service metadata: groups, timestamps, tokens
+
+    def sent_label(self) -> str:
+        """How the frames actually reached the model -- never guessed from the view."""
+        if not self.had_image:
+            return "text only"
+        r = self.reply
+        n = r.frames_sent if r is not None else 1
+        if self.send_mode == "video" and r is not None:
+            return f"video, {n} frames, ts {list(r.timestamps_s)}"
+        if self.send_mode == "images" and n > 1:
+            return f"{n} separate images"
+        if self.send_mode == "montage":
+            return "1 tiled image (montage)"
+        return "1 image"
 
 
 # --------------------------------------------------------------------------- #
@@ -271,9 +318,14 @@ def render_panel(
         flags += "  grid"
     if opts.pinned is not None:
         flags += "  FROZEN"
-    if opts.montage > 1:
-        flags += f"  montage:{opts.montage}"
+    if not opts.greedy:
+        flags += "  SAMPLING"
     draw_outlined_text(panel, flags, (x, y), scale=0.4, color=DIM)
+    y += BODY_LINE_PX
+    send = opts.send_mode
+    if send != "single":
+        send += f" x{opts.frames} @{opts.frame_gap_s:g}s"
+    draw_outlined_text(panel, f"send: {send}", (x, y), scale=0.4, color=DIM)
     y = rule(y + 10)
 
     if pending is not None:
@@ -303,9 +355,22 @@ def render_panel(
         remaining = max(2, (height - y - 70) // BODY_LINE_PX)
         y = block("A", answer.text or "(empty response)", A_BGR, y, limit=remaining)
 
-    footer = height - 42
+    footer = height - 58
     cv2.line(panel, (x, footer), (PANEL_W - PANEL_PAD, footer), RULE, 1)
+    # What actually reached the model, never inferred from the picture shown.
+    draw_outlined_text(
+        panel, f"sent: {answer.sent_label()}"[: 58], (x, footer + 18),
+        scale=0.4, color=DIM,
+    )
+    warning = answer.reply.frame_warning() if answer.reply is not None else None
+    if warning:
+        draw_outlined_text(
+            panel, "! frames were dropped", (x, footer + 52), scale=0.42, color=ERR_BGR,
+        )
+    footer += 16
     stats = f"{answer.latency_s:.1f}s"
+    if answer.reply is not None and answer.reply.prompt_tokens:
+        stats += f"  {answer.reply.prompt_tokens} tok"
     if not answer.had_image:
         stats += "  text-only"
     if region_counts is not None and region_counts[0]:
@@ -338,6 +403,14 @@ def compose(
         main = answer.sent.copy()
         if answer.regions:
             counts = draw_regions(main, answer.regions, opts.coord_mode)
+        # For images/video the view is a tiling of several posted frames, so
+        # say so -- otherwise it reads as a single montage image having been
+        # sent, which is a different thing to the model.
+        if answer.send_mode in ("images", "video"):
+            draw_outlined_text(
+                main, f"VIEW: tiled for display - sent as {answer.send_mode}",
+                (14, 28), scale=0.55, color=(0, 200, 255),
+            )
         _inset(main, live, "LIVE")
     elif pending is not None:
         main = live.copy()
@@ -495,28 +568,54 @@ class QwenWorker:
 
     # -- worker thread ----------------------------------------------------
 
-    def _build_image(self, opts: Options) -> tuple[np.ndarray, str]:
-        """The image to POST, plus any prompt preamble it needs."""
+    def _capture(self, opts: Options) -> list[np.ndarray]:
+        """The frames to send: the pinned one, or a fresh timed sequence."""
         if opts.pinned is not None:
-            base = opts.pinned.copy()
-            frames = [base]
-        else:
-            frames = [self.grab()]
-            for _ in range(max(0, opts.montage - 1)):
-                time.sleep(opts.montage_gap_s)
-                frames.append(self.grab())
+            return [opts.pinned.copy()]
+        want = 1 if opts.send_mode == "single" else max(1, opts.frames)
+        frames = [self.grab()]
+        for _ in range(want - 1):
+            time.sleep(opts.frame_gap_s)
+            frames.append(self.grab())
+        return frames
+
+    def _build_payload(
+        self, prompt: str, opts: Options,
+    ) -> tuple[list[np.ndarray], np.ndarray, str, str]:
+        """Return (frames_to_post, image_to_display, sent_prompt, send_mode).
+
+        The displayed image and the posted frames diverge for the multi-frame
+        modes: the model gets N frames, the human gets them tiled so all N are
+        visible at once. ``Answer.sent_label`` names what actually went, so the
+        view can never be mistaken for the payload.
+        """
+        frames = self._capture(opts)
+        mode = opts.send_mode if len(frames) > 1 else "single"
 
         preamble = ""
-        if len(frames) > 1:
+        if mode == "montage":
             preamble = (
                 f"This image is a {len(frames)}-frame time sequence from a fixed "
-                f"camera, captured {opts.montage_gap_s:g} seconds apart and tiled "
+                f"camera, captured {opts.frame_gap_s:g} seconds apart and tiled "
                 f"left-to-right then top-to-bottom, numbered 1 to {len(frames)}. "
             )
-        img = montage(frames)
+        elif mode == "images":
+            preamble = (
+                f"These {len(frames)} images are consecutive frames from one fixed "
+                f"camera, in time order, {opts.frame_gap_s:g} seconds apart. "
+            )
+        # Video needs no preamble: the service labels each temporal group with
+        # a real timestamp derived from fps, which is stronger than prose.
+
+        if mode == "montage":
+            posted = [montage(frames)]
+        else:
+            posted = frames
         if opts.grid:
-            img = annotate_for_pointing(img)
-        return img, preamble
+            posted = [annotate_for_pointing(f) for f in posted]
+
+        display = posted[0] if len(posted) == 1 else montage(posted)
+        return posted, display, preamble + prompt, mode
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -534,21 +633,27 @@ class QwenWorker:
             prompt, with_image = job
             started = time.monotonic()
             sent_prompt, error, text = prompt, None, ""
+            reply: Reply | None = None
+            send_mode = "single"
             img = np.full((360, 640, 3), 40, dtype=np.uint8)
             draw_outlined_text(
                 img, "text-only prompt (no image sent)", (24, 190),
                 scale=0.7, color=(200, 200, 200),
             )
             try:
+                posted: list[np.ndarray] = []
                 if with_image:
-                    img, preamble = self._build_image(opts)
-                    sent_prompt = preamble + prompt
-                text = generate(
+                    posted, img, sent_prompt, send_mode = self._build_payload(prompt, opts)
+                reply = ask(
                     sent_prompt,
-                    img if with_image else None,
+                    posted if with_image else None,
+                    mode="video" if send_mode == "video" else "images",
+                    fps=opts.fps,
                     url=self._url,
                     max_new_tokens=opts.tokens,
+                    do_sample=not opts.greedy,
                 )
+                text = reply.text
             except CameraError as exc:
                 error = f"camera: {exc}"
             except QwenError as exc:
@@ -566,20 +671,27 @@ class QwenWorker:
                 error=error,
                 tokens=opts.tokens,
                 had_image=with_image,
+                send_mode=send_mode,
+                reply=reply,
             )
             with self._lock:
                 self._answer = answer
                 self._pending = None
 
             self._ui.emit("")
-            self._ui.emit(f"> {prompt}")
+            self._ui.emit(f"> {prompt}   [{answer.sent_label()}]")
             if error:
                 self._ui.emit(f"  !! {error}")
                 self._ui.set_status(f"failed after {answer.latency_s:.1f}s")
             else:
+                warning = reply.frame_warning() if reply is not None else None
+                if warning:
+                    self._ui.emit(f"  !! {warning}")
                 for line in (text or "(empty response)").split("\n"):
                     self._ui.emit(f"  {line}")
                 note = f"{answer.latency_s:.1f}s"
+                if reply is not None and reply.prompt_tokens:
+                    note += f", {reply.prompt_tokens} prompt tok"
                 if answer.regions:
                     note += f", {len(answer.regions)} region(s)"
                 self._ui.set_status(f"answered in {note}")
@@ -662,6 +774,9 @@ def save_probe(
         "max_new_tokens": answer.tokens,
         "had_image": answer.had_image,
         "sent_size": [answer.sent.shape[1], answer.sent.shape[0]],
+        "send_mode": answer.send_mode,
+        "sent_label": answer.sent_label(),
+        "service": answer.reply.raw if answer.reply is not None else None,
         "regions": [
             {"label": r.label, "kind": r.kind, "coords": list(r.coords)}
             for r in answer.regions
@@ -690,8 +805,8 @@ def handle_command(
             ui.emit(row)
         ui.set_status("ready")
     elif cmd == "freeze":
-        if opts.montage > 1:
-            ui.set_status("/montage is on -- /montage 1 first (a pinned frame is not a sequence)")
+        if opts.frames > 1:
+            ui.set_status("/frames is >1 -- /frames 1 first (a pinned frame is not a sequence)")
             return True
         try:
             frame = worker.grab()
@@ -734,22 +849,44 @@ def handle_command(
             ui.set_status("usage: /tokens N")
         else:
             ui.set_status(f"max_new_tokens = {opts.tokens}")
-    elif cmd == "montage":
+    elif cmd == "frames":
         try:
-            want = max(1, min(9, int(rest[0])))
-            gap = max(0.0, float(rest[1])) if len(rest) > 1 else opts.montage_gap_s
+            want = max(1, min(16, int(rest[0])))
+            gap = max(0.05, float(rest[1])) if len(rest) > 1 else opts.frame_gap_s
         except (IndexError, ValueError):
-            ui.set_status("usage: /montage N [seconds-between]")
+            ui.set_status("usage: /frames N [seconds-between]")
             return True
-        # A frozen frame would be tiled with copies of itself and answered as
-        # if it were a sequence -- a wrong answer with no visible cause.
+        # A frozen frame would be repeated and answered as if it were a
+        # sequence -- a wrong answer with no visible cause.
         if want > 1 and opts.pinned is not None:
-            ui.set_status("frame is frozen -- /thaw first, a montage needs live frames")
+            ui.set_status("frame is frozen -- /thaw first, a sequence needs live frames")
             return True
-        opts.montage, opts.montage_gap_s = want, gap
+        opts.frames, opts.frame_gap_s = want, gap
+        if want > 1 and opts.send_mode == "single":
+            opts.send_mode = "images"
         ui.set_status(
-            f"montage {want} frames, {gap:g}s apart" if want > 1
-            else "montage off (single frame)"
+            f"{want} frames {gap:g}s apart, sent as {opts.send_mode} "
+            f"({opts.fps:g} fps)" if want > 1 else "single frame"
+        )
+    elif cmd == "mode":
+        want = (rest[0].lower() if rest else "")
+        match = [m for m in SEND_MODES if m.startswith(want)] if want else []
+        if len(match) != 1:
+            ui.set_status(f"usage: /mode {'|'.join(SEND_MODES)}")
+            return True
+        opts.send_mode = match[0]
+        if opts.send_mode != "single" and opts.frames < 2:
+            opts.frames = 4
+        ui.set_status(
+            f"mode {opts.send_mode}"
+            + (f", {opts.frames} frames {opts.frame_gap_s:g}s apart"
+               if opts.send_mode != "single" else "")
+        )
+    elif cmd == "sample":
+        opts.greedy = not opts.greedy
+        ui.set_status(
+            "greedy (reproducible)" if opts.greedy
+            else "sampling at the model's temperature 0.7 (answers will vary)"
         )
     elif cmd == "noimage":
         prev = worker.last_submitted()
@@ -824,37 +961,64 @@ def camera_hint() -> str:
 
 def run_once(args: argparse.Namespace, svc: str) -> int:
     """Non-interactive single question, for scripting."""
-    frame = None
+    frames: list[np.ndarray] = []
+    send_mode = "single"
+    stream: FrameStream | None = None
     if not args.no_image:
+        want = 1 if args.mode == "single" else max(1, args.frames)
         try:
-            frame = capture_frame(args.camera)
+            if want == 1:
+                frames = [capture_frame(args.camera)]
+            else:
+                # One held stream, never repeated opens -- see QwenWorker.grab.
+                stream = FrameStream(args.camera)
+                frames = [stream.fresh(min_advance=1)]
+                for _ in range(want - 1):
+                    time.sleep(args.gap)
+                    frames.append(stream.fresh(min_advance=1))
         except CameraError as exc:
             print(f"camera: {exc}\n{camera_hint()}", file=sys.stderr)
             return 1
+        finally:
+            if stream is not None:
+                stream.close()
+        send_mode = args.mode if len(frames) > 1 else "single"
+        if send_mode == "montage":
+            frames = [montage(frames)]
         if args.grid:
-            frame = annotate_for_pointing(frame)
+            frames = [annotate_for_pointing(f) for f in frames]
+
     started = time.monotonic()
     try:
-        text = generate(
-            args.prompt, frame, url=args.url, max_new_tokens=args.tokens,
+        reply = ask(
+            args.prompt, frames or None,
+            mode="video" if send_mode == "video" else "images",
+            fps=1.0 / args.gap if args.gap > 0 else 1.0,
+            url=args.url, max_new_tokens=args.tokens,
+            do_sample=args.sample,
         )
     except QwenError as exc:
         print(f"qwen: {exc}", file=sys.stderr)
         return 1
     latency = time.monotonic() - started
-    regions = parse_regions(text)
+    regions = parse_regions(reply.text)
 
-    print(f"# {svc}  ({latency:.1f}s)")
-    print(text)
+    print(f"# {svc}  ({latency:.1f}s, {reply.mode}, {reply.prompt_tokens} prompt tok)")
+    warning = reply.frame_warning()
+    if warning:
+        print(f"# WARNING: {warning}", file=sys.stderr)
+    print(reply.text)
     for r in regions:
         coords = ", ".join(f"{c:g}" for c in r.coords)
         print(f"# {r.kind} {r.label or '?'}: [{coords}]")
     if args.save:
+        display = frames[0] if len(frames) == 1 else (
+            montage(frames) if frames else np.zeros((8, 8, 3), np.uint8)
+        )
         answer = Answer(
-            prompt=args.prompt, sent_prompt=args.prompt,
-            sent=frame if frame is not None else np.zeros((8, 8, 3), np.uint8),
-            text=text, regions=regions, latency_s=latency, tokens=args.tokens,
-            had_image=frame is not None,
+            prompt=args.prompt, sent_prompt=args.prompt, sent=display,
+            text=reply.text, regions=regions, latency_s=latency, tokens=args.tokens,
+            had_image=bool(frames), send_mode=send_mode, reply=reply,
         )
         annotated = answer.sent.copy()
         draw_regions(annotated, regions, args.coords)
@@ -883,6 +1047,20 @@ def main(argv: list[str] | None = None) -> int:
             "read returned coords as 0-1000 normalized (norm, measured default "
             "for this build) or raw pixels (abs)"
         ),
+    )
+    p.add_argument(
+        "--mode", choices=SEND_MODES, default="single",
+        help=(
+            "how multiple frames reach the model: images (direction right, ~2x "
+            "tokens), video (change right, direction not, ~1x), montage (tiled "
+            "into one picture)"
+        ),
+    )
+    p.add_argument("--frames", type=int, default=1, help="frames to capture")
+    p.add_argument("--gap", type=float, default=0.5, help="seconds between frames")
+    p.add_argument(
+        "--sample", action="store_true",
+        help="sample at the model's temperature 0.7 instead of greedy (default greedy)",
     )
     p.add_argument(
         "--prompt", default="",
@@ -934,7 +1112,11 @@ def main(argv: list[str] | None = None) -> int:
                 client.close()
                 client = None
 
-    opts = Options(tokens=args.tokens, grid=args.grid, coord_mode=args.coords)
+    opts = Options(
+        tokens=args.tokens, grid=args.grid, coord_mode=args.coords,
+        send_mode=args.mode, frames=max(1, args.frames), frame_gap_s=max(0.05, args.gap),
+        greedy=not args.sample,
+    )
     stream: FrameStream | None = None
     view: HarnessPreview | None = None
     ui = BottomUI("ask")
@@ -988,4 +1170,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # Hard exit after main()'s cleanup has already released the camera and the
+    # window. OpenCV highgui can keep a Windows process alive past the end of
+    # main, and a lingering process holds the capture device open -- which
+    # strands the camera for every other vision script in the repo until it is
+    # killed by hand. Observed once; not worth risking again for a CLI whose
+    # work is finished by this point.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
