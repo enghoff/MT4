@@ -1,0 +1,18 @@
+[Unit]
+Description=Qwen3-VL-4B-Instruct vision-language service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/qwen3-vl
+Environment=QWEN_VL_HOST=127.0.0.1
+Environment=QWEN_VL_PORT=8766
+Environment=QWEN_VL_MODEL=Qwen/Qwen3-VL-4B-Instruct
+Environment=QWEN_VL_DEVICE=cuda
+Environment=QWEN_VL_LOAD_IN_4BIT=1
+ExecStart=/opt/qwen3-vl/.venv/bin/python /opt/qwen3-vl/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

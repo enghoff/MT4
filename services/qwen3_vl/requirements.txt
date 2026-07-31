@@ -1,0 +1,9 @@
+torch
+torchvision
+transformers
+accelerate
+bitsandbytes
+fastapi
+uvicorn[standard]
+pillow
+python-multipart
