@@ -133,19 +133,29 @@ class BottomUI:
             print(msg, file=self._out, flush=True)
 
     def emit(self, text: str = "") -> None:
-        """Append lines to the transcript above the pinned lines."""
+        """Append lines to the transcript above the pinned lines.
+
+        A line longer than the terminal width is wrapped across several rows
+        -- each its own scroll step -- rather than clipped, so a long reply
+        (a JSON array on one line, an unbroken URL) never silently loses its
+        tail on screen. This is unlike ``_redraw``'s prompt/status truncation,
+        which must stay exactly one row or it would unpin the footer.
+        """
         text = encodable(text, self._out)
         if not self._live:
             print(text, file=self._out, flush=True)
             return
         rows, cols = self._size()
         last = rows - 2  # bottom row of the scroll region
+        width = cols - 1
         with self._out_lock:
             self._set_scroll_region()
             out = ["\033[?25l"]
             for line in text.split("\n"):
-                # At the region's bottom row, \n scrolls the region up by one.
-                out.append(f"\033[{last};1H\n\033[2K{line[: cols - 1]}")
+                chunks = [line[i : i + width] for i in range(0, len(line), width)] or [""]
+                for chunk in chunks:
+                    # At the region's bottom row, \n scrolls the region up by one.
+                    out.append(f"\033[{last};1H\n\033[2K{chunk}")
             self._write("".join(out))
             self._redraw()
 

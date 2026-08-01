@@ -119,13 +119,18 @@ def test_emit_scrolls_inside_the_region_and_repaints_the_prompt(
     assert text.rindex(f"\033[{PROMPT_ROW};1H") > text.rindex("second")
 
 
-def test_emit_truncates_to_the_terminal_width(
+def test_emit_wraps_long_lines_instead_of_truncating(
     live: tuple[BottomUI, FakeTTY],
 ) -> None:
     ui, out = live
     ui.emit("x" * 200)
-    assert "x" * (COLS - 1) in out.getvalue()
-    assert "x" * COLS not in out.getvalue()
+    text = out.getvalue()
+    # Each wrapped row still respects the terminal width...
+    assert "x" * (COLS - 1) in text
+    assert "x" * COLS not in text
+    # ...but nothing is dropped: it takes 3 scroll steps to place all 200.
+    assert text.count(f"\033[{REGION_END};1H\n") == 3
+    assert text.count("x") == 200
 
 
 def test_long_input_never_wraps_the_prompt_line(

@@ -59,6 +59,7 @@ class QwenError(RuntimeError):
 _BOX_KEYS = ("bbox_2d", "bbox", "box_2d", "box")
 _POINT_KEYS = ("point_2d", "point", "coordinate")
 _LABEL_KEYS = ("label", "name", "text", "object")
+_DESC_KEYS = ("description", "desc", "caption")
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,7 @@ class Region:
     label: str
     kind: str
     coords: tuple[float, ...]
+    description: str = ""
 
     @property
     def cx(self) -> float:
@@ -305,7 +307,14 @@ def generate(
 
 
 def _json_spans(text: str) -> Iterator[str]:
-    """Candidate JSON substrings: fenced blocks first, then balanced spans."""
+    """Candidate JSON substrings: fenced blocks first, then balanced spans.
+
+    An unbalanced opener is stepped over rather than ending the scan, so a
+    reply cut off by ``max_new_tokens`` mid-array still yields the objects
+    that did complete. Bailing there instead left the whole grounding reply
+    to the bare-coordinate fallback, which drops every label and description
+    and then dedups distinct objects that happen to share a box.
+    """
     for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.S):
         yield m.group(1)
 
@@ -326,7 +335,8 @@ def _json_spans(text: str) -> Iterator[str]:
                     end = j
                     break
         if end < 0:
-            return
+            i += 1
+            continue
         yield text[i : end + 1]
         i = end + 1
 
@@ -349,8 +359,17 @@ def _label_of(obj: dict) -> str:
     return ""
 
 
+def _desc_of(obj: dict) -> str:
+    for key in _DESC_KEYS:
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 def _regions_from_dict(obj: dict) -> list[Region]:
     label = _label_of(obj)
+    description = _desc_of(obj)
     out: list[Region] = []
     for keys, kind, arity in (
         (_BOX_KEYS, "box", 4),
@@ -365,7 +384,7 @@ def _regions_from_dict(obj: dict) -> list[Region]:
             for group in groups:
                 nums = _numbers(group)
                 if nums is not None and len(nums) == arity:
-                    out.append(Region(label=label, kind=kind, coords=nums))
+                    out.append(Region(label=label, kind=kind, coords=nums, description=description))
             break
     return out
 

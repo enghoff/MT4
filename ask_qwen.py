@@ -18,9 +18,10 @@ Coordinates come back in whichever space this model build uses (see
 ``parse_regions``); ``/coords`` flips the interpretation so you can settle it
 by eye in two keystrokes rather than guessing.
 
-It is a monitor by default: the desk is watched from startup and anything that
-moves gets asked about, with whatever you last typed as the standing question.
-``--no-watch`` makes it request/response only.
+It is a monitor by default: the desk is watched from startup, and anything
+that moves gets boxed and described (JSON, one box per object) until you type
+something, which replaces that as the standing question. ``--no-watch`` makes
+it request/response only.
 
 Prereqs:
   * The service running, and ``.\\scripts\\start_qwen_tunnel.ps1`` if remote
@@ -105,6 +106,17 @@ OBJECTS_PROMPT = (
     '[{"bbox_2d": [x1, y1, x2, y2], "label": "<short noun>"}]\n'
     "Begin your reply with [ and end it with ]. Exclude the desk itself."
 )
+# Same schema trick as OBJECTS_PROMPT, plus a "description" key -- for a
+# free-text target ("paintings", "the tools") where a short noun label loses
+# the detail a follow-up question would otherwise need a second round-trip
+# to get. Not scoped to the desk: /identify is also used on the room scene.
+IDENTIFY_PROMPT = (
+    "Detect every {obj} in this image.\n"
+    "Reply with ONLY a JSON array, no prose, no explanation, no markdown fence:\n"
+    '[{{"bbox_2d": [x1, y1, x2, y2], "label": "<short noun>", '
+    '"description": "<one short sentence>"}}]\n'
+    "Begin your reply with [ and end it with ]."
+)
 # Capability probes worth running against any new VLM build before trusting
 # it for anything on the desk. Ordered easiest-to-hardest: description and
 # counting usually pass, grounding and fine spatial relations are where a
@@ -137,7 +149,7 @@ HELP = """commands (anything else is asked verbatim):
   /cancel           drop queued questions that have not started yet
   /grid             toggle the labelled pixel grid drawn on the sent image
   /coords abs|norm  reinterpret returned coords as pixels or 0-1000 normalized
-  /tokens N         max_new_tokens (default 256)
+  /tokens N         max_new_tokens (default 700)
   /frames N [gap]   capture N frames, gap seconds apart (N=1 for one still)
   /mode M           how they reach the model: single|montage|images|video
                       images = N separate images; direction right, ~2x tokens
@@ -147,6 +159,9 @@ HELP = """commands (anything else is asked verbatim):
   /objects [watch]  JSON list of every object with boxes ("identify all objects"
                       alone returns prose -- the schema has to be named).
                       Add 'watch' to re-list on every change
+  /identify <what> [watch]  JSON list of <what> with boxes AND a one-sentence
+                      description each, e.g. /identify paintings. Add 'watch'
+                      to re-identify on every change
   /track <object>   locate that object on each NEW frame after movement, box
                       drawn on it
   /watch            ON BY DEFAULT. Anything you type becomes the standing
@@ -171,10 +186,16 @@ HELP = """commands (anything else is asked verbatim):
 # multi-frame support at all, which is its only advantage. See docs/QWEN3-VL.md.
 SEND_MODES = ("single", "montage", "images", "video")
 
+# The service's own default is 256, which suits a sentence of prose but cuts
+# the default watch question's JSON off after ~5 boxed objects (~35 tokens
+# each, plus a description). Truncation there is not graceful: the array
+# never closes, and only the entries that completed can be recovered.
+DEFAULT_TOKENS = 700
+
 
 @dataclass
 class Options:
-    tokens: int = 256
+    tokens: int = DEFAULT_TOKENS
     grid: bool = False
     # This build answers in 0-1000 normalized coords, verified against the
     # desk camera -- see mt4_vision.qwen.parse_regions. /coords flips it.
@@ -219,7 +240,7 @@ class Answer:
     regions: list[Region] = field(default_factory=list)
     latency_s: float = 0.0
     error: str | None = None
-    tokens: int = 256
+    tokens: int = DEFAULT_TOKENS
     had_image: bool = True
     send_mode: str = "single"
     reply: Reply | None = None   # service metadata: groups, timestamps, tokens
@@ -562,6 +583,55 @@ def montage(frames: list[np.ndarray]) -> np.ndarray:
 # worker
 
 
+def format_region(r: Region) -> str:
+    """One line: kind, label, compact bbox/point, description if any."""
+    coords = ", ".join(f"{c:g}" for c in r.coords)
+    suffix = f" -- {r.description}" if r.description else ""
+    return f"{r.kind} {r.label or '?'}: [{coords}]{suffix}"
+
+
+def _display_lines(text: str, regions: list[Region]) -> list[str]:
+    """Split an answer into lines for the terminal transcript.
+
+    BottomUI.emit() wraps a too-long line across rows now rather than
+    dropping its tail, so a JSON array on one line -- the schema /identify
+    and the new default both reply with -- no longer loses text on screen.
+    But ``json.dumps(indent=2)`` explodes every ``bbox_2d`` into 6 lines of
+    its own, which is technically readable and practically a scroll-fest for
+    a handful of objects. ``regions`` is already the exact fields worth
+    reading (label, box, description) with everything else -- schema
+    boilerplate, brackets, per-number lines -- stripped, so a box/point reply
+    prints as one line each instead. Prose and non-grounding JSON (a bare
+    count, an object with no bbox/point key) still get the general
+    fallbacks. The JSON kept for /save is the untouched original text --
+    this only reshapes what gets echoed live.
+    """
+    if not text:
+        return ["(empty response)"]
+    stripped = text.strip()
+    looks_json = stripped[:1] in "[{"
+    whole: object = None
+    if looks_json:
+        try:
+            whole = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            whole = None  # not JSON, or cut short by max_new_tokens
+
+    # Unlabelled regions mean parse_regions fell back to bare coordinates, so
+    # the summary would carry strictly less than the text it replaces -- show
+    # the text instead. Never let the summary be the only thing printed when
+    # it is not actually a summary of what came back.
+    if regions and any(r.label for r in regions):
+        lines = [format_region(r) for r in regions]
+        if looks_json and whole is None:
+            lines.append("!! reply cut off mid-JSON -- raise /tokens; complete entries only")
+        return lines
+    if whole is not None:
+        return json.dumps(whole, indent=2).split("\n")
+    return text.split("\n")
+
+
+
 class QwenWorker:
     """Serial ask queue: one request on the GPU at a time, FIFO behind it.
 
@@ -829,7 +899,7 @@ class QwenWorker:
                 warning = reply.frame_warning() if reply is not None else None
                 if warning:
                     self._ui.emit(f"  !! {warning}")
-                for line in (text or "(empty response)").split("\n"):
+                for line in _display_lines(text, answer.regions):
                     self._ui.emit(f"  {line}")
                 note = f"{answer.latency_s:.1f}s"
                 if reply is not None and reply.prompt_tokens:
@@ -846,15 +916,15 @@ class QwenWorker:
 MOTION_THRESHOLD = 0.0005
 # Asked on every motion event until the user types something, which replaces it.
 # Deliberately open-ended: at startup the harness has no idea what you care
-# about, and "what changed" is the one question that is always meaningful.
-# /track <object> builds this. Grounding on ONE frame is the combination that
-# actually worked in testing -- boxes landed on the objects, whereas the
-# before/after "did it move" framing repeatedly answered "it has not moved"
-# for changes the frame diff had already proven.
-DEFAULT_WATCH_QUESTION = (
-    "These are two frames of the same scene, before and after something moved. "
-    "What changed between them? Answer in one sentence."
-)
+# about, and "what's here, boxed and described" is the one question that is
+# always meaningful -- same schema as /identify, since a typed target isn't
+# available yet. Single frame, not before/after -- /track <object> found the
+# same thing: grounding on ONE frame is the combination that actually worked
+# in testing (boxes landed on the objects), whereas the before/after "did it
+# move" framing repeatedly answered "it has not moved" for changes the frame
+# diff had already proven. Explicit /watch <q> opts back into the pair for
+# genuinely comparative questions.
+DEFAULT_WATCH_QUESTION = IDENTIFY_PROMPT.format(obj="distinct object")
 MOTION_DELTA = 25          # per-pixel grayscale change that counts
 MOTION_SETTLE_TICKS = 3    # consecutive quiet ticks before calling it settled
 MOTION_MAX_S = 8.0         # fire anyway if motion never settles
@@ -917,7 +987,7 @@ class MotionWatcher:
         self.threshold = threshold
         self._prompt: str | None = None
         self._last_prompt = DEFAULT_WATCH_QUESTION
-        self._send = "pair"
+        self._send = "latest"
         self._state = "off"
         self._score = 0.0
         self._events = 0
@@ -927,15 +997,17 @@ class MotionWatcher:
         self._thread = threading.Thread(target=self._loop, name="motion", daemon=True)
         self._thread.start()
 
-    def arm(self, prompt: str, send: str = "pair") -> None:
-        """``send="pair"`` asks about before+after; ``"latest"`` about the new
-        frame alone.
+    def arm(self, prompt: str, send: str = "latest") -> None:
+        """``send="latest"`` asks about the new frame alone; ``"pair"`` asks
+        about before+after.
 
-        "What changed" needs both frames. "Where is it now" wants only the new
-        one -- a coordinate is about a single image, and asking for one against
-        a pair leaves it ambiguous which frame it refers to. The pair framing
-        also draws repeated false negatives ("it has not moved") on small
-        changes, where a plain locate-it question on one frame does not.
+        "Where is it now" wants only the new frame -- a coordinate is about a
+        single image, and asking for one against a pair leaves it ambiguous
+        which frame it refers to. The pair framing also draws repeated false
+        negatives ("it has not moved") on small changes, where a plain
+        locate-it question on one frame does not. "What changed" is the
+        exception that needs both frames -- explicit /watch <q> passes
+        ``send="pair"`` for that.
         """
         with self._lock:
             self._prompt = self._last_prompt = prompt
@@ -1147,7 +1219,10 @@ def save_probe(
         "sent_label": answer.sent_label(),
         "service": answer.reply.raw if answer.reply is not None else None,
         "regions": [
-            {"label": r.label, "kind": r.kind, "coords": list(r.coords)}
+            {
+                "label": r.label, "kind": r.kind, "coords": list(r.coords),
+                **({"description": r.description} if r.description else {}),
+            }
             for r in answer.regions
         ],
     }
@@ -1275,14 +1350,17 @@ def handle_command(
                     + f", threshold {watcher.threshold:.5f}"
                 )
             else:
-                watcher.arm(watcher.last_question)
+                # Reuse whatever mode was last active -- disarm() leaves
+                # ``send`` untouched precisely so a bare resume doesn't
+                # silently downgrade an explicit /watch <q> pair back to latest.
+                watcher.arm(watcher.last_question, send=watcher.send)
                 ui.emit(f"  watching for: {watcher.last_question}")
                 ui.set_status("watching again (/watch off to stop)")
         elif opts.pinned is not None:
             ui.set_status("frame is frozen -- /thaw first, the watcher needs live frames")
         else:
             question = " ".join(rest)
-            watcher.arm(question)
+            watcher.arm(question, send="pair")
             ui.emit(f"  watching for: {question}")
             ui.set_status(
                 f"watching -- asks on motion above {watcher.threshold:.5f} (/watch off)"
@@ -1291,15 +1369,29 @@ def handle_command(
         # "identify all objects" gets prose; the schema has to be named. See
         # OBJECTS_PROMPT for the measurement behind that.
         standing = bool(rest) and rest[0].lower() in ("watch", "keep", "on")
-        # ~35 tokens per boxed object, so a busy desk overruns the default 256
-        # and the array is cut mid-entry. parse_regions still recovers the
-        # complete entries, but the tail is silently missing.
+        # ~35 tokens per boxed object, so a busy desk can still overrun a
+        # lowered budget and cut the array mid-entry. The entries that
+        # completed are recovered and the transcript flags the cut.
         if opts.tokens < 500:
             ui.emit(f"  note: /tokens {opts.tokens} may truncate the list; 600+ is safer")
         if standing and watcher is not None:
             watcher.arm(OBJECTS_PROMPT, send="latest")
             ui.set_status("re-listing objects on every change (/watch off to stop)")
         worker.ask(OBJECTS_PROMPT)
+    elif cmd == "identify":
+        standing = bool(rest) and rest[-1].lower() in ("watch", "keep", "on")
+        obj = " ".join(rest[:-1] if standing else rest).strip()
+        if not obj:
+            ui.set_status("usage: /identify <object(s)> [watch], e.g. /identify paintings")
+            return True
+        if opts.tokens < 500:
+            ui.emit(f"  note: /tokens {opts.tokens} may truncate the list; 600+ is safer")
+        question = IDENTIFY_PROMPT.format(obj=obj)
+        if standing and watcher is not None:
+            watcher.arm(question, send="latest")
+            ui.set_status(f"re-identifying {obj} on every change (/watch off to stop)")
+        worker.ask(question)
+        ui.emit(f"  identifying: {obj}")
     elif cmd == "track":
         if watcher is None:
             ui.set_status("no watcher (needs the camera stream)")
@@ -1462,8 +1554,7 @@ def run_once(args: argparse.Namespace, svc: str) -> int:
         print(f"# WARNING: {warning}", file=sys.stderr)
     print(reply.text)
     for r in regions:
-        coords = ", ".join(f"{c:g}" for c in r.coords)
-        print(f"# {r.kind} {r.label or '?'}: [{coords}]")
+        print(f"# {format_region(r)}")
     if args.save:
         display = frames[0] if len(frames) == 1 else (
             montage(frames) if frames else np.zeros((8, 8, 3), np.uint8)
@@ -1489,7 +1580,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX)
     p.add_argument("--url", default=DEFAULT_URL, help="service base URL")
-    p.add_argument("--tokens", type=int, default=256, help="max_new_tokens")
+    p.add_argument(
+        "--tokens", type=int, default=DEFAULT_TOKENS, help="max_new_tokens",
+    )
     p.add_argument(
         "--grid", action="store_true",
         help="draw a labelled pixel grid on the sent image (helps pointing)",
@@ -1512,9 +1605,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--watch", default=DEFAULT_WATCH_QUESTION, metavar="QUESTION",
         help=(
-            "the standing question the motion watcher asks, with the "
-            "before/after pair, whenever the desk moves and settles. Watching "
-            "is on by default; whatever you type at the prompt replaces this"
+            "the standing question the motion watcher asks on the new frame "
+            "whenever the desk moves and settles. Watching is on by default; "
+            "whatever you type at the prompt replaces this"
         ),
     )
     p.add_argument(
@@ -1605,9 +1698,12 @@ def main(argv: list[str] | None = None) -> int:
         ui.emit("/help for commands, /preset for capability probes")
         if watcher.armed:
             ui.emit(
-                f"  watching the desk (motion > {watcher.threshold:.5f}); what you "
-                "type becomes the standing question. /watch off to stop."
+                f"  watching the desk (motion > {watcher.threshold:.5f}); default "
+                "question boxes and describes whatever appears. What you type "
+                "replaces it. /watch off to stop."
             )
+            if opts.tokens < 500:
+                ui.emit(f"  note: /tokens {opts.tokens} may truncate the list; 600+ is safer")
             ui.set_status("watching -- type a question, or wait for movement")
         else:
             ui.set_status("ready")

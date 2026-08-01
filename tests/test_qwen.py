@@ -241,6 +241,26 @@ def test_parse_survives_malformed_json() -> None:
     assert parse_regions('[{"bbox_2d": [1, 2,, "label"}]') == []
 
 
+def test_parse_recovers_complete_entries_from_a_truncated_array() -> None:
+    """A reply cut off by max_new_tokens must not lose the entries it finished.
+
+    The outer array never closes, so the whole-span parse fails; without
+    per-object recovery this fell through to the bare-coordinate fallback,
+    which drops every label and then dedups distinct objects sharing a box.
+    """
+    text = (
+        '[{"bbox_2d": [0, 40, 104, 317], "label": "lamp", "description": "a lamp."},\n'
+        '{"bbox_2d": [499, 0, 999, 534], "label": "balcony", "description": "a balcony."},\n'
+        '{"bbox_2d": [499, 0, 999, 534], "label": "rail", "description": "a rail."},\n'
+        '{"bbox_2d": [499,'
+    )
+    regions = parse_regions(text)
+    assert [r.label for r in regions] == ["lamp", "balcony", "rail"]
+    assert regions[0].description == "a lamp."
+    # Same box, different labels -- these must survive the dedup.
+    assert regions[1].coords == regions[2].coords
+
+
 # -- coordinate-space handling -------------------------------------------- #
 
 
