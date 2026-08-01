@@ -8,8 +8,9 @@ for the WSL2 host-level gotchas that apply here too).
 
 - **Port:** `8766`, bound to `127.0.0.1` only (not reachable outside the distro/host
   without a tunnel — see below).
-- **VRAM footprint:** ~3.7GB loaded and idle, leaving ~4.2GB headroom on the RTX 3070
-  for KV-cache and vision tokens.
+- **VRAM footprint:** ~6.1GB of the RTX 3070's 8GB with the static cache and CUDA
+  graphs enabled (~3.7GB without — see [Decode throughput](#decode-throughput)).
+  That leaves ~2GB headroom, so it is even less of a co-tenant than before.
 - **Not meant to run at the same time as Grounding DINO** — it's set up as a separate,
   disabled-by-default systemd service you start on demand, not something that
   auto-starts alongside `grounding-dino.service`.
@@ -59,6 +60,12 @@ Every response reports what the model actually received — `mode`, `frames_sent
 `prompt_tokens`, plus `images_encoded` or `temporal_groups` and `timestamps_s`.
 That is not decoration: see the frame-dropping trap below.
 
+It also reports what generation cost, split the way the fixes are split:
+`completion_tokens`, `prefill_s`, `decode_s`, `decode_tok_s`, `generate_s`, and
+`cache` (`static` or `dynamic`). Prefill and decode want opposite optimizations
+and differ by two orders of magnitude per token, so one wall time hides which
+of them a change moved — see [Decode throughput](#decode-throughput).
+
 **With an image:**
 
 ```bash
@@ -90,6 +97,86 @@ curl -X POST http://127.0.0.1:8766/generate \
 Errors come back as standard FastAPI JSON (`400` for a bad/empty image or empty
 prompt, `422` if `prompt` is missing entirely, `503` if the model hasn't finished
 loading yet).
+
+## Decode throughput
+
+**Essentially all of a request's time is the token loop, not the image.** Measured
+on the reference deployment, one 1280x720 frame:
+
+| | cost |
+|---|---|
+| prefill (vision encoder + one batched forward, 912 prompt tokens) | **0.45 s** |
+| decode | **29 ms/token** |
+
+So a 350-token `/objects` reply is ~10s, of which the image accounts for 4%.
+Nothing about resizing frames or trimming vision tokens will move that number
+meaningfully; only the token loop will.
+
+Two knobs do, and they only work together:
+
+| Config | decode | GPU util | power |
+|---|---|---|---|
+| dynamic cache, eager (the original setup) | 11.4 tok/s | 48% | 140 W |
+| static cache, eager | 11.0 tok/s | 61% | 168 W |
+| `COMPILE=1` alone — **silently does nothing** | 10.8 tok/s | 56% | 158 W |
+| **static cache + CUDA-graphed decode** | **34 tok/s** | **86%** | 192 W |
+
+A **3x** speedup, and the utilization number that prompted the exercise goes
+48% → 86%. Note the static cache *on its own is a pessimization* — it is worth
+having only as the precondition for compilation.
+
+### Why `COMPILE=1` alone does nothing
+
+`transformers` compiles only the decode step (prefill stays eager, which is what
+keeps a variable-size vision input from recompiling per image), but
+`_valid_auto_compile_criteria` gates that on `hf_quantizer.is_compileable`. In
+5.14.1 **only `TorchAoHfQuantizer` and `FineGrainedFP8HfQuantizer` return True** —
+bitsandbytes, GPTQ, HQQ, AWQ and the rest all return False. A blocked compile
+only logs `unable to meet the criteria for compilation`, so a config that looks
+enabled can be doing nothing at all. `/health` reports the gate's actual verdict
+in its `compile` field for exactly that reason; check it, don't assume it.
+
+`QWEN_VL_FORCE_COMPILE=1` patches the property. Measured, that gate is
+conservative for this combination (transformers 5.14.1 / bnb 0.50 / torch 2.13 /
+sm86): output stays coherent and is byte-identical across repeated passes in one
+process.
+
+### What it costs
+
+- **~52 s of compilation at startup**, warmed at load rather than on the first
+  request. `/health` reports `loaded: false` for ~80 s after a restart, not ~30 s.
+- **~2.4GB more VRAM** (6.1GB total), from the preallocated cache and the graph pools.
+- **Greedy replies no longer match the ones the uncompiled service gave.** This
+  is *not* caused by compilation — the static cache alone diverged from
+  dynamic-cache-eager on 3 of 4 probe prompts. Changing floating-point reduction
+  order sends one near-tied argmax the other way and the rest of the sequence
+  follows; every output involved stayed coherent. Reproducibility *within* a
+  configuration holds, which is what `/freeze` and `/again` depend on. Only
+  comparisons against answers recorded before this change are affected — if you
+  have such a baseline, re-run it.
+
+### Sizing `QWEN_VL_CACHE_LEN`
+
+Attention runs over the **whole** window every step regardless of how much is
+real, so an oversized cache is pure waste: 4096 gave 23.6 tok/s where 2048 gave
+34 on the same 912-token request. The default 2048 fits one image plus a
+700-token reply.
+
+Requests that would overrun it fall back to the dynamic cache, and therefore to
+eager — correct, just slow, and reported as `"cache": "dynamic"` in the response.
+That covers multi-frame `images` mode (6 frames measured at 5310 prompt tokens →
+8.4 tok/s) and the explicit `/watch <question>` before/after pair. Raise the knob
+if that is your normal workload, and expect the single-frame case to get slower
+in exchange.
+
+### What's left
+
+The remaining ceiling is the quantizer, not the plumbing. 34 tok/s is still well
+short of what a 4B int4 model can do on this card, because bitsandbytes NF4
+dequantizes weights on every matmul — the GPU draws 192 W to produce those
+tokens. Switching to **torchao int4 weight-only** would replace those kernels
+*and* pass the compile gate legitimately (no `FORCE_COMPILE`), and unlike
+AWQ/GPTQ it needs no calibration pass. That is the next real step.
 
 ## Reaching it from outside the distro
 
@@ -335,6 +422,12 @@ Set these in `/etc/systemd/system/qwen3-vl.service` (then `sudo systemctl daemon
 | `QWEN_VL_DEVICE` | `cuda` (auto-detected) | `cuda` or `cpu` |
 | `QWEN_VL_LOAD_IN_4BIT` | `1` | Set to `0` to load full-precision (needs ~16GB+ VRAM, won't fit this card) |
 | `QWEN_VL_MAX_NEW_TOKENS` | `256` | Default generation cap if the request omits `max_new_tokens` |
+| `QWEN_VL_CACHE_LEN` | `2048` | Static KV-cache window. `0` for the dynamic cache (and no compilation). Size it tightly — see [Decode throughput](#decode-throughput) |
+| `QWEN_VL_COMPILE` | `1` | CUDA-graph the decode step. Needs a static cache; **a no-op on its own with bitsandbytes** |
+| `QWEN_VL_FORCE_COMPILE` | `1` | Override `is_compileable=False` on the bnb quantizer. Without it `COMPILE=1` is silently skipped |
+
+Set `QWEN_VL_COMPILE=0` to revert to the original 11.4 tok/s behaviour, e.g. if you
+need to reproduce an answer recorded before the change.
 
 ## Layout
 
@@ -359,10 +452,20 @@ scp services/qwen3_vl/server.py root@media:/opt/qwen3-vl/server.py
 ssh root@media "systemctl restart qwen3-vl && sleep 30 && curl -s http://127.0.0.1:8766/health"
 ```
 
-Model load takes ~20-30s, so a `/health` immediately after the restart reports
-`loaded: false` rather than failing. If the unit file changed, `install -m 644`
-it into `/etc/systemd/system/` and `systemctl daemon-reload` first — `scp` alone
-leaves the old unit in force.
+Model load takes ~20-30s and compilation another ~52s, so allow ~80s; a `/health`
+before then reports `loaded: false` rather than failing. If the unit file changed,
+`install -m 644` it into `/etc/systemd/system/` and `systemctl daemon-reload`
+first — `scp` alone leaves the old unit in force.
+
+Confirm the perf knobs actually engaged, since a blocked compile is silent:
+
+```powershell
+curl -s http://127.0.0.1:8766/health   # want cache:"static", compile:"forced: ..."
+```
+
+One more trap when restarting by hand: `pkill -f qwen3-vl/server.py` over SSH
+matches the remote shell's *own* command line and kills the session before your
+next command runs. Use `pkill -f '[q]wen3-vl/server.py'`.
 
 ## Known gotcha
 

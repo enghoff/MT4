@@ -10,6 +10,15 @@ Environment=QWEN_VL_PORT=8766
 Environment=QWEN_VL_MODEL=Qwen/Qwen3-VL-4B-Instruct
 Environment=QWEN_VL_DEVICE=cuda
 Environment=QWEN_VL_LOAD_IN_4BIT=1
+# Decode-loop speedup: static KV cache + CUDA-graphed decode step. 11.4 ->
+# 31.5 tok/s, 48% -> 86% GPU utilization, at the cost of ~52s of compilation
+# at startup (so /health reports loaded:false for ~80s after a restart, not
+# ~30s). FORCE_COMPILE is required because transformers refuses to compile a
+# bitsandbytes-quantized model; see the comments in server.py for what that
+# gate does and does not protect against. Set COMPILE=0 to revert.
+Environment=QWEN_VL_CACHE_LEN=2048
+Environment=QWEN_VL_COMPILE=1
+Environment=QWEN_VL_FORCE_COMPILE=1
 ExecStart=/opt/qwen3-vl/.venv/bin/python /opt/qwen3-vl/server.py
 Restart=on-failure
 RestartSec=5

@@ -12,9 +12,11 @@ avoid silently discarding most of them.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -23,7 +25,14 @@ import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image
-from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
+from transformers import (
+    AutoProcessor,
+    BitsAndBytesConfig,
+    CompileConfig,
+    LogitsProcessor,
+    Qwen3VLForConditionalGeneration,
+    StaticCache,
+)
 
 MODEL_ID = os.environ.get("QWEN_VL_MODEL", "Qwen/Qwen3-VL-4B-Instruct")
 DEVICE = os.environ.get("QWEN_VL_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -32,6 +41,47 @@ PORT = int(os.environ.get("QWEN_VL_PORT", "8766"))
 LOAD_IN_4BIT = os.environ.get("QWEN_VL_LOAD_IN_4BIT", "1") not in ("0", "false", "False")
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("QWEN_VL_MAX_NEW_TOKENS", "256"))
 DEFAULT_FPS = float(os.environ.get("QWEN_VL_DEFAULT_FPS", "2.0"))
+
+# Decode, not prefill, is what a request's time goes on: measured here, one
+# 1280x720 frame prefills in 0.65s (912 prompt tokens) and then decodes at
+# 82 ms/token. A 350-token /objects reply is therefore ~29s, essentially all
+# of it in the token loop. The two knobs below target that loop.
+#
+# A reused StaticCache instead of the default DynamicCache: dynamic reallocates
+# and torch.cat's the whole K/V of all 36 layers on every single token, static
+# writes in place into buffers allocated once at load. It is also the
+# precondition for compilation -- transformers refuses to compile unless the
+# cache is a compileable type.
+#
+# Size it tightly. Attention runs over the WHOLE window every step regardless
+# of how much of it is real, so an oversized cache is pure waste: measured,
+# 4096 gave 23.6 tok/s and 2048 gave 31.5 tok/s on the same 912-token request.
+# 2048 covers one image (912 prompt tokens) plus a 700-token reply with room
+# over. A request that would overrun it falls back to the dynamic cache and
+# therefore to eager -- correct, just slow -- which is the case for `images`
+# mode with several frames (~2700 prompt tokens for 6). Raise it if that is
+# your normal workload, and expect the single-frame case to get slower.
+CACHE_LEN = int(os.environ.get("QWEN_VL_CACHE_LEN", "2048"))
+# Compile the decode step (transformers wraps only that; prefill stays eager,
+# which is what keeps a variable-size vision input from recompiling per image).
+COMPILE = os.environ.get("QWEN_VL_COMPILE", "0") not in ("0", "false", "False")
+# transformers 5.14 gates compilation on `hf_quantizer.is_compileable`, and
+# bitsandbytes reports False (as do GPTQ, HQQ and every other quantizer here
+# except torchao and fp8), so `COMPILE=1` alone is a no-op that only logs a
+# warning. Measured, that gate is conservative for this combination
+# (transformers 5.14.1 / bnb 0.50 / torch 2.13 / sm86): 11.4 -> 31.5 tok/s,
+# 48% -> 86% GPU utilization, coherent output, and byte-identical replies
+# across repeated passes within one process.
+#
+# What it does NOT preserve is byte-identical replies against the *uncompiled*
+# deployment -- but neither does the static cache on its own, which is the
+# actual source of that drift (measured: static-cache-without-compile diverges
+# from dynamic-cache-eager on 3 of 4 probe prompts). Both are the ordinary
+# consequence of changed floating-point reduction order: one near-tied argmax
+# goes the other way and the rest of the sequence follows. Greedy stays
+# reproducible run-to-run, which is what /freeze and /again rely on; it is only
+# comparisons against answers recorded before this change that are affected.
+FORCE_COMPILE = os.environ.get("QWEN_VL_FORCE_COMPILE", "0") not in ("0", "false", "False")
 
 # The vision encoder pairs adjacent frames into one temporal patch (config
 # vision_config.temporal_patch_size), which is exactly why video costs about
@@ -42,10 +92,45 @@ _TIMESTAMP_RE = re.compile(r"<([0-9.]+) seconds>")
 
 _processor: Any = None
 _model: Any = None
+_cache: Any = None
+_compile_status = "off"
+# One request at a time on the GPU. Already true by accident -- `generate` is
+# blocking and never awaits, so it holds the event loop for its whole duration
+# -- but the reused StaticCache makes it load-bearing rather than incidental:
+# two overlapping generations would write into the same K/V buffers.
+_gpu = asyncio.Lock()
+
+
+def _enable_compile() -> str:
+    """Turn on transformers' decode-step compilation. Returns a status string.
+
+    ``CompileConfig(mode="reduce-overhead")`` is CUDA graphs: the ~36 layers'
+    worth of tiny per-token kernel launches get captured once and replayed,
+    instead of being dispatched from Python 700 times over.
+
+    The quantizer gate is the catch. ``_valid_auto_compile_criteria`` silently
+    declines to compile when ``hf_quantizer.is_compileable`` is False and only
+    warns, so a config that looks enabled can do nothing at all. Bitsandbytes
+    reports False -- deliberately, its 4-bit dequant path is not graph-safe as
+    far as transformers is concerned. ``FORCE_COMPILE`` patches the property to
+    find out whether that is a real limitation or a conservative default; if it
+    is real, the failure mode to watch for is not a crash but *wrong output*,
+    so compare a greedy answer against the uncompiled one before trusting it.
+    """
+    _model.generation_config.compile_config = CompileConfig(mode="reduce-overhead")
+    quantizer = getattr(_model, "hf_quantizer", None)
+    if quantizer is None or quantizer.is_compileable:
+        return "enabled"
+    name = type(quantizer).__name__
+    if not FORCE_COMPILE:
+        _model.generation_config.compile_config = None
+        return f"skipped: {name}.is_compileable is False (set QWEN_VL_FORCE_COMPILE=1 to override)"
+    type(quantizer).is_compileable = property(lambda self: True)
+    return f"forced: overrode {name}.is_compileable=False"
 
 
 def _load() -> None:
-    global _processor, _model
+    global _processor, _model, _cache, _compile_status
     if _model is not None:
         return
     _processor = AutoProcessor.from_pretrained(MODEL_ID)
@@ -66,6 +151,58 @@ def _load() -> None:
     if DEVICE != "cuda":
         _model = _model.to(DEVICE)
     _model.eval()
+
+    if DEVICE == "cuda" and CACHE_LEN > 0:
+        # Buffers are allocated lazily from the first key_states, so no device
+        # or dtype is needed here; one object is built now and reset between
+        # requests rather than reallocated per request. Requests that would
+        # overrun CACHE_LEN fall back to the dynamic cache in `generate`.
+        _cache = StaticCache(config=_model.config, max_cache_len=CACHE_LEN)
+    if COMPILE:
+        _compile_status = _enable_compile()
+        # Capture the graph now. Without this the first real request pays the
+        # whole compile (a minute or more) and reads as a hung service.
+        if _model.generation_config.compile_config is not None:
+            _warmup()
+
+
+def _warmup(tokens: int = 8) -> None:
+    """Run one tiny text-only generation to capture the decode graph at load.
+
+    Text-only is enough: prefill stays eager and is the only part whose shape
+    depends on the image, so the graph being captured here is the same one
+    every subsequent request replays.
+    """
+    inputs = _build_image_inputs("warmup", []).to(_model.device)
+    kwargs: dict[str, Any] = {"max_new_tokens": tokens, "do_sample": False}
+    if _cache is not None:
+        _cache.reset()
+        kwargs["past_key_values"] = _cache
+    started = time.perf_counter()
+    with torch.no_grad():
+        _model.generate(**inputs, **kwargs)
+    print(f"warmup/compile took {time.perf_counter() - started:.1f}s", flush=True)
+
+
+class _FirstTokenClock(LogitsProcessor):
+    """Timestamps the first scored token, splitting prefill from decode.
+
+    ``generate`` reports one wall time, and the two halves behind it want
+    opposite fixes -- prefill is a single batched forward already close to the
+    card's roofline, decode is N sequential ones bound by weight-dequant
+    bandwidth. Measured here they are 0.65s and 82 ms/token, so a change that
+    improves the total by 5% may have halved one and done nothing to the other.
+    Reported per request so that stays visible instead of being re-derived by
+    subtracting two runs at different token caps.
+    """
+
+    def __init__(self) -> None:
+        self.first: float | None = None
+
+    def __call__(self, input_ids: Any, scores: Any) -> Any:
+        if self.first is None:
+            self.first = time.perf_counter()
+        return scores
 
 
 @asynccontextmanager
@@ -89,6 +226,12 @@ def health() -> dict[str, Any]:
         "modes": ["text", "image", "images", "video"],
         "temporal_patch_size": TEMPORAL_PATCH_SIZE,
         "default_fps": DEFAULT_FPS,
+        # Whether the two decode-loop knobs are actually in force, not merely
+        # requested -- `compile` reports the gate's verdict, which is the whole
+        # reason it is surfaced here.
+        "cache": "static" if _cache is not None else "dynamic",
+        "cache_len": CACHE_LEN if _cache is not None else None,
+        "compile": _compile_status,
     }
 
 
@@ -263,8 +406,25 @@ async def generate(
         gen_kwargs["temperature"] = temperature
         gen_kwargs.setdefault("do_sample", True)
 
-    with torch.no_grad():
-        generated_ids = _model.generate(**inputs, **gen_kwargs)
+    prompt_len = int(inputs["input_ids"].shape[-1])
+    # A static cache is a fixed allocation, so a request that would overrun it
+    # falls back rather than failing. Reported in the payload because the fast
+    # path silently not applying is exactly the kind of thing that turns a
+    # perf measurement into a wrong conclusion.
+    cache_used = "dynamic"
+    if _cache is not None and prompt_len + max_new_tokens <= CACHE_LEN:
+        _cache.reset()
+        gen_kwargs["past_key_values"] = _cache
+        cache_used = "static"
+
+    clock = _FirstTokenClock()
+    started = time.perf_counter()
+    async with _gpu:
+        with torch.no_grad():
+            generated_ids = _model.generate(
+                **inputs, logits_processor=[clock], **gen_kwargs
+            )
+    finished = time.perf_counter()
     trimmed = [
         out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
     ]
@@ -272,6 +432,7 @@ async def generate(
         trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
 
+    completion_tokens = int(generated_ids.shape[-1]) - prompt_len
     payload: dict[str, Any] = {
         "ok": True,
         "model": MODEL_ID,
@@ -279,9 +440,21 @@ async def generate(
         "mode": mode,
         "had_image": mode != "text",
         "frames_sent": n_frames,
-        "prompt_tokens": int(inputs["input_ids"].shape[-1]),
+        "prompt_tokens": prompt_len,
+        "completion_tokens": completion_tokens,
+        "generate_s": round(finished - started, 3),
+        "cache": cache_used,
         "response": output_text[0] if output_text else "",
     }
+    if clock.first is not None:
+        # prefill_s covers the vision encoder and the one batched forward;
+        # decode_s covers every token after the first.
+        payload["prefill_s"] = round(clock.first - started, 3)
+        payload["decode_s"] = round(finished - clock.first, 3)
+        if completion_tokens > 1 and finished > clock.first:
+            payload["decode_tok_s"] = round(
+                (completion_tokens - 1) / (finished - clock.first), 1
+            )
     if mode == "video":
         payload["fps"] = fps
     payload.update(consumed)
