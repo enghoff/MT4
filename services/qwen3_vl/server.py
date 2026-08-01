@@ -32,6 +32,7 @@ from transformers import (
     LogitsProcessor,
     Qwen3VLForConditionalGeneration,
     StaticCache,
+    TorchAoConfig,
 )
 
 MODEL_ID = os.environ.get("QWEN_VL_MODEL", "Qwen/Qwen3-VL-4B-Instruct")
@@ -41,6 +42,36 @@ PORT = int(os.environ.get("QWEN_VL_PORT", "8766"))
 LOAD_IN_4BIT = os.environ.get("QWEN_VL_LOAD_IN_4BIT", "1") not in ("0", "false", "False")
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("QWEN_VL_MAX_NEW_TOKENS", "256"))
 DEFAULT_FPS = float(os.environ.get("QWEN_VL_DEFAULT_FPS", "2.0"))
+
+# Which 4-bit backend. Both fit the card; they are not close on speed, because
+# decode at batch 1 is bound by how fast weights can be turned back into
+# something a matmul accepts:
+#
+#   nf4  -- bitsandbytes. Dequantizes into bf16 on every matmul. 34 tok/s
+#           compiled, 6.1GB, ~25s to load.
+#   int4 -- torchao weight-only, tinygemm. 43 tok/s compiled, 5.0GB, 4s to load.
+#
+# The gap only exists once the decode step is compiled: uncompiled, the two are
+# 11.4 and 12.2 tok/s, because per-token dispatch overhead swamps any difference
+# between the kernels. Which is the useful lesson -- the quantizer is worth
+# about +26% on top of CUDA graphs and nothing at all without them.
+#
+# int4 is also the only one of the two transformers will compile without being
+# forced (TorchAoHfQuantizer.is_compileable is True), so it retires the
+# FORCE_COMPILE override rather than merely outrunning it.
+QUANT = os.environ.get("QWEN_VL_QUANT", "int4" if LOAD_IN_4BIT else "none")
+INT4_GROUP = int(os.environ.get("QWEN_VL_INT4_GROUP", "128"))
+# torchao 0.17 defaults to the "plain" packing format, which targets newer
+# architectures. "tile_packed_to_4d" is the TensorCore-tiled tinygemm layout
+# and is the one that has a fast kernel on this sm86 card.
+INT4_PACKING = os.environ.get("QWEN_VL_INT4_PACKING", "tile_packed_to_4d")
+# Modules to leave in bf16, comma-separated. int4 is a decode optimization and a
+# prefill pessimization -- weight-only int4 has to unpack for the wide GEMMs
+# that prefill is made of, where bf16 just multiplies. Quantizing the vision
+# tower therefore costs prefill (measured: 0.45s -> 0.90s for one frame) to
+# speed up a token loop the vision tower takes no part in. Excluding it buys
+# that back for ~0.6GB.
+INT4_SKIP = [m for m in os.environ.get("QWEN_VL_INT4_SKIP", "visual").split(",") if m]
 
 # Decode, not prefill, is what a request's time goes on: measured here, one
 # 1280x720 frame prefills in 0.65s (912 prompt tokens) and then decodes at
@@ -54,14 +85,16 @@ DEFAULT_FPS = float(os.environ.get("QWEN_VL_DEFAULT_FPS", "2.0"))
 # cache is a compileable type.
 #
 # Size it tightly. Attention runs over the WHOLE window every step regardless
-# of how much of it is real, so an oversized cache is pure waste: measured,
-# 4096 gave 23.6 tok/s and 2048 gave 31.5 tok/s on the same 912-token request.
-# 2048 covers one image (912 prompt tokens) plus a 700-token reply with room
-# over. A request that would overrun it falls back to the dynamic cache and
-# therefore to eager -- correct, just slow -- which is the case for `images`
-# mode with several frames (~2700 prompt tokens for 6). Raise it if that is
-# your normal workload, and expect the single-frame case to get slower.
-CACHE_LEN = int(os.environ.get("QWEN_VL_CACHE_LEN", "2048"))
+# of how much of it is real, so an oversized cache is pure waste: measured on
+# the same 912-token request, 4096 gave 23.6 tok/s, 2048 gave 34 and 1664 gave
+# 43. 1664 is the smallest that still fits one image (912 prompt tokens) plus a
+# full 700-token reply, which is the harness's normal shape.
+# A request that would overrun it falls back to the dynamic cache and therefore
+# to eager -- correct, just slow -- which is the case for `images` mode with
+# several frames (6 measured at 5310 prompt tokens) and for the before/after
+# pair that an explicit `/watch <question>` sends. Raise it if that is your
+# normal workload, and expect the single-frame case to get slower for it.
+CACHE_LEN = int(os.environ.get("QWEN_VL_CACHE_LEN", "1664"))
 # Compile the decode step (transformers wraps only that; prefill stays eager,
 # which is what keeps a variable-size vision input from recompiling per image).
 COMPILE = os.environ.get("QWEN_VL_COMPILE", "0") not in ("0", "false", "False")
@@ -94,6 +127,7 @@ _processor: Any = None
 _model: Any = None
 _cache: Any = None
 _compile_status = "off"
+_quantization = "unknown"
 # One request at a time on the GPU. Already true by accident -- `generate` is
 # blocking and never awaits, so it holds the event loop for its whole duration
 # -- but the reused StaticCache makes it load-bearing rather than incidental:
@@ -129,19 +163,51 @@ def _enable_compile() -> str:
     return f"forced: overrode {name}.is_compileable=False"
 
 
+def _quant_config() -> tuple[Any, str]:
+    """The 4-bit backend to load with, plus the label /health reports.
+
+    Weight-only int4 leaves activations in bf16 and only the weights packed,
+    which is the right trade at batch 1: decode reads every weight once per
+    token and does almost no arithmetic per byte read, so the format the weights
+    are stored in is the whole ballgame.
+    """
+    if QUANT == "none" or DEVICE != "cuda":
+        return None, "none"
+    if QUANT == "nf4":
+        return (
+            BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            ),
+            "nf4-4bit",
+        )
+    if QUANT == "int4":
+        from torchao.quantization import Int4WeightOnlyConfig
+
+        label = f"torchao-int4 ({INT4_PACKING}, group {INT4_GROUP})"
+        if INT4_SKIP:
+            label += f", bf16: {'+'.join(INT4_SKIP)}"
+        return (
+            TorchAoConfig(
+                quant_type=Int4WeightOnlyConfig(
+                    group_size=INT4_GROUP, int4_packing_format=INT4_PACKING
+                ),
+                modules_to_not_convert=INT4_SKIP or None,
+            ),
+            label,
+        )
+    raise ValueError(f"QWEN_VL_QUANT must be nf4, int4 or none, got {QUANT!r}")
+
+
 def _load() -> None:
-    global _processor, _model, _cache, _compile_status
+    global _processor, _model, _cache, _compile_status, _quantization
     if _model is not None:
         return
     _processor = AutoProcessor.from_pretrained(MODEL_ID)
-    quant_config = None
-    if LOAD_IN_4BIT and DEVICE == "cuda":
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
+    quant_config, _quantization = _quant_config()
+    started = time.perf_counter()
     _model = Qwen3VLForConditionalGeneration.from_pretrained(
         MODEL_ID,
         dtype="auto",
@@ -151,6 +217,7 @@ def _load() -> None:
     if DEVICE != "cuda":
         _model = _model.to(DEVICE)
     _model.eval()
+    print(f"loaded {_quantization} in {time.perf_counter() - started:.1f}s", flush=True)
 
     if DEVICE == "cuda" and CACHE_LEN > 0:
         # Buffers are allocated lazily from the first key_states, so no device
@@ -222,7 +289,7 @@ def health() -> dict[str, Any]:
         "device": DEVICE,
         "cuda": torch.cuda.is_available(),
         "loaded": _model is not None,
-        "quantization": "nf4-4bit" if (LOAD_IN_4BIT and DEVICE == "cuda") else "none",
+        "quantization": _quantization,
         "modes": ["text", "image", "images", "video"],
         "temporal_patch_size": TEMPORAL_PATCH_SIZE,
         "default_fps": DEFAULT_FPS,
