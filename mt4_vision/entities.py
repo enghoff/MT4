@@ -10,7 +10,7 @@ Two defects this replaces:
 * ``mt4_pick_cube(color)`` resolved ambiguity silently via ``pick_largest_cube``
   -- no way to name *which* red cube, and no way for the request to fail.
 * A blob the pick filters rejected simply wasn't reported, so the honest answer
-  ("that is the arm's own paint, 78mm outside the marker hull") came back as
+  ("that is the arm's own paint, behind the desk's back edge") came back as
   "no red cube in view". Every detection that is a real object appears here,
   non-pickable ones included, each carrying the gate that stopped it.
 
@@ -42,12 +42,9 @@ from mt4_vision.motion import (
     Grasp,
 )
 from mt4_vision.scene import (
-    HULL_OUTSIDE_MARGIN_MM,
     PICK_MAX_AREA,
     PICK_MIN_AREA,
     Scene,
-    _marker_hull_robot,
-    within_pick_hull,
 )
 from mt4_vision.workspace import (
     KEEPOUT_RADIUS_MM,
@@ -55,7 +52,9 @@ from mt4_vision.workspace import (
     PICK_CLEARANCE_MM,
     MarkerSlot,
     dist_mm,
+    in_work_region,
     is_mp_reachable_xy,
+    work_region_block_reason,
 )
 
 if TYPE_CHECKING:  # only for the annotation; locate.py must not be a dependency
@@ -224,22 +223,17 @@ def pick_block_reason(cube: CubeDetection, scene: Scene) -> str | None:
             f"blob is {cube.area:.0f}px2, over the {PICK_MAX_AREA:.0f}px2 pick "
             f"ceiling -- the arm's own body or a smear, not a cube"
         )
-    if not is_mp_reachable_xy(x, y):
+    if scene.calib is not None:
+        region = work_region_block_reason(x, y, scene.calib)
+        if region is not None:
+            return region
+    elif not is_mp_reachable_xy(x, y):
         return (
             f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out "
             f"(firmware mp refuses any target there)"
         )
-    if r > MAX_REACH_MM:
+    elif r > MAX_REACH_MM:
         return f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
-    if not within_pick_hull(x, y, scene.markers):
-        hull = _marker_hull_robot(scene.markers)
-        outside = 0.0
-        if hull is not None:
-            outside = -float(cv2.pointPolygonTest(hull, (x, y), True))
-        return (
-            f"{outside:.0f}mm outside the marker hull (allowance "
-            f"{HULL_OUTSIDE_MARGIN_MM:.0f}mm) -- arm paint or off-desk clutter"
-        )
 
     nearest = None
     for other in scene.cubes:
@@ -262,9 +256,13 @@ def _marker_place_block_reason(
     if occupant is not None:
         return f"occupied by {occupant}"
     r = math.hypot(marker.x, marker.y)
-    if not is_mp_reachable_xy(marker.x, marker.y):
+    if scene.calib is not None:
+        region = work_region_block_reason(marker.x, marker.y, scene.calib)
+        if region is not None:
+            return region
+    elif not is_mp_reachable_xy(marker.x, marker.y):
         return f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out"
-    if r > MAX_REACH_MM:
+    elif r > MAX_REACH_MM:
         return f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
     if marker.marker_id not in scene.visible_marker_ids:
         return (
@@ -408,6 +406,13 @@ def build_snapshot(
             )
         )
 
+    # placeable is computed, not asserted. It used to be a literal True on
+    # every slot free_placement_slots returned, and that function checked only
+    # keep-out and reach -- so five of the eight fixed slots were advertised as
+    # place targets while sitting where the detector discarded anything put
+    # there. free_placement_slots now gates on the work region too, making this
+    # belt-and-braces; it is written out anyway because a slot list that lies
+    # about placeable is the one failure mode with no symptom at the time.
     slot_entities = [
         Entity(
             id=f"slot_{i}",
@@ -415,7 +420,15 @@ def build_snapshot(
             label="open slot",
             x=float(sx),
             y=float(sy),
-            placeable=True,
+            placeable=(
+                scene.calib is None
+                or in_work_region(float(sx), float(sy), scene.calib)
+            ),
+            reason=(
+                None
+                if scene.calib is None
+                else work_region_block_reason(float(sx), float(sy), scene.calib)
+            ),
             source="slot",
         )
         for i, (sx, sy) in enumerate(
@@ -476,13 +489,14 @@ def object_entity(
 
     reason: str | None = None
     r = math.hypot(obj.x, obj.y)
-    if not is_mp_reachable_xy(obj.x, obj.y):
+    calib = None if scene is None else scene.calib
+    if calib is not None:
+        reason = work_region_block_reason(obj.x, obj.y, calib)
+    elif not is_mp_reachable_xy(obj.x, obj.y):
         reason = f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out"
     elif r > MAX_REACH_MM:
         reason = f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
-    elif scene is not None and not within_pick_hull(obj.x, obj.y, scene.markers):
-        reason = "outside the marker hull -- off-desk clutter or a bad hint"
-    elif scene is not None:
+    if reason is None and scene is not None:
         need = max(obj.short_mm, 20.0) * 0.5 + 12.0
         for other in scene.cubes:
             if other.x is None or other.y is None:

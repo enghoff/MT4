@@ -43,6 +43,8 @@ CALIB = Calibration(
     grip_open_s=140,
     grip_close_s=240,
 )
+from rig import CALIB as RIG_CALIB, calibration as rig_calibration
+
 FRAME_W, FRAME_H = 1280, 720
 DESK = (140, 150, 165)  # a light wooden desk, in BGR
 PEN = (35, 30, 30)  # a dark pen
@@ -495,13 +497,16 @@ def _obj(x, y, *, axis=37.0, short=9.0, long_mm=138.0):
 
 
 def _span_calib(**kw) -> Calibration:
-    """CALIB plus the measured jaw-span model (jaws open to ~64mm)."""
-    return Calibration(
-        homography=CALIB.homography, table_z=127.2, safe_z=155.0,
-        grip_open_s=140, grip_close_s=240,
-        grip_span_s_at_zero_mm=285.0, grip_span_s_per_mm=2.25,
-        **kw,
-    )
+    """The real rig plus the measured jaw-span model (jaws open to ~64mm).
+
+    Not module-level CALIB: that one is a deliberately arithmetic 0.5mm/px
+    scale for testing the measurement maths, and grasp_feasibility now asks
+    the work region whether the camera can see the grasp point -- a question
+    only a real camera model can answer.
+    """
+    kw.setdefault("grip_span_s_at_zero_mm", 285.0)
+    kw.setdefault("grip_span_s_per_mm", 2.25)
+    return rig_calibration(grip_close_s=240, **kw)
 
 
 def test_feasible_object_in_the_workspace() -> None:
@@ -510,20 +515,27 @@ def test_feasible_object_in_the_workspace() -> None:
 
 
 def test_infeasible_inside_keepout() -> None:
-    ok, reason = grasp_feasibility(_obj(100.0, 0.0), CALIB)
+    ok, reason = grasp_feasibility(_obj(100.0, 0.0), RIG_CALIB)
     assert not ok and "keep-out" in reason
 
 
 def test_infeasible_beyond_reach() -> None:
-    ok, reason = grasp_feasibility(_obj(400.0, 0.0), CALIB)
+    ok, reason = grasp_feasibility(_obj(400.0, 0.0), RIG_CALIB)
     assert not ok and "max reach" in reason
 
 
-def test_infeasible_past_the_cameras_verifiable_radius() -> None:
-    """Placing past this radius loses the object to vision until moved by hand,
-    so it is refused even though the arm can physically reach it."""
-    ok, reason = grasp_feasibility(_obj(300.0, 0.0), CALIB)
-    assert not ok and "beyond camera" in reason
+def test_infeasible_past_the_cameras_coverage() -> None:
+    """Placing where the camera cannot see loses the object until it is moved
+    by hand, so it is refused even though the arm can physically reach it.
+
+    This used to be a 240mm circle. It is now the actual frame projection, so
+    the refusal is bearing-dependent: straight out along +x the camera's near
+    edge cuts in at ~284mm, while the same radius to the side is fine.
+    """
+    ok, reason = grasp_feasibility(_obj(320.0, 0.0), RIG_CALIB)
+    assert not ok and "camera frame" in reason
+    ok_side, _ = grasp_feasibility(_obj(0.0, 320.0), RIG_CALIB)
+    assert ok_side, "the old radius cap refused this; the camera sees it fine"
 
 
 def test_infeasible_wider_than_the_jaws_open() -> None:
@@ -539,16 +551,16 @@ def test_too_open_check_is_skipped_when_uncalibrated() -> None:
     """Without the measured jaw model there is no jaws-open limit to compare
     against, and inventing one would refuse valid grasps. Closing too FAR on a
     wide object only squeezes, which the jaws tolerate."""
-    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=80.0), CALIB)
+    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=80.0), RIG_CALIB)
     assert ok
-    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=17.0), CALIB)
+    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=17.0), RIG_CALIB)
     assert ok
 
 
 def test_narrow_object_allowed_when_the_jaw_model_is_uncalibrated() -> None:
     """Object picks open fully then command a full close; the servo stops on
     resistance, so a missing jaw-span model is not a reason to refuse."""
-    ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), CALIB)
+    ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), RIG_CALIB)
     assert ok and reason is None
     ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=9.0), _span_calib())
     assert ok and reason is None

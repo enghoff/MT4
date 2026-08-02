@@ -323,7 +323,8 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         to mt4_pick / mt4_place, robot-frame x/y in mm, and `pickable` /
         `placeable` flags. When one of those is false, `reason` says which
         physical constraint stopped it (keep-out, reach, finger clearance,
-        outside the marker hull, undecoded tag) -- report that reason rather
+        off the desk, outside the camera frame, undecoded tag) -- report that
+    reason rather
         than trying a different target.
 
         Entity kinds: `cube_N` (colour-detected cubes), `marker_N` (the printed
@@ -331,7 +332,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         spots), `obj_N` (anything registered via mt4_locate_at_pixel).
 
         Detections that are real objects but not valid pick targets ARE listed,
-        with their reason -- "that blob is 60mm outside the marker hull, most
+        with their reason -- "that blob is past the desk's back edge, most
         likely the arm's own paint" is a better answer than omitting it.
 
         Uses a fresh camera frame, so ids change between calls. Re-call after

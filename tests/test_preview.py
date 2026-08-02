@@ -15,6 +15,7 @@ from mt4_vision.detect import CubeDetection, MarkerDetection
 from mt4_vision.preview import VideoRecorder, annotate_scene
 from mt4_vision.scene import Scene
 from mt4_vision.workspace import MarkerSlot, rebuild_workspace_state
+from rig import CALIB as RIG_CALIB
 
 
 def cube(color: str, px: float, py: float, x: float, y: float) -> CubeDetection:
@@ -25,9 +26,9 @@ def make_scene() -> Scene:
     markers = [MarkerSlot(0, 100.0, 0.0), MarkerSlot(1, 200.0, 100.0)]
     cubes = [cube("red", 300.0, 200.0, 100.0, 0.0)]
     state = rebuild_workspace_state(
-        None, markers, cubes, visible_marker_ids={0, 1}
+        RIG_CALIB, markers, cubes, visible_marker_ids={0, 1}
     )
-    return Scene.from_workspace(state, raw_cubes=cubes)
+    return Scene.from_workspace(state, raw_cubes=cubes, calib=RIG_CALIB)
 
 
 def test_annotate_scene_does_not_mutate_input_frame():

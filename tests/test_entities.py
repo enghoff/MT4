@@ -33,6 +33,7 @@ from mt4_vision.entities import (
 from mt4_jog.joints import GRIPPER_S_CLOSED, GRIPPER_S_OPEN
 from mt4_vision.motion import YAW_PERIOD_LONG_AXIS, YAW_PERIOD_SQUARE
 from mt4_vision.scene import PICK_MAX_AREA, PICK_MIN_AREA, Scene, filter_phantoms
+from rig import CALIB
 from mt4_vision.workspace import (
     MAX_REACH_MM,
     MarkerSlot,
@@ -60,9 +61,9 @@ def scene(cubes, visible=None) -> Scene:
     phantom-filtered pick subset."""
     if visible is None:
         visible = {m.marker_id for m in MARKERS}
-    state = rebuild_workspace_state(None, MARKERS, cubes, visible_marker_ids=visible)
+    state = rebuild_workspace_state(CALIB, MARKERS, cubes, visible_marker_ids=visible)
     return Scene.from_workspace(
-        state, pick_cubes=filter_phantoms(cubes, MARKERS), raw_cubes=cubes
+        state, pick_cubes=filter_phantoms(cubes, CALIB), raw_cubes=cubes, calib=CALIB
     )
 
 
@@ -91,7 +92,7 @@ def test_pickable_agrees_with_the_pick_path() -> None:
         cube("red", 140.0, 240.0),        # clean, isolated (306mm away)
         cube("green", 100.0, 0.0),        # inside keep-out
         cube("yellow", 330.0, 180.0),     # beyond max reach
-        cube("red", 240.0, 100.0),        # inside reach, 60mm outside the hull
+        cube("red", -100.0, 250.0),       # behind the desk's back edge
         cube("blue", 200.0, -40.0),       # 20mm from the blue above
         cube("green", 160.0, 60.0, area=100.0),   # under the pick floor
         cube("red", 160.0, 0.0, area=9000.0),     # over the pick ceiling
@@ -112,7 +113,7 @@ def test_every_unpickable_cube_explains_itself() -> None:
     cubes = [
         cube("green", 100.0, 0.0),
         cube("yellow", 330.0, 180.0),
-        cube("red", 240.0, 100.0),
+        cube("red", -100.0, 250.0),
         cube("green", 160.0, 60.0, area=100.0),
         cube("red", 160.0, 0.0, area=9000.0),
     ]
@@ -143,13 +144,28 @@ def test_reason_max_reach() -> None:
     assert r and "max reach" in r and f"{MAX_REACH_MM:.0f}" in r
 
 
-def test_reason_outside_hull_reports_the_distance() -> None:
-    # r=260mm, so inside reach: the hull is genuinely the first gate to
-    # fire, not a consequence of being unreachable.
-    s = scene([cube("red", 240.0, 100.0)])
+def test_reason_off_the_desk() -> None:
+    # Inside reach and inside the camera frame, so the desk edge is genuinely
+    # the first gate to fire rather than a consequence of anything else.
+    s = scene([cube("red", -100.0, 250.0)])
     r = pick_block_reason(s.raw_cubes[0], s)
-    assert r and "outside the marker hull" in r
-    assert "mm outside" in r  # the how-far, not just the fact
+    assert r and "edge of the desk" in r
+
+
+def test_reason_outside_the_camera_frame() -> None:
+    # r=320mm straight out along +x: the arm can hold this pose and lift off
+    # it, and the desk is there, but the camera's near edge cuts in at ~284mm
+    # so nothing could confirm or re-pick a cube here.
+    s = scene([cube("red", 320.0, 0.0)])
+    r = pick_block_reason(s.raw_cubes[0], s)
+    assert r and "camera frame" in r
+
+
+def test_far_desk_cube_is_pickable_now() -> None:
+    # The measured regression: on the desk, in reach, in frame -- and until
+    # 2026-08-02 silently absent because it sat outside the marker hull.
+    s = scene([cube("blue", 266.5, -52.7)])
+    assert pick_block_reason(s.raw_cubes[0], s) is None
 
 
 def test_reason_area_floor_and_ceiling() -> None:
@@ -216,7 +232,7 @@ def test_undecoded_marker_is_never_a_place_target() -> None:
 def test_marker_beyond_reach_says_so() -> None:
     """Marker 1 sits at r~303mm here, inside reach; push a marker out instead."""
     far = [MarkerSlot(9, 340.0, 180.0)]
-    state = rebuild_workspace_state(None, far, [], visible_marker_ids={9})
+    state = rebuild_workspace_state(CALIB, far, [], visible_marker_ids={9})
     sn = build_snapshot(
         Scene.from_workspace(state, pick_cubes=[], raw_cubes=[]), token="s1"
     )

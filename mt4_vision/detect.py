@@ -271,11 +271,11 @@ def detect_cubes(
     # speckle -- a bigger open kernel eats the ~15-20px cube blobs whole.
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    hull = None
-    if calibration is not None and calibration.workspace_hull_px:
-        hull = np.array(calibration.workspace_hull_px, dtype=np.float32)
+    # Deferred: workspace imports this module for CubeDetection.
+    from mt4_vision.workspace import on_table
 
     detections: list[CubeDetection] = []
+    dropped_off_table = 0
     for color, bands in ranges.items():
         if colors is not None and color not in colors:
             continue
@@ -298,14 +298,6 @@ def detect_cubes(
             px, py = _top_face_centroid(
                 hsv, contour, (m["m10"] / m["m00"], m["m01"] / m["m00"])
             )
-            # Workspace filter: off-desk clutter contributes stray blobs.
-            # The margin is negative (allowing detections a bit OUTSIDE the
-            # marker polygon) because the markers now sit inside the arm's
-            # reach, not at the desk edges -- cubes can legitimately sit
-            # outside the polygon. The arm's own red-reading body is handled
-            # by MAX_BLOB_AREA, not this filter.
-            if hull is not None and cv2.pointPolygonTest(hull, (px, py), True) < -80:
-                continue
             det = CubeDetection(color, px, py, area, sat=_blob_saturation(hsv, px, py))
             if calibration is not None:
                 det.x, det.y = calibration.pixel_to_robot(px, py, on_cube_top=True)
@@ -313,6 +305,43 @@ def detect_cubes(
                 if off:
                     det.x += float(off[0])
                     det.y += float(off[1])
+                # The ONLY thing dropped here is what is not on the desk at
+                # all: the arm's own links and the wall behind it. On this
+                # steeply oblique mount anything with height images ABOVE the
+                # desk-edge line, so the arm's body maps behind the edge and
+                # falls out here for free, while its base maps inside the
+                # keep-out and is rejected later.
+                #
+                # Everything else stays, including cubes the arm cannot reach
+                # and cubes the camera can barely confirm. Those are real
+                # objects: they must still block a placement beside them, and
+                # a caller asking about one deserves the reason rather than
+                # silence. Deciding they are not PICK targets is
+                # scene.is_phantom_detection's job, one layer up, where a
+                # reason can be attached.
+                #
+                # This replaced a -80px test against the marker-centre hull,
+                # which was a hard drop with no reason attached. Measured
+                # 2026-08-02 on a live frame, it was deleting three cubes that
+                # were plainly on the desk and plainly in reach.
+                if not on_table(det.x, det.y, calibration):
+                    dropped_off_table += 1
+                    continue
                 det.yaw_deg = _robot_edge_yaw_deg(contour, calibration)
             detections.append(det)
+    if dropped_off_table:
+        _LAST_DROPPED[0] = dropped_off_table
+    else:
+        _LAST_DROPPED[0] = 0
     return sorted(detections, key=lambda d: -d.area)
+
+
+# Blobs the last detect_cubes() call discarded as not-on-the-desk. Surfaced in
+# the scene summary so "the cube vanished" is diagnosable instead of silent --
+# the failure mode of the gate this replaced was that it left no trace at all.
+_LAST_DROPPED = [0]
+
+
+def last_dropped_off_table() -> int:
+    """Count of off-desk blobs discarded by the most recent detect_cubes()."""
+    return _LAST_DROPPED[0]

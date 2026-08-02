@@ -27,17 +27,13 @@ import heapq
 import math
 
 from mt4_jog.joints import GROUND_Z_MM
-from mt4_jog.kinematics import JointAnglesDeg, ik_position, steps_from_angles
-from mt4_vision.workspace import (
-    KEEPOUT_RADIUS_MM,
-    KEEPOUT_TARGET_MARGIN_MM,
-    MAX_REACH_MM,
-    joints_within_soft_limits,
-)
+from mt4_vision.workspace import joint_reachable, max_z_at
 
-# Elbow-up IK branch seed (the tape-fit park posture; see kinematics.py).
-_NEAR_J2_DEG = 107.0
-_NEAR_J3_DEG = -9.3
+# ``joint_reachable`` and ``max_z_at`` moved to workspace so the work-region
+# predicate could use them without workspace importing this module (which
+# imports workspace). Re-exported here because that is where they have always
+# been imported from.
+__all__ = ["joint_reachable", "max_z_at", "StackPlanner"]
 
 # Heights (mm, TCP frame -- relative to release_z / stack grip-top).
 RELEASE_ABOVE_MM = 4.0        # drop height above the seated stack top
@@ -71,44 +67,6 @@ FOREARM_MARGIN_MM = 5.0
 SEGMENT_SAMPLE_MM = 10.0
 
 XYZ = tuple[float, float, float]
-
-
-def joint_reachable(x: float, y: float, z: float) -> bool:
-    """True when (x, y, z) passes envelope, closed-form IK, and soft limits.
-
-    ``ik_position`` alone only checks link-length geometry; the real ceiling
-    over the desk (~315mm at the marker radii) comes from the J3 soft max,
-    which ``joints_within_soft_limits`` enforces -- the check the old
-    level-9 travel-height test was missing.
-    """
-    r = math.hypot(x, y)
-    if r < KEEPOUT_RADIUS_MM - KEEPOUT_TARGET_MARGIN_MM or r > MAX_REACH_MM:
-        return False
-    if z < GROUND_Z_MM - 0.05:
-        return False
-    near = JointAnglesDeg(
-        math.degrees(math.atan2(y, x)), _NEAR_J2_DEG, _NEAR_J3_DEG, 0.0
-    )
-    q = ik_position(x, y, z, near=near)
-    if q is None:
-        return False
-    return joints_within_soft_limits(steps_from_angles(q))
-
-
-def max_z_at(x: float, y: float, *, hi: float = 340.0) -> float | None:
-    """Highest joint-reachable TCP z at (x, y), or None when nothing is."""
-    lo = GROUND_Z_MM
-    if not joint_reachable(x, y, lo):
-        return None
-    if joint_reachable(x, y, hi):
-        return hi
-    while hi - lo > 0.5:
-        mid = 0.5 * (lo + hi)
-        if joint_reachable(x, y, mid):
-            lo = mid
-        else:
-            hi = mid
-    return lo
 
 
 class StackPlanner:

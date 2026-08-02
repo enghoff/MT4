@@ -4,8 +4,8 @@ Each clear camera frame builds a fresh ``Scene`` from cube detections and
 ArUco visibility. No persistent tracks -- vacated poses cannot linger.
 
 Occupancy and place-clearance use every robot-mapped detection. Pick
-candidates are a stricter subset (area / hull / reach filters) so arm
-paint is not grasped -- but a filtered blob still blocks placing on a
+candidates are a stricter subset (blob size, plus ``workspace.in_work_region``)
+so arm paint is not grasped -- but a filtered blob still blocks placing on a
 nearby marker.
 
 No camera-park exclusion here: that guarded against the arm's own
@@ -24,7 +24,12 @@ import cv2
 import numpy as np
 
 from mt4_vision.calib import Calibration
-from mt4_vision.detect import CubeDetection, detect_cubes, detect_markers
+from mt4_vision.detect import (
+    CubeDetection,
+    detect_cubes,
+    detect_markers,
+    last_dropped_off_table,
+)
 from mt4_vision.workspace import (
     MARKER_DICT,
     MARKER_OCCUPY_RADIUS_MM,
@@ -34,9 +39,11 @@ from mt4_vision.workspace import (
     WorkspaceState,
     cubes_with_robot_coords,
     dist_mm,
+    in_work_region,
     is_mp_reachable_xy,
     marker_slots_from_calibration,
     rebuild_workspace_state,
+    work_region_block_reason,
 )
 
 # Real cube blobs under the closer overhead mount land ~2000-4000px^2
@@ -46,13 +53,6 @@ from mt4_vision.workspace import (
 # the raw detection list. Old far-mount pick band was 280-650.
 PICK_MIN_AREA = 400.0
 PICK_MAX_AREA = 5000.0
-# Allow cubes a bit outside the marker convex hull (markers aren't at the
-# desk edge). Measured phantoms run 60-90mm outside; real near-pad cubes
-# sit within ~15mm -- but measured live 2026-07-14, several genuine
-# open-table cubes on this desk's layout sat 42-53mm outside the hull and
-# were wrongly dropped as phantoms at the old 40mm margin. 55mm recovers
-# those while staying short of the 60-90mm phantom range.
-HULL_OUTSIDE_MARGIN_MM = 55.0
 # A cube gripped at the capture pose hovers ~210mm over the table and
 # registers as a normal-looking detection near a predictable pixel; from
 # the raw list it leaks into marker occupancy / free-slot clearance and
@@ -66,8 +66,8 @@ HELD_CUBE_RADIUS_PX = 90.0
 # Minimum saturation (0-255) at the top-face centroid for a blob to be a
 # physical object at all. A laminated ArUco pad reflecting the room lights
 # throws a specular highlight whose faintly-tinted rim clips the blue band
-# (H 90-128) and survives every geometric gate -- the pad is inside the
-# marker hull, reachable, and the blob is cube-sized and square. Measured
+# (H 90-128) and survives every geometric gate -- the pad is on the desk,
+# reachable, and the blob is cube-sized and square. Measured
 # over 377 recorded episodes: 28 picks were sent at such a highlight, all
 # blue, all ending grasp_failed or lost. Verified-real cubes bottom out at
 # S=211 (blue), 201 (red), 100 (green); on-marker glare runs a median of 37.
@@ -137,6 +137,13 @@ class Scene:
     visible_marker_ids: set[int]
     # Raw detections (occupancy source); cubes is the pick-quality subset.
     raw_cubes: list[CubeDetection] | None = None
+    # The calibration this snapshot was built from. Carried because the work
+    # region is defined by the desk polygon and the camera geometry, both of
+    # which live on the calibration -- a Scene that could not answer "may the
+    # arm work here?" would force every consumer to thread a second argument.
+    calib: Calibration | None = None
+    # Blobs detect_cubes discarded as not-on-the-desk for this frame.
+    off_table_blobs: int = 0
 
     @classmethod
     def from_workspace(
@@ -145,6 +152,8 @@ class Scene:
         *,
         pick_cubes: list[CubeDetection] | None = None,
         raw_cubes: list[CubeDetection] | None = None,
+        calib: Calibration | None = None,
+        off_table_blobs: int = 0,
     ) -> Scene:
         visible = state.visible_marker_ids or set()
         cubes = list(pick_cubes) if pick_cubes is not None else list(state.cubes)
@@ -157,12 +166,19 @@ class Scene:
             free_slots=list(state.free_slots),
             visible_marker_ids=set(visible),
             raw_cubes=list(raw_cubes) if raw_cubes is not None else None,
+            calib=calib,
+            off_table_blobs=int(off_table_blobs),
         )
 
     def summary_line(self) -> str:
         raw_n = len(self.raw_cubes) if self.raw_cubes is not None else len(self.cubes)
         dropped = max(0, raw_n - len(self.cubes))
         extra = f" phantoms_dropped={dropped}" if dropped else ""
+        # Say so when the detector threw blobs away entirely. The gate this
+        # replaced was silent, which is how three cubes sat on the desk
+        # missing from the snapshot with nothing anywhere saying so.
+        if self.off_table_blobs:
+            extra += f" off_table_blobs={self.off_table_blobs}"
         return (
             f"cubes={len(self.cubes)} blockers={len(self.blockers())} "
             f"free_markers={len(self.placeable_markers())} "
@@ -196,18 +212,21 @@ class Scene:
         return [c for c in self.cubes if self.marker_for_cube(c) is None]
 
     def placeable_markers(self) -> list[MarkerSlot]:
-        """Tag visible, place-clearance free, reachable at travel height.
+        """Tag visible, place-clearance free, and inside the work region.
 
-        Matches pick/slot filtering: keep-out cylinder *and* MAX_REACH_MM.
-        Keep-out alone is not enough -- a marker can be placeable at table_z
-        but outside the two-link envelope at safe_z, where every transit goes
-        first (firmware ``err mp unreachable``).
+        One predicate with the pick path and the slot list, so a marker can
+        never be offered as a place target somewhere a cube resting there
+        could not be picked back up.
         """
+        if self.calib is None:
+            return [
+                m
+                for m in self.free_markers
+                if is_mp_reachable_xy(m.x, m.y)
+                and math.hypot(m.x, m.y) <= MAX_REACH_MM
+            ]
         return [
-            m
-            for m in self.free_markers
-            if is_mp_reachable_xy(m.x, m.y)
-            and math.hypot(m.x, m.y) <= MAX_REACH_MM
+            m for m in self.free_markers if in_work_region(m.x, m.y, self.calib)
         ]
 
     def occupied_pick_cubes(self) -> list[CubeDetection]:
@@ -216,12 +235,15 @@ class Scene:
         return [c for _m, c in self.occupied if id(c) in pick_ids]
 
     def pickable(self, cubes: list[CubeDetection]) -> list[CubeDetection]:
-        """Reachable cubes with finger clearance from every other pick cube."""
+        """Work-region cubes with finger clearance from every other pick cube."""
         out: list[CubeDetection] = []
         for c in cubes:
-            if not is_mp_reachable_xy(float(c.x), float(c.y)):
-                continue
-            if math.hypot(float(c.x), float(c.y)) > MAX_REACH_MM:
+            if self.calib is not None:
+                if not in_work_region(float(c.x), float(c.y), self.calib):
+                    continue
+            elif not is_mp_reachable_xy(float(c.x), float(c.y)) or math.hypot(
+                float(c.x), float(c.y)
+            ) > MAX_REACH_MM:
                 continue
             if any(
                 dist_mm(float(c.x), float(c.y), float(o.x), float(o.y))
@@ -242,60 +264,30 @@ class Scene:
         return out
 
 
-def _marker_hull_robot(markers: list[MarkerSlot]) -> np.ndarray | None:
-    if len(markers) < 3:
-        return None
-    pts = np.array([[m.x, m.y] for m in markers], dtype=np.float32)
-    return cv2.convexHull(pts)
+def is_phantom_detection(cube: CubeDetection, calib: Calibration) -> bool:
+    """True when a blob should not be treated as a pick target.
 
+    Two independent reasons, and the split matters. A blob can be the wrong
+    SIZE to be a cube (glare fleck, the arm's body, a smear) -- that is a
+    statement about the blob. Or it can be somewhere the arm may not work --
+    that is ``workspace.in_work_region``, and it is the same predicate a place
+    target is held to, so a cube can never be pickable somewhere a place is
+    refused or the other way round.
 
-def within_pick_hull(
-    x: float,
-    y: float,
-    markers: list[MarkerSlot],
-    *,
-    margin_mm: float = HULL_OUTSIDE_MARGIN_MM,
-    hull: np.ndarray | None = None,
-) -> bool:
-    """True when (x, y) is inside the marker hull or within ``margin_mm``.
-
-    Same gate ``filter_phantoms`` uses for pick candidates. With fewer than
-    three markers there is no hull and every point is accepted.
+    This used to take ``markers`` and test the convex hull of their centres.
+    See the note above ``workspace.in_work_region`` for what that cost.
     """
-    hull = hull if hull is not None else _marker_hull_robot(markers)
-    if hull is None:
-        return True
-    return cv2.pointPolygonTest(hull, (float(x), float(y)), True) >= -margin_mm
-
-
-def is_phantom_detection(
-    cube: CubeDetection,
-    markers: list[MarkerSlot],
-    *,
-    hull: np.ndarray | None = None,
-) -> bool:
-    """True when a blob should not be treated as a pick target."""
     if cube.x is None or cube.y is None:
         return True
     if cube.area < PICK_MIN_AREA or cube.area > PICK_MAX_AREA:
         return True
-    if not is_mp_reachable_xy(float(cube.x), float(cube.y)):
-        return True
-    if math.hypot(float(cube.x), float(cube.y)) > MAX_REACH_MM:
-        return True
-    hull = hull if hull is not None else _marker_hull_robot(markers)
-    if hull is not None and not within_pick_hull(
-        float(cube.x), float(cube.y), markers, hull=hull
-    ):
-        return True
-    return False
+    return not in_work_region(float(cube.x), float(cube.y), calib)
 
 
 def filter_phantoms(
-    cubes: list[CubeDetection], markers: list[MarkerSlot]
+    cubes: list[CubeDetection], calib: Calibration
 ) -> list[CubeDetection]:
-    hull = _marker_hull_robot(markers)
-    return [c for c in cubes if not is_phantom_detection(c, markers, hull=hull)]
+    return [c for c in cubes if not is_phantom_detection(c, calib)]
 
 
 def capture_scene(
@@ -321,6 +313,7 @@ def capture_scene(
     """
     markers = marker_slots_from_calibration(calib)
     raw = cubes_with_robot_coords(detect_cubes(frame, calib))
+    off_table = last_dropped_off_table()
     marker_dets = detect_markers(frame, MARKER_DICT)
     quads = [m.corners for m in marker_dets if m.corners]
     raw = [c for c in raw if not is_glare_blob(c, quads)]
@@ -333,8 +326,14 @@ def capture_scene(
     state = rebuild_workspace_state(
         calib, markers, raw, visible_marker_ids=visible
     )
-    pick_cubes = filter_phantoms(raw, markers)
-    return Scene.from_workspace(state, pick_cubes=pick_cubes, raw_cubes=raw)
+    pick_cubes = filter_phantoms(raw, calib)
+    return Scene.from_workspace(
+        state,
+        pick_cubes=pick_cubes,
+        raw_cubes=raw,
+        calib=calib,
+        off_table_blobs=off_table,
+    )
 
 
 # Post-move verification -- implementation lives on motion so stack's

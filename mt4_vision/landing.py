@@ -14,14 +14,14 @@ import math
 import random
 from collections.abc import Callable, Iterable, Sequence
 
+from mt4_vision.calib import Calibration
 from mt4_vision.pickplace import near_camera_park
-from mt4_vision.scene import within_pick_hull
 from mt4_vision.workspace import (
     MARKER_PAPER_CLEARANCE_MM,
     MAX_REACH_MM,
-    MAX_VERIFIABLE_RADIUS_MM,
     MarkerSlot,
     dist_mm,
+    in_work_region,
     is_mp_reachable_xy,
 )
 
@@ -29,10 +29,11 @@ from mt4_vision.workspace import (
 # cube parked close to the J1 keep-out was occluded by the arm's own
 # camera-park silhouette and never seen again by later scans.
 LANDING_MIN_RADIUS_MM = 170.0
-# Camera coverage ceiling -- past this, detection is indistinguishable from
-# a lost cube (measured 2026-07-29). Unstack uses this as its max; stack's
-# park grid goes out to MAX_REACH_MM because clears are short pushes.
-LANDING_MAX_RADIUS_MM = MAX_VERIFIABLE_RADIUS_MM
+# Outer bound for a landing. No longer a radius: camera coverage on this
+# oblique mount is not a circle about the base, so ``in_work_region``'s frame
+# projection is what decides how far out a cube may be put down. This constant
+# only stops the search wasting candidates past any possible reach.
+LANDING_MAX_RADIUS_MM = MAX_REACH_MM
 # Finger clearance from other cubes when parking.
 LANDING_SEP_MM = 45.0
 
@@ -40,11 +41,11 @@ LANDING_SEP_MM = 45.0
 def landing_ok(
     x: float,
     y: float,
+    calib: Calibration,
     *,
     occupied: Sequence[tuple[float, float]] = (),
     sep_mm: float = LANDING_SEP_MM,
     markers: Sequence[MarkerSlot] | None = None,
-    require_hull: bool = True,
     marker_clearance_mm: float | None = None,
     site_xy: tuple[float, float] | None = None,
     site_avoid_mm: float = 0.0,
@@ -53,16 +54,25 @@ def landing_ok(
     avoid_camera_park: bool = False,
     blocked: Callable[[float, float], bool] | None = None,
 ) -> bool:
-    """True when (x, y) is a reachable, visible, unconflicted table landing.
+    """True when (x, y) is a workable, unconflicted table landing.
+
+    ``calib`` is positional and required on purpose. It used to be a
+    ``require_hull`` flag over the marker-centre hull, defaulting to on, which
+    meant a caller could silently opt out of the only gate that kept a parked
+    cube findable. The work region is not optional for a landing -- putting a
+    cube where it cannot be picked up again is the exact failure this module
+    was written to prevent.
 
     ``blocked`` is an optional extra veto (stack's camera-LOS shadow corridor).
     ``marker_clearance_mm`` defaults to off so stack can keep relying on the
-    pick-hull gate alone; unstack passes ``MARKER_PAPER_CLEARANCE_MM``.
+    work-region gate alone; unstack passes ``MARKER_PAPER_CLEARANCE_MM``.
     """
     if not is_mp_reachable_xy(x, y):
         return False
     r = math.hypot(x, y)
     if r > max_radius_mm or r < min_radius_mm:
+        return False
+    if not in_work_region(x, y, calib):
         return False
     if avoid_camera_park and near_camera_park(x, y):
         return False
@@ -71,14 +81,9 @@ def landing_ok(
             return False
     if any(dist_mm(x, y, ox, oy) < sep_mm for ox, oy in occupied):
         return False
-    if markers is not None:
-        if require_hull and not within_pick_hull(x, y, list(markers)):
+    if markers is not None and marker_clearance_mm is not None:
+        if any(dist_mm(x, y, m.x, m.y) < marker_clearance_mm for m in markers):
             return False
-        if marker_clearance_mm is not None:
-            if any(
-                dist_mm(x, y, m.x, m.y) < marker_clearance_mm for m in markers
-            ):
-                return False
     if blocked is not None and blocked(x, y):
         return False
     return True
@@ -120,6 +125,7 @@ def push_aside_xy(
     cx: float,
     cy: float,
     occupied: Sequence[tuple[float, float]],
+    calib: Calibration,
     *,
     park_mm: float,
     park_radii_extra_mm: Sequence[float] = (25.0, 45.0),
@@ -145,7 +151,7 @@ def push_aside_xy(
             vx, vy = ux * ca - uy * sa, ux * sa + uy * ca
             tx, ty = sx + vx * dist, sy + vy * dist
             if landing_ok(
-                tx, ty,
+                tx, ty, calib,
                 occupied=occupied, sep_mm=sep_mm, markers=markers,
                 min_radius_mm=min_radius_mm, blocked=blocked,
             ):
@@ -156,6 +162,7 @@ def push_aside_xy(
 def nearest_landing(
     sx: float,
     sy: float,
+    calib: Calibration,
     *,
     preferred: Iterable[tuple[float, float]],
     fallback: Iterable[tuple[float, float]] = (),
@@ -170,7 +177,7 @@ def nearest_landing(
 
     def _valid(x: float, y: float) -> bool:
         return dist_mm(x, y, sx, sy) >= site_clear_mm and landing_ok(
-            x, y,
+            x, y, calib,
             occupied=occupied, sep_mm=sep_mm, markers=markers,
             min_radius_mm=min_radius_mm, blocked=blocked,
         )
@@ -185,6 +192,7 @@ def nearest_landing(
 
 def random_landing(
     rng: random.Random,
+    calib: Calibration,
     *,
     sx: float,
     sy: float,
@@ -203,7 +211,7 @@ def random_landing(
         theta = rng.uniform(0.0, 2.0 * math.pi)
         x, y = r * math.cos(theta), r * math.sin(theta)
         if landing_ok(
-            x, y,
+            x, y, calib,
             occupied=avoid, sep_mm=spacing_mm, markers=markers,
             marker_clearance_mm=marker_clearance_mm,
             site_xy=(sx, sy), site_avoid_mm=site_avoid_mm,

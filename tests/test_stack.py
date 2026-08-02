@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from rig import CALIB
 from stack_cubes import (
     CLEAR_PARK_MM,
     SITE_CLEAR_MM,
@@ -32,7 +33,7 @@ def test_cubes_near_site_filters_by_radius():
 
 def test_clear_aside_pushes_past_keep_clear():
     # Marker 4-ish; cube slightly off-center toward +y.
-    dest = clear_aside_xy(243.0, 5.0, 251.0, 27.0, occupied=[])
+    dest = clear_aside_xy(243.0, 5.0, 251.0, 27.0, [], CALIB)
     assert dest is not None
     assert math.hypot(dest[0] - 243.0, dest[1] - 5.0) >= CLEAR_PARK_MM - 0.1
     # Must not land in the barely-outside free-slot ring that re-triggered clear.
@@ -42,15 +43,15 @@ def test_clear_aside_pushes_past_keep_clear():
 def test_clear_aside_avoids_occupied():
     sx, sy = 243.0, 5.0
     cx, cy = 251.0, 27.0
-    primary = clear_aside_xy(sx, sy, cx, cy, occupied=[])
+    primary = clear_aside_xy(sx, sy, cx, cy, [], CALIB)
     assert primary is not None
-    alt = clear_aside_xy(sx, sy, cx, cy, occupied=[primary])
+    alt = clear_aside_xy(sx, sy, cx, cy, [primary], CALIB)
     assert alt is not None
     assert math.hypot(alt[0] - primary[0], alt[1] - primary[1]) >= 40.0
 
 
 def test_clear_aside_stays_in_pick_hull():
-    from mt4_vision.workspace import MarkerSlot
+    from mt4_vision.workspace import MarkerSlot, in_work_region
 
     # Tight triangle around the site; a long push along +y exits the hull.
     markers = [
@@ -59,12 +60,13 @@ def test_clear_aside_stays_in_pick_hull():
         MarkerSlot(3, 240.0, 80.0),
     ]
     dest = clear_aside_xy(
-        240.0, 20.0, 240.0, 40.0, occupied=[], markers=markers,
+        240.0, 20.0, 240.0, 40.0, [], CALIB, markers=markers,
     )
     assert dest is not None
-    from mt4_vision.scene import within_pick_hull
-
-    assert within_pick_hull(dest[0], dest[1], markers)
+    # The gate is no longer the marker hull -- markers do not bound the work
+    # area at all now -- so what a clear must still guarantee is that the cube
+    # lands somewhere the arm can pick it up again.
+    assert in_work_region(dest[0], dest[1], CALIB)
 
 
 def test_clear_aside_skips_stack_shadow_corridor():
@@ -78,7 +80,7 @@ def test_clear_aside_skips_stack_shadow_corridor():
     cx = sx + behind[0] * 40.0
     cy = sy + behind[1] * 40.0
     dest = clear_aside_xy(
-        sx, sy, cx, cy, occupied=[], behind_u=behind, shadow_levels=8,
+        sx, sy, cx, cy, [], calib, behind_u=behind, shadow_levels=8,
     )
     assert dest is not None
     assert not in_stack_camera_shadow(
@@ -93,7 +95,7 @@ def test_clear_aside_stays_out_of_arm_occlusion_strip():
 
     # Cube on the base side of marker 3: the straight push aims at the
     # occlusion strip, so an alternative landing must be chosen.
-    dest = clear_aside_xy(153.6, 156.9, 120.0, 120.0, occupied=[])
+    dest = clear_aside_xy(153.6, 156.9, 120.0, 120.0, [], CALIB)
     assert dest is not None
     assert math.hypot(dest[0], dest[1]) >= CLEAR_MIN_RADIUS_MM
 
@@ -103,7 +105,7 @@ def test_choose_park_slot_requires_clear_margin():
     scene = SimpleNamespace(
         free_slots=[(200.0, 60.0), (200.0, -60.0), (150.0, -250.0)],
     )
-    spot = choose_park_slot(scene, 243.0, 5.0)
+    spot = choose_park_slot(scene, 243.0, 5.0, CALIB)
     assert spot == (150.0, -250.0)
 
 

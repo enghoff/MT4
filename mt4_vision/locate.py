@@ -50,7 +50,7 @@ from mt4_vision.calib import Calibration
 from mt4_vision.wrist import j4_for_long_axis
 from mt4_vision.workspace import (
     MAX_REACH_MM,
-    MAX_VERIFIABLE_RADIUS_MM,
+    work_region_block_reason,
     is_mp_reachable_xy,
 )
 
@@ -910,12 +910,9 @@ def grasp_feasibility(
     axis, and a wrist angle must exist that closes across its long axis.
     """
     r = math.hypot(obj.x, obj.y)
-    if not is_mp_reachable_xy(obj.x, obj.y):
-        return False, f"keep-out (r={r:.0f}mm)"
-    if r > MAX_REACH_MM:
-        return False, f"beyond max reach (r={r:.0f}mm)"
-    if r > MAX_VERIFIABLE_RADIUS_MM:
-        return False, f"beyond camera (r={r:.0f}mm)"
+    region = work_region_block_reason(obj.x, obj.y, calib)
+    if region is not None:
+        return False, region
     span_open = _span_mm(calib, int(calib.grip_open_s))
     if span_open is not None and obj.short_mm > span_open:
         return False, (
