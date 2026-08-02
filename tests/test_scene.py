@@ -14,6 +14,7 @@ from mt4_vision.detect import CubeDetection
 from mt4_vision.policy import plan_shuffle
 from mt4_vision.scene import Scene, verify_pick_place
 from mt4_vision.workspace import MarkerSlot, rebuild_workspace_state
+from rig import CALIB
 
 
 MARKERS = [
@@ -36,9 +37,9 @@ def scene(
     if visible is None:
         visible = {m.marker_id for m in MARKERS}
     state = rebuild_workspace_state(
-        None, MARKERS, cubes, visible_marker_ids=visible
+        CALIB, MARKERS, cubes, visible_marker_ids=visible
     )
-    return Scene.from_workspace(state)
+    return Scene.from_workspace(state, calib=CALIB)
 
 
 def test_blocker_to_free_marker():
@@ -79,8 +80,7 @@ def test_beyond_max_reach_marker_not_placeable():
     far = MarkerSlot(9, 58.0, 349.0)
     assert math.hypot(far.x, far.y) > MAX_REACH_MM
     markers = list(MARKERS) + [far]
-    state = rebuild_workspace_state(
-        None, markers, [], visible_marker_ids={0, 1, 2, 3, 9}
+    state = rebuild_workspace_state(CALIB, markers, [], visible_marker_ids={0, 1, 2, 3, 9}
     )
     s = Scene.from_workspace(state)
     placeable_ids = {m.marker_id for m in s.placeable_markers()}
@@ -157,14 +157,14 @@ def test_camera_park_adjacent_cube_is_pickable():
     from mt4_vision.scene import is_phantom_detection
 
     near_park = cube("green", 193.0, -51.0, area=412.0)
-    assert not is_phantom_detection(near_park, MARKERS)
+    assert not is_phantom_detection(near_park, CALIB)
 
 
 def test_raw_near_marker_blocks_place_even_if_filtered_from_picks():
     """Occupancy uses raw blobs; a too-small blob still blocks place."""
     small = cube("green", 177.2, 181.5, area=150.0)
     state = rebuild_workspace_state(
-        None, MARKERS, [small], visible_marker_ids={0, 1, 2, 3}
+        CALIB, MARKERS, [small], visible_marker_ids={0, 1, 2, 3}
     )
     assert any(m.marker_id == 3 for m, _ in state.occupied)
     assert 3 not in {m.marker_id for m in state.free_markers}
@@ -182,22 +182,42 @@ def test_vacated_pose_not_planned_after_fresh_scene():
     assert after.cubes == []
 
 
-def test_outside_hull_blob_filtered_as_phantom():
+def test_off_desk_blob_filtered_as_phantom():
     from mt4_vision.scene import filter_phantoms, is_phantom_detection
 
-    # Far outside marker hull, oversize area -- the live "red (272,-188)" class.
-    phantom = cube("red", 272.0, -188.0, area=733.0)
+    # Behind the desk's back edge: the arm's own body images up there on this
+    # oblique mount, which is what this gate is for. (272,-188) used to be the
+    # canonical case as "outside the marker hull"; it is a perfectly good desk
+    # location and is now pickable, which was the point of the change.
+    phantom = cube("red", -100.0, 250.0, area=733.0)
     real = cube("green", 177.2, 181.5, area=400.0)
-    assert is_phantom_detection(phantom, MARKERS)
-    assert not is_phantom_detection(real, MARKERS)
-    kept = filter_phantoms([phantom, real], MARKERS)
+    assert is_phantom_detection(phantom, CALIB)
+    assert not is_phantom_detection(real, CALIB)
+    kept = filter_phantoms([phantom, real], CALIB)
     assert [c.color for c in kept] == ["green"]
+
+
+def test_far_desk_blob_is_a_pick_target_now():
+    """The regression the work region exists to prevent.
+
+    Measured on a live frame 2026-08-02: three cubes plainly on the desk and
+    plainly in reach were absent from the snapshot because they fell outside
+    the marker-centre hull. These are their measured positions.
+    """
+    from mt4_vision.scene import is_phantom_detection
+
+    for x, y in ((176.1, -213.6), (266.5, -52.7), (132.8, 272.0)):
+        assert not is_phantom_detection(cube("blue", x, y, area=2000.0), CALIB), (x, y)
 
 
 def test_keepout_blob_filtered():
     from mt4_vision.scene import is_phantom_detection
 
-    assert is_phantom_detection(cube("blue", -19.0, 161.0, area=400.0), MARKERS)
+    # The arm base's own hardware reads as small blue blobs near the column.
+    # (-19, 161) used to be this test's case; it is r=162mm, comfortably
+    # outside the keep-out, and was only ever rejected by the marker hull. It
+    # is a legitimate pick target now, so the test uses a real keep-out point.
+    assert is_phantom_detection(cube("blue", 60.0, 60.0, area=400.0), CALIB)
 
 
 def test_verify_pick_place_outcomes():
@@ -333,6 +353,6 @@ def test_marker_at_touched_reach_limit_is_placeable():
     from mt4_vision.workspace import MarkerSlot, rebuild_workspace_state
 
     m1 = MarkerSlot(1, 45.0, 319.3)
-    state = rebuild_workspace_state(None, [m1], [], visible_marker_ids={1})
+    state = rebuild_workspace_state(CALIB, [m1], [], visible_marker_ids={1})
     s = Scene.from_workspace(state, pick_cubes=[], raw_cubes=[])
     assert 1 in {m.marker_id for m in s.placeable_markers()}

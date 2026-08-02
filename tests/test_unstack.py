@@ -16,6 +16,7 @@ from mt4_vision.workspace import (
     is_mp_reachable_xy,
     marker_slots_from_calibration,
 )
+from rig import CALIB
 from unstack_cubes import (
     SCATTER_MAX_RADIUS_MM,
     SCATTER_MIN_RADIUS_MM,
@@ -38,7 +39,8 @@ def test_random_landing_respects_reach_and_spacing():
     avoid = [(200.0, -60.0), (150.0, 100.0)]
     rng = random.Random(1)
     xy = random_landing(
-        rng, sx=site.x, sy=site.y, markers=markers, avoid=avoid, spacing_mm=75.0,
+        rng, _calib, sx=site.x, sy=site.y, markers=markers, avoid=avoid,
+        spacing_mm=75.0,
     )
     assert xy is not None
     x, y = xy
@@ -61,7 +63,8 @@ def test_random_landing_avoids_marker_papers_directly_on_a_marker():
     rng = random.Random(2)
     for _ in range(20):
         xy = random_landing(
-            rng, sx=site.x, sy=site.y, markers=markers, avoid=[], spacing_mm=75.0,
+            rng, _calib, sx=site.x, sy=site.y, markers=markers, avoid=[],
+            spacing_mm=75.0,
         )
         assert xy is not None
         x, y = xy
@@ -76,7 +79,7 @@ def test_find_landing_degrades_spacing_when_crowded():
 
     calls = []
 
-    def fake_random_landing(rng, *, sx, sy, markers, avoid, spacing_mm, attempts=0):
+    def fake_random_landing(rng, calib, *, sx, sy, markers, avoid, spacing_mm, attempts=0):
         calls.append(spacing_mm)
         if spacing_mm == uc.DROP_SPACING_FALLBACKS_MM[-1]:
             return (250.0, 0.0)
@@ -86,7 +89,7 @@ def test_find_landing_degrades_spacing_when_crowded():
     uc.random_landing = fake_random_landing
     try:
         landing, spacing = find_landing(
-            random.Random(3), sx=0.0, sy=0.0, markers=[], avoid=[],
+            random.Random(3), sx=0.0, sy=0.0, markers=[], avoid=[], calib=CALIB,
         )
     finally:
         uc.random_landing = orig
@@ -103,7 +106,10 @@ def test_find_landing_raises_when_desk_has_no_room():
     uc.random_landing = lambda *a, **k: None
     try:
         try:
-            find_landing(random.Random(4), sx=0.0, sy=0.0, markers=[], avoid=[])
+            find_landing(
+                random.Random(4), sx=0.0, sy=0.0, markers=[], avoid=[],
+                calib=CALIB,
+            )
             assert False, "expected Mt4ClientError"
         except Mt4ClientError:
             pass

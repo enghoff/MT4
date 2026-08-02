@@ -4,7 +4,7 @@
 The stack site is a marker id passed on the CLI (required -- no default).
 Any cubes within SITE_CLEAR_MM of that marker are nudged aside along the
 marker→cube direction to CLEAR_PARK_MM (keep-clear + margin) first, preferring
-landings that stay inside the pick hull and out of the stack camera-shadow
+landings that stay inside the work region and out of the stack camera-shadow
 corridor. A full-circle angle sweep backs up the primary push direction, and
 open-table free slots (or, failing those, a full annulus grid scan) are the
 fallback when nothing near the site itself qualifies. Each stack cube is taken
@@ -236,6 +236,7 @@ def clear_aside_xy(
     cx: float,
     cy: float,
     occupied: list[tuple[float, float]],
+    calib: Calibration,
     *,
     markers: list[MarkerSlot] | None = None,
     behind_u: tuple[float, float] | None = None,
@@ -246,7 +247,7 @@ def clear_aside_xy(
     Lands at ~CLEAR_PARK_MM from the site (not on a barely-outside free
     slot that vision will still read as "near site"). Tries a few angles
     and radii if the primary landing is blocked or unreachable. Prefers
-    landings that stay pickable (marker hull + not in stack camera shadow).
+    landings that stay pickable (work region + not in stack camera shadow).
     """
 
     def _shadowed(x: float, y: float) -> bool:
@@ -255,7 +256,7 @@ def clear_aside_xy(
         )
 
     return push_aside_xy(
-        sx, sy, cx, cy, occupied,
+        sx, sy, cx, cy, occupied, calib,
         park_mm=CLEAR_PARK_MM, angles_deg=_CLEAR_ANGLES_DEG,
         markers=markers, blocked=_shadowed,
         sep_mm=CLEAR_SEP_MM, min_radius_mm=CLEAR_MIN_RADIUS_MM,
@@ -266,6 +267,7 @@ def choose_park_slot(
     scene: Scene,
     sx: float,
     sy: float,
+    calib: Calibration,
     *,
     avoid: list[tuple[float, float]] | None = None,
     markers: list[MarkerSlot] | None = None,
@@ -285,7 +287,7 @@ def choose_park_slot(
         )
 
     return nearest_landing(
-        sx, sy,
+        sx, sy, calib,
         preferred=scene.free_slots,
         fallback=_PARK_GRID,
         site_clear_mm=CLEAR_PARK_MM,
@@ -815,13 +817,13 @@ def main() -> int:
                     if c is not target and c.x is not None and c.y is not None
                 ]
                 dest = clear_aside_xy(
-                    sx, sy, float(target.x), float(target.y), occupied,
+                    sx, sy, float(target.x), float(target.y), occupied, calib,
                     markers=all_markers, behind_u=behind_u,
                     shadow_levels=shadow_levels,
                 )
                 if dest is None:
                     dest = choose_park_slot(
-                        scene, sx, sy, avoid=occupied,
+                        scene, sx, sy, calib, avoid=occupied,
                         markers=all_markers, behind_u=behind_u,
                         shadow_levels=shadow_levels,
                     )

@@ -180,6 +180,7 @@ def _home_requested(watcher: _HomeKeyWatcher, exc: Mt4ClientError) -> bool:
 
 def random_landing(
     rng: random.Random,
+    calib: Calibration,
     *,
     sx: float,
     sy: float,
@@ -192,7 +193,7 @@ def random_landing(
     in ``avoid`` (prior drops, pre-existing cubes) and every marker paper,
     or None when nothing turned up in ``attempts`` tries."""
     return _random_landing(
-        rng, sx=sx, sy=sy, markers=markers, avoid=avoid,
+        rng, calib, sx=sx, sy=sy, markers=markers, avoid=avoid,
         spacing_mm=spacing_mm, site_avoid_mm=SITE_AVOID_MM,
         attempts=attempts,
         min_radius_mm=SCATTER_MIN_RADIUS_MM,
@@ -207,6 +208,7 @@ def find_landing(
     sy: float,
     markers: list[MarkerSlot],
     avoid: list[tuple[float, float]],
+    calib: Calibration,
 ) -> tuple[tuple[float, float], float]:
     """Best-effort landing spot: try the preferred spacing first, then
     degrade through ``DROP_SPACING_FALLBACKS_MM`` before giving up."""
@@ -214,7 +216,8 @@ def find_landing(
     # this module's random_landing.
     for spacing in DROP_SPACING_FALLBACKS_MM:
         landing = random_landing(
-            rng, sx=sx, sy=sy, markers=markers, avoid=avoid, spacing_mm=spacing,
+            rng, calib, sx=sx, sy=sy, markers=markers, avoid=avoid,
+            spacing_mm=spacing,
         )
         if landing is not None:
             return landing, spacing
@@ -462,7 +465,8 @@ def main() -> int:
                 continue
             try:
                 landing, spacing = find_landing(
-                    rng, sx=sx, sy=sy, markers=all_markers, avoid=placed + obstacles,
+                    rng, sx=sx, sy=sy, markers=all_markers,
+                    avoid=placed + obstacles, calib=calib,
                 )
                 tx, ty = landing
                 j4 = random_place_j4(tx, ty, rng)

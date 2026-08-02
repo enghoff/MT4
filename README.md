@@ -109,7 +109,8 @@ entities. This is what both the MCP tools and the task scripts work in terms of:
 
 Every entity carries robot-frame `x`/`y` in mm plus `pickable` / `placeable`
 flags. When a flag is false, `reason` names the physical constraint — J1
-keep-out, out of reach, finger clearance, outside the marker hull, a tag that
+keep-out, out of reach, finger clearance, off the desk, outside the camera
+frame, a tag that
 did not decode this frame. Detections that are real but unusable are still
 listed with their reason rather than dropped.
 

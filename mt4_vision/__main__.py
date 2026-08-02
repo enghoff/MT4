@@ -90,7 +90,7 @@ def cmd_scene(args: argparse.Namespace) -> int:
         yaw = f" yaw {c.yaw_deg:.0f}°" if c.yaw_deg is not None else ""
         phantom = (
             " [phantom -- not a pick target]"
-            if calib is not None and is_phantom_detection(c, slots)
+            if calib is not None and is_phantom_detection(c, calib)
             else ""
         )
         print(f"  {c.color}: pixel ({c.px:.0f}, {c.py:.0f}) area {c.area:.0f}px^2{robot}{yaw}{phantom}")
@@ -298,8 +298,7 @@ def cmd_pick(args: argparse.Namespace) -> int:
     calib = load_calibration(Path(args.calib))
     frame = capture_frame(args.camera)
     candidates = filter_phantoms(
-        cubes_with_robot_coords(detect_cubes(frame, calib)),
-        marker_slots_from_calibration(calib),
+        cubes_with_robot_coords(detect_cubes(frame, calib)), calib
     )
     target = pick_largest_cube(cubes_of_color(candidates, args.color))
     if target is None:

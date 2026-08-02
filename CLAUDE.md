@@ -38,13 +38,35 @@ Chat replies are explanations for a competent colleague who has **not** read the
 
 Homed FK TCP is about **(190, 0, 226)**; J1 keep-out **140 mm**; soft ground **115 mm**. After kinematics or keep-out changes, flash and re-run vision calibration.
 
+## Where pick/place is allowed
+
+One predicate: `mt4_vision.workspace.in_work_region(x, y, calib)`. Four things
+must all hold, and `work_region_block_reason` names the first that fails:
+
+1. the arm can hold the grasp pose (IK + joint soft limits + keep-out + reach)
+2. it can lift `PICK_LIFT_MM` = 50 mm straight off it
+3. the point is on the desk (`table_polygon_robot` in the calibration)
+4. the point images inside the camera frame with a margin
+
+Do not add a fifth gate somewhere else. The thing this replaced was a convex
+hull of the ArUco marker centres applied twice with different allowances, in
+two files; measured 2026-08-02 it admitted 828 cm² of a table where the arm can
+safely work 2278 cm², and three cubes plainly on the desk were missing from
+`mt4_scene` entirely. Marker positions describe where paper was taped down,
+not where the desk, the arm, or the camera end.
+
+Re-measure the desk edge with `python calibrate_table_edge.py` after moving the
+arm, the desk, or the camera. It needs the wall visible above the desk, so park
+the arm clear of the back of the frame first.
+
 ## Typical failure patterns
 
 - **`err mp segment` after aborted calibration** — arm often stranded low with **J4 at soft limit**; home + park before retrying.
 - **Pick/place “failed” with no vision symptom** — motion planning failure, not mis-detection.
 - **Empty scene / no cubes** — arm blocking camera, wrong camera index, or cold camera frame.
 - **Serial busy** — stop MCP and other clients before flash or a second script.
-- **`stack_cubes.py`: "No reachable clear spot for <color>"** — the clear/park search came up empty near the stack site; fixed 2026-07-24 (full-circle angle sweep in `clear_aside_xy` + annulus grid fallback in `choose_park_slot`, since corner markers and 8 fixed `PLACEMENT_SLOTS` could exhaust all candidates). If it recurs, the site is likely boxed in on all sides (occupied + hull + shadow), not a hardware fault.
+- **`stack_cubes.py`: "No reachable clear spot for <color>"** — the clear/park search came up empty near the stack site; fixed 2026-07-24 (full-circle angle sweep in `clear_aside_xy` + annulus grid fallback in `choose_park_slot`, since corner markers and 8 fixed `PLACEMENT_SLOTS` could exhaust all candidates). If it recurs, the site is likely boxed in on all sides (occupied + work region + shadow), not a hardware fault.
+- **A cube on the desk is missing from `mt4_scene`** — check the summary's `off_table_blobs` count. Non-zero means `detect_cubes` discarded blobs as behind the desk edge; if a real cube is among them the desk polygon is stale, so re-run `calibrate_table_edge.py`.
 
 ## Project context
 

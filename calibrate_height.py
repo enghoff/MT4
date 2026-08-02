@@ -282,7 +282,7 @@ def main() -> int:
         # inside the keep-out zone, and the grasp-failure rotation below would
         # otherwise eventually send the gripper at one.
         all_blobs = detect_cubes(frame, calib)
-        cubes = filter_phantoms(all_blobs, markers)
+        cubes = filter_phantoms(all_blobs, calib)
         dropped = [c for c in all_blobs if c not in cubes]
         if dropped:
             print("Ignoring phantom blob(s): "
@@ -352,7 +352,7 @@ def main() -> int:
             if found is not None:
                 return found
             candidates = [
-                c for c in filter_phantoms(detect_cubes(frame, calib), markers)
+                c for c in filter_phantoms(detect_cubes(frame, calib), calib)
                 if c.color == probe_color and math.hypot(c.x, c.y) <= MAX_REACH_MM
             ]
             if not candidates:

@@ -147,9 +147,19 @@ class Calibration:
     # default; assumes firmware ``j4zero`` (``calibrate_j4.py``) so world
     # J4 = 0 means jaws along the arm.
     face_align_picks: bool = True
-    # Pixel-space convex hull of the marker centers. Detections outside it
-    # are rejected (the arm's orange body and off-desk clutter live there).
+    # Pixel-space convex hull of the marker centers. Kept for the overlay and
+    # for older calibrations; no longer a pick/place gate -- see
+    # workspace.in_work_region for what replaced it and why.
     workspace_hull_px: list[list[float]] | None = None
+    # Desk surface as a polygon in ROBOT frame (mm), safety margin already
+    # applied. Written by calibrate_table_edge.py. This is the answer to "is
+    # there anything there to set an object down on", which the marker hull
+    # was standing in for and getting wrong. None accepts everything.
+    table_polygon_robot: list[list[float]] | None = None
+    # Frame size (w, h) the homography was fitted at. The maps are only valid
+    # at this resolution, and camera_covers needs it to know where the frame
+    # border is. None falls back to workspace.DEFAULT_FRAME_SIZE_PX.
+    frame_size_px: list[int] | None = None
 
     def pixel_to_robot(self, px: float, py: float, *, on_cube_top: bool = False) -> tuple[float, float]:
         if on_cube_top and self.cube_top_homography:
