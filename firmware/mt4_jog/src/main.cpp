@@ -184,6 +184,7 @@ void loop() {
   poll_limits();
   gripperSweepTick();
   refresh_cartesian_jog_if_due();
+  refresh_envelope_guard_if_due();
   motion_poll_move_done();
   /* After gripperSweepTick() and motion_poll_move_done(), so a station armed
    * this same pass sees the sweep's own state, and so the leg ahead of it has

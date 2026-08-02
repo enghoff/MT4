@@ -62,6 +62,8 @@ bool motion_start_jog();
  * translates; a zero dir with nonzero roll is a pure J4 roll. */
 void start_cartesian_jog(Vec3 dir, int8_t j4_roll);
 void refresh_cartesian_jog_if_due();
+/* Ground/keep-out guard for `j` jog and `m` moves; call every loop(). */
+void refresh_envelope_guard_if_due();
 
 /* Bounded relative move (`m` command): all joints move proportionally so
  * they finish together; completion is reported asynchronously from loop(). */

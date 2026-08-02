@@ -38,6 +38,34 @@ Chat replies are explanations for a competent colleague who has **not** read the
 
 Homed FK TCP is about **(190, 0, 226)**; J1 keep-out **140 mm**; soft ground **115 mm**. After kinematics or keep-out changes, flash and re-run vision calibration.
 
+## Envelope limits apply to every control path
+
+Four ways to drive the arm, all four now gated on ground Z and the J1 keep-out:
+
+| Path | Guard |
+|------|-------|
+| `mp` / `mq` | target, per-segment and routed-path checks |
+| `cj` Cartesian jog | `setup_cartesian_jog` clamps, re-run every 40 ms |
+| `j` joint jog | `refresh_envelope_guard_if_due`, polled every 10 ms |
+| `m` relative move | same guard |
+
+`motion_step_allowed` is **not** an envelope check — it only knows joint step
+counters and the J2+J3 coupling, which say nothing about where the TCP is.
+Measured 2026-08-02: 13% of the legal joint box puts the TCP below the desk
+(worst 78 mm) and 7% inside the keep-out (worst r = 118 mm), so `j` and `m`
+used to reach the desk with nothing objecting.
+
+The guard compares a *predicted* pose against the current one and stops only
+motion that makes a violation worse. It must stay that way — after an MCU
+reset the arm sits at r = 124.6 mm, already inside the cylinder, so a guard
+that refused every violating pose would freeze it there. Homing is unaffected:
+it pulses the step pins directly and never touches the DDA.
+
+**`GROUND_Z_MM` = 115 sits ~12 mm below actual desk contact (~127).** The
+guard enforces the floor faithfully; the floor itself is deliberately slack so
+picks at `table_z` = 127.2 have room. Raising it would make the guard prevent
+contact rather than limit it, but it would also squeeze every pick.
+
 ## Where pick/place is allowed
 
 One predicate: `mt4_vision.workspace.in_work_region(x, y, calib)`. Four things
