@@ -64,6 +64,20 @@ static const float MT4_KEEPOUT_RADIUS_MM = 140.0f;
  * frame (2026-07-19); after 2026-07-21 home refit (107/−9.3) the same desk
  * contact reports ~127mm, so floor lowered to leave headroom. */
 static const float MT4_GROUND_Z_MM = 115.0f;
+/* Ground / keep-out guard poll for joint-space motion (`j` jog, `m` moves) --
+ * see refresh_envelope_guard_if_due() in motion.cpp for why this is a poll and
+ * not a per-step ISR check. 10ms is 4x tighter than the Cartesian jog refresh
+ * because this guard is the ONLY thing standing between a joint jog and the
+ * desk, where cj also has its own setup-time clamp. At the fastest jog rate
+ * (700us/step) 10ms is ~14 steps, about 1.3mm of TCP travel at a typical
+ * 200mm reach, so the stop lands roughly a millimetre before the plane rather
+ * than after it. */
+static const uint16_t MT4_ENVELOPE_GUARD_MS = 10;
+/* Lookahead bounds in steps. The floor keeps a very slow jog from looking at
+ * a pose indistinguishable from the current one (which would never trip);
+ * the ceiling keeps a fast one from refusing motion far from the envelope. */
+static const int32_t MT4_ENVELOPE_LOOKAHEAD_MIN = 6;
+static const int32_t MT4_ENVELOPE_LOOKAHEAD_MAX = 200;
 /* Soft joint step limits. J2/J3 counters are relative to the
  * limit/interference reference (steps=0 at switch / J3 fold-into-J2).
  * Envelope maxima measured 2026-07-19 in the old park-zero frame were

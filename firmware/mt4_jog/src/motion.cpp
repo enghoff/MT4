@@ -1304,6 +1304,127 @@ void start_cartesian_jog(Vec3 dir, int8_t j4_roll) {
   Serial.println(F("ok cj"));
 }
 
+/* Ground / keep-out guard for JOINT-space motion (`j` jog and `m` moves).
+ *
+ * Why this exists. Until 2026-08-02 the desk plane and the base keep-out
+ * cylinder were enforced on only two of the four ways this arm can be driven:
+ *
+ *   mp / mq        target, per-segment and routed-path checks   -- guarded
+ *   cj (cartesian) setup_cartesian_jog clamps, re-run every 40ms -- guarded
+ *   j  (joint jog) straight to the DDA                           -- NOT
+ *   m  (rel. move) straight to the DDA                           -- NOT
+ *
+ * The only limit the last two ever saw was motion_step_allowed(), which is
+ * purely about joint step counters and the J2+J3 coupling. Those say nothing
+ * about where the TCP ends up. Measured over the soft-limit box on a 10-step
+ * grid: 13% of legal joint poses put the TCP below the desk -- as much as
+ * 78mm below, at J2=3950 J3=-1550 -- and 7% put it inside the keep-out
+ * cylinder, down to r=118mm against a 140mm column. So a joint jog could
+ * drive the gripper through the desk without a single limit objecting.
+ *
+ * Why a predictive poll rather than a check inside motion_step_allowed().
+ * That function runs in the Timer1 ISR, once per joint per step, at up to
+ * ~1.4kHz. TCP z and r need two sines and two cosines, which an AVR at 16MHz
+ * cannot afford there. Worse, an ISR check strict enough to be useful would
+ * also abort legal `mp` moves that skim the ground plane, turning a safety
+ * net into a source of stranded moves. So the guard polls, exactly like the
+ * Cartesian jog refresh it sits next to.
+ *
+ * Why "worse than now" and not "outside the envelope". A hard rejection would
+ * trap the arm. At the J2 limit switch (steps 0) the TCP is legitimately at
+ * r=137.2mm -- already inside the 140mm cylinder -- so "refuse anything
+ * violating" would freeze the arm at the one pose homing always ends near,
+ * with no way out. Testing the PREDICTED pose against the current one instead
+ * means motion that deepens a violation stops while motion that escapes one
+ * is always allowed. Same principle as the Cartesian clamp above, which
+ * projects away only the inward radial component.
+ *
+ * mp paths are left alone: they check their own targets, segments and routes
+ * up front, and stopping one from out here would strand it mid-path. Homing
+ * is unaffected by construction -- it pulses the step pins directly and never
+ * touches the DDA. */
+static unsigned long envelope_guard_ms = 0;
+
+static void fk_of_steps(const long steps[MT4_NUM_JOINTS], Vec3 *out) {
+  const JointAnglesDeg q = angles_from_joint_steps(steps);
+  mt4_fk_tcp(&q, out);
+}
+
+void refresh_envelope_guard_if_due() {
+  if (homing_active || !jog_active || dda_axis_mask == 0) {
+    return;
+  }
+  if (mp_path.active || cart_jog_mode) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (now - envelope_guard_ms < MT4_ENVELOPE_GUARD_MS) {
+    return;
+  }
+  envelope_guard_ms = now;
+
+  /* Look ahead by however far the fastest axis travels before the next poll,
+   * so the stop lands before the envelope rather than after it. Bounded at
+   * both ends: a floor so a very slow jog still looks somewhere, a ceiling so
+   * a very fast one does not refuse motion half a workspace early. */
+  const uint16_t period_us = dda_get_speed_us();
+  int32_t lookahead = (static_cast<int32_t>(MT4_ENVELOPE_GUARD_MS) * 1000L) /
+                      static_cast<int32_t>(period_us ? period_us : 1);
+  if (lookahead < MT4_ENVELOPE_LOOKAHEAD_MIN) {
+    lookahead = MT4_ENVELOPE_LOOKAHEAD_MIN;
+  } else if (lookahead > MT4_ENVELOPE_LOOKAHEAD_MAX) {
+    lookahead = MT4_ENVELOPE_LOOKAHEAD_MAX;
+  }
+
+  /* joint_steps is 4 bytes per axis and the ISR writes it, so a plain read
+   * can tear on this 8-bit core. Snapshot with interrupts off. */
+  long here[MT4_NUM_JOINTS];
+  uint8_t mask;
+  cli();
+  mask = dda_axis_mask;
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    here[i] = joint_steps[i];
+  }
+  sei();
+
+  long ahead[MT4_NUM_JOINTS];
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    ahead[i] = here[i];
+    if (!(mask & (1 << i))) {
+      continue;
+    }
+    const bool high = digitalRead(J_DIR_PIN[i]) == HIGH;
+    const bool positive = (high == J_DIR_POS_HIGH[i]);
+    ahead[i] += positive ? lookahead : -lookahead;
+  }
+
+  Vec3 tcp_now, tcp_next;
+  fk_of_steps(here, &tcp_now);
+  fk_of_steps(ahead, &tcp_next);
+  const float r_now = sqrtf(tcp_now.x * tcp_now.x + tcp_now.y * tcp_now.y);
+  const float r_next =
+      sqrtf(tcp_next.x * tcp_next.x + tcp_next.y * tcp_next.y);
+
+  const bool into_ground =
+      tcp_next.z < mt4_ground_z_mm && tcp_next.z < tcp_now.z;
+  const bool into_column =
+      r_next < MT4_KEEPOUT_RADIUS_MM && r_next < r_now;
+  if (!into_ground && !into_column) {
+    return;
+  }
+
+  dda_stop();
+  cli();
+  dda_axis_mask = 0;
+  const bool was_move = move_mode;
+  if (was_move) {
+    move_done_pending = true;
+  }
+  sei();
+  cart_dir_active_valid = false;
+  Serial.println(into_ground ? F("err jog ground") : F("err jog keepout"));
+}
+
 void refresh_cartesian_jog_if_due() {
   if (!cart_jog_mode || !cart_dir_active_valid || !jog_active) {
     return;
