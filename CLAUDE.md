@@ -15,6 +15,17 @@ Cursor rules with full detail:
 - `.cursor/rules/hardware-investigate.mdc` — investigation workflow, error mapping, recovery
 - `.cursor/rules/flash-ok.mdc` — flash firmware without asking
 
+## Explaining your work (required)
+
+Chat replies are explanations for a competent colleague who has **not** read the code. Written deliverables — docs, plans, code comments — stay dense, thorough and complete. Simplify the prose *around* the work, never the work.
+
+- **Lead with the headline or correction**, in ordinary words.
+- **One idea per sentence.** Short sentences beat compressed ones.
+- **Explain the mechanism before the term.** "The camera looks at the desk from an angle, so a tall object appears shifted sideways" — *then* say parallax.
+- **No metaphors or wordplay standing in for an explanation.** Clever phrasing makes the reader decompress it before they can judge the claim.
+- **Keep every number and observed fact.** Plain does not mean vague, and a measured value beats an adjective.
+- **Bold lead-ins, short paragraphs.** Decisions the user owns go in their own section at the end, stated as choices with consequences.
+
 ## Primary tools
 
 | Tool | Use |
