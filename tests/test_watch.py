@@ -1,4 +1,4 @@
-"""Unit tests for the motion gate in ask_qwen.py (no camera, no service).
+"""Unit tests for the motion gate behind ask_qwen.py (no camera, no service).
 
 The gate decides when the model is asked at all, so its threshold has to sit
 between two measured numbers: the desk camera's noise floor (max 0.00016 over
@@ -12,15 +12,12 @@ import threading
 
 import numpy as np
 
-from ask_qwen import (
+from mt4_vision.qwen_panel import Options, WatchState, compose, montage
+from mt4_vision.qwen_watch import (
     MOTION_THRESHOLD,
     MotionWatcher,
-    Options,
-    WatchState,
     _prep,
     changed_boxes,
-    compose,
-    montage,
     motion_score,
 )
 
