@@ -242,6 +242,7 @@ MCP tools and Grounding DINO all work with this service absent.
 |-------------|--------------|
 | [mt4_vision/qwen.py](../mt4_vision/qwen.py) | Client. `ask(prompt, frames, mode=...)` → `Reply` (text plus what the service really encoded, incl. `frame_warning()`); `generate(prompt, frame)` → just text for the one-frame case; `parse_regions(text)` → the boxes/points Qwen named; `health()`. Raises `QwenError` when unreachable. `MT4_QWEN_URL` overrides the default URL |
 | [ask_qwen.py](../ask_qwen.py) | Interactive harness — see below |
+| [run_instruction.py](../run_instruction.py) | The same harness shape, wired to the arm: type an English instruction and it is carried out — see below |
 | [services/qwen3_vl/](../services/qwen3_vl/) | The deployed service itself: `server.py`, `requirements.txt`, systemd unit |
 
 ### The interactive harness
@@ -444,6 +445,66 @@ red cube "green cube" while boxing it correctly, and counted "2 cubes ... red,
 red" with a green one in frame — localization is stronger than instance/colour
 binding. Treat it as a describer and a rough locator, not a detector; for
 detection there is [Grounding DINO](GROUNDING_DINO.md).
+
+### The instruction loop
+
+`run_instruction.py` is the same harness shape pointed at the arm: a prompt
+pinned to the bottom of the terminal, a background worker, a window that keeps
+redrawing while the worker is busy. What differs is that the worker moves real
+hardware, and that changes what the pieces are for.
+
+```powershell
+python run_instruction.py                                  # interactive
+python run_instruction.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
+python run_instruction.py --dry-run "pick up the stapler"  # decide, never move
+```
+
+**The window is three things at once.** The left pane is the frame the last
+decision was made from, with the model's own answer drawn over it
+(`preview.annotate_qwen`: the box it named, the same numbers in the other
+coordinate space, the segmented silhouette, and a line from the point it gave
+to the entity the stack bound that point to). The right is a state panel —
+instruction, step, phase, what the jaws are believed to hold, what has been
+done. The corner inset is the live feed. The left pane deliberately does not
+update during a move: those are the pixels a decision was made from, and a
+re-capture would silently answer a different question.
+
+**Typing does not block on the arm.** A transfer is seconds of motion and a
+decision is seconds of GPU, and through all of it the prompt still takes input.
+Instructions queue FIFO — one arm, so one at a time. The commands worth knowing:
+
+| Command | Why |
+|---|---|
+| `/stop` | End after the current step and drop the queue. The arm finishes what it is doing, so it stops somewhere it chose to be |
+| `/abort` | Also interrupt the move in flight (`Mt4Client.request_interrupt`). The arm halts where it stands with the jaws as they are — the recovery, not the tidy exit |
+| `/held [thing]` | What the loop believes is in the jaws, and how to correct it. **Nothing on this rig can sense this**, so after an `/abort` mid-carry the belief and the world can differ and only you can say so |
+| `/open` | Release the jaws — what `/abort` mid-carry leaves you needing |
+| `/scene` | The entity list as the model will be shown it, with the reason each blocked one is blocked |
+| `/status` `/park` `/home` | Arm state and recovery, queued behind the run rather than racing it down one serial port |
+| `/dry on\|off` | Flip between deciding and moving without restarting |
+| `/save` | The frame the model saw, the whole window, and a JSON record of the decision |
+
+**What the gripper holds outlives an instruction**, because the jaws are
+physical and finishing a sentence does not empty them. `held` is session state:
+stop a transfer halfway and the next instruction is told the arm is still
+carrying something.
+
+**One camera, one stream.** The window and the decision captures come off a
+single `FrameStream` held open for the session — only one consumer can hold the
+device, and on Windows DSHOW a second open simply fails. It is also much
+faster: `capture_frame` reopens the device and burns 20 exposure warm-up reads,
+2-3 seconds, and the loop used to pay that on every step. `instruct.observe`
+therefore takes an optional `frame=`, and the caller owns the freshness
+guarantee that reopening used to provide — pull the frame *after* the arm has
+parked, which is what `FrameStream.fresh` blocks for.
+
+Everything the loop reports about a move is what it **sent**, never what it
+observed; outcome lines say "commanded, not checked". There is no sensor in the
+jaws, and the vision test that once stood in for one was measured reporting a
+completed pick as a failure because it matched the ArUco tag beside a stapler
+instead of the stapler. What is still checked, before the gripper opens, is
+reach, keep-out, ground, finger clearance, the desk polygon, and both ends of a
+transfer.
 
 ## Configuration (environment variables)
 
