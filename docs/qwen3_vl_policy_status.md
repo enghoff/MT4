@@ -60,7 +60,7 @@ motor.
 | `Action` | `kind`, `ok`, `reason`, `label`, `source` (a `Grounding`), `dest_entity_id`, `dest_point_px`, `dest_alt_point_px`, `raw`. `ok` means *the reply is well formed for the action it chose* — not that anything was measured or is reachable. No `entity_id`: a pick target is a box. |
 | `observe()` | Capture → `capture_scene` → `build_snapshot` → grid overlay drawn with **markers only**. |
 | `decide()` | One Qwen call. `ACTIONS = (TRANSFER, PICK, PLACE, DONE, STOP)`. Reads the reply; resolves nothing physical. |
-| `measure_source()` | GrabCut inside the model's `box_2d` at `object_height_mm=0`, on the frame the box was drawn on. |
+| `measure_source()` | GrabCut inside the model's `box_2d`, on the frame the box was drawn on. Height inferred from the silhouette and unprojected to the table plane — see §2z. |
 | `source_entity()` | The measurement through `entities.object_entity` — reach, keep-out, ground Z, jaw plan, neighbour clearance, desk polygon. The only thing entitled to override the model. |
 | `destination_grasp()` | A tag id → its calibrated position; a `dest_2d` pixel → the plain table-plane projection of that pixel, **not snapped** to any tag or slot. Both squared to the world axes, both gated by `work_region_block_reason`. |
 | `to_frame_pixels()` / `point_readings()` / `box_readings()` | The single model-coordinate → pixel conversion, and the two readings kept for a point and for a box. Ordered identically, pixels first. See §2a, §2v. |
@@ -1290,6 +1290,11 @@ cannot flood the desk and gives an extent to sanity-check.
 
 #### Grip geometry: table height, always
 
+**The XY half of this was reversed by §2z**, which measured it at 18.0-22.4 mm
+outward on 20 mm cubes and added a height cue that has no axis dependence. Grip
+*height* is unchanged and always was `table_z`. What follows is the reasoning as
+it stood.
+
 `measure_source` passes `object_height_mm=0`
 (`instruct.PICK_AT_TABLE_HEIGHT_MM`). So a target's XY is the plain table-plane
 projection of the GrabCut mask's centroid, its yaw is that mask's long axis,
@@ -1571,7 +1576,145 @@ should still be the better choice for something flat, which is what it was
 chosen for, but that has not been measured -- there is no flat object with an
 independent ground truth on this desk.
 
-**This is a live decision, not a settled one.** See §5.
+**Superseded by §2z**, which found a flat ground truth, found the cause of the
+43.2 mm outlier, and replaced the choice with a third option.
+
+---
+
+### 2z. Height from two cues, and the minimum of them — measured on both ends
+
+**Owner's decision, 2026-08-03:**
+
+> we need to account for the height of objects when processing qwen responses
+> [...] for the purpose of grip height, it is always safe to assume that the
+> gripper can grip at ground level (no object will be taller than the vertical
+> clearance of the gripper) but we need to account for the fact that the x,y
+> pixel coordinates identified by qwen are not at surface level and need to be
+> projected to the table surface
+
+Grip **Z** was never the question: `Grasp.z is None` means `table_z` and
+`LocatedObject.height_mm` has never fed it. What §2v removed, and what this
+restores, is the **XY** unprojection.
+
+#### The flat ground truth that was missing
+
+§2y could only measure the tall end, because the only independently-positioned
+objects on the desk were 20 mm cubes. The flat end was sitting there the whole
+time: **an ArUco marker is a flat object whose robot position is known** from
+the tag decode. Segment its paper as if it were an unknown object and the
+correct answer is "no height, do not move the point".
+
+| target | truth | `h=0` gap | `h` = width cue | inferred `h` (width) |
+|---|---|---|---|---|
+| tag 3 paper | (153.6, 156.9) | **1.2** | 14.6 | 16.8 mm |
+| tag 4 paper | (211.3, 7.3) | **2.4** | 13.0 | 22.3 mm |
+
+So the width cue (`_assumed_height_mm`) invents 15–22 mm of height for a sheet
+of paper and drags the aim point 13.0–14.6 mm — outside the ~±10 mm jaw
+tolerance, and the reason §2v was right to take it out of the pick path.
+
+#### The 43.2 mm outlier was a merged mask, not the height rule
+
+§2y's worst height-inferring case was a red cube at (22.6, −419.0). Re-measured
+2026-08-03: two red cubes sit **44 mm apart** there, and desk-deviation
+segmentation returns them as one blob — 121 mm long through GrabCut, 347 mm
+through the deviation path. Every height rule then aims somewhere in the gap
+(`h=0` 13.2–40.6 mm out, width cue 30.2–56.4 mm, stretch cue 25.6–49.0 mm).
+That is a segmentation failure amplified by the correction, and the guards for
+it already exist (`_check_plausible`, the two-window stability check). It is
+**not** evidence about which height rule to use.
+
+#### A second cue, from the radial stretch
+
+An object standing on the table images as its footprint unioned with its top
+outline, and the top is thrown outward from the camera nadir by exactly
+`h * gain`. That stretch lands *entirely* on the radial axis — the extent
+across the radial direction is the footprint's own, untouched. So:
+
+    h = (radial extent - across-radial extent) / gain
+
+both extents measured on the table plane, from the silhouette contour.
+`locate._height_from_sweep`. It needs no assumption about how tall a thing is,
+only that its footprint is about as deep as it is wide — true of cubes, rocks,
+staplers and sheets of paper, false of a pen pointing at the camera, where the
+footprint's own length is counted as stretch.
+
+The two cues are loose under **opposite** shapes, and neither is ever loose on
+the shape that defeats the other, so `locate._height_corrected` takes the
+**smaller**:
+
+| shape | width cue | stretch cue | min |
+|---|---|---|---|
+| 20 mm cube | tight (h ≈ w) | tight | tight |
+| flat sheet | invents 25–79 mm | ~0, correctly | ~0 |
+| pen along the azimuth | tight | invents 42–108 mm | tight |
+| pen across the azimuth | tight | reads 0 | **0 — no correction** |
+
+#### Measured, live on the arm
+
+Same frame, same masks, so only the rule differs. Cubes against
+`cube_top_homography`; tags against their decoded position.
+
+| target | flat (`h=0`) | shipped (min of two cues) | inferred h |
+|---|---|---|---|
+| blue cube (153.6, −214.8) | 18.0 | **4.0** | 16.2 mm |
+| red cube (161.3, −74.6) | 22.1 | **9.9** | 15.9 mm |
+| blue cube (96.4, −163.0) | 16.2 | **6.0** | 11.2 mm |
+| tag 3 paper | 1.2 | **1.2** | 0.0 mm |
+| tag 4 paper | 2.4 | **3.0** | 0.0 mm |
+
+All three cubes move from outside the ~±10 mm jaw tolerance to inside it, and
+the flat objects do not move.
+
+#### Measured, 84 synthetic prisms through the live calibration
+
+Ground truth is exact by construction: a prism of known size, height, position
+and yaw, projected through the measured nadir and lens height
+(`robot_to_pixel(x, y, z)`), silhouette taken as the convex hull of footprint
+and top outline. Error is the component **across** the object's long axis,
+which is the one the jaws cannot absorb — error along a shaft still lands on
+the shaft. 7 shapes × 3 desk positions × 4 orientations.
+
+| rule | mean | worst | outside ±10 mm |
+|---|---|---|---|
+| flat (`h=0`) | 7.2 | 29.0 | 23 / 84 |
+| width cue alone | 11.0 | 111.2 | 32 / 84 |
+| stretch cue alone | 4.7 | 29.0 | 15 / 84 |
+| **min of the two** | **3.9** | **29.0** | **9 / 84** |
+
+Per shape, worst across-axis error, flat → min: 20 mm cube 19.4 → 1.2;
+45×40×30 mm rock 28.5 → 1.8; 60×40×1 mm card 1.1 → 3.0; 90×60×0.5 mm sheet
+3.4 → 5.2; 55×22×4 mm key 3.8 → 3.8; 140×12×12 mm pen 10.6 → 10.6;
+150×60×35 mm stapler 29.0 → 29.0. The minimum never has a worse **worst** case
+than the flat projection in this sweep — the 29.0 mm entry is the same stapler
+pose for both.
+
+#### The residual, stated because nothing downstream will notice it
+
+Something long lying **across** the camera azimuth gets no correction: the
+stretch cue reads no radial elongation, wins the minimum at zero, and the point
+stays where the flat projection put it — 6.1–12.1 mm outward for a
+140×12×12 mm pen. This is a real one-view ambiguity: the identical silhouette
+is cast by a flat strip three times as wide, whose centre is ~10 mm away.
+Correcting the pen means over-correcting every flat object. Pinned as
+`test_a_long_object_lying_across_the_camera_gets_no_correction` so a future
+reader does not take it for a regression.
+
+The 150×60×35 mm stapler is the other honest gap: it is elongated *and* tall,
+so both cues are loose at once and nothing here rescues it. Two views, or a
+class height prior, would be the only fixes — and the second one means asking
+the language model for a millimetre, which this stack does not do.
+
+#### Also fixed by this
+
+The Phase 0 geometry gate failure (18.6 mm mean / 29.1 mm max disagreement
+between the generic path and the cube path) was diagnosed as
+`_assumed_height_mm`'s axis dependence: `cos_radial` came out 0.03–0.58 for the
+same cube depending on its rotation, so the same cube estimated a different
+height at every orientation. The stretch cue has no such dependence — over the
+synthetic cube sweep it recovers 18.7–20.7 mm at every one of 12 poses against
+a true 20 — and it wins the minimum for compact objects, which is exactly the
+case the gate tested. Backlog item 7 is closed by this rather than sidestepped.
 
 ---
 
@@ -1589,7 +1732,10 @@ nothing about cubes. It measures a silhouette, takes the long axis from
 for compact ones. The stapler was gripped on hardware. §2v made this *more*
 general, not less: the height inference that was the one remaining
 shape-dependent step is out of the pick path entirely, and every object is now
-gripped the same way at `table_z`.
+gripped the same way at `table_z`. §2z put a height inference back in, but a
+shape-*agnostic* one: it reads the silhouette's radial stretch, which is the
+same measurement whatever the object is, and it recovers 20 mm for a cube and
+0 mm for a sheet of paper without being told which it is looking at.
 
 **2. Referent resolution — yes, and now genuinely so.** It used to pass on a
 technicality: `unmatched_nouns` + `locate_target` + `LOCATE_AT_PIXEL` could get
@@ -1705,14 +1851,13 @@ actually built.
 
 ### Needs hardware time
 
-**7. ~~Fix `_assumed_height_mm`'s axis dependence.~~ Sidestepped for the
-instruction loop by §2v** — every pick now measures at zero assumed height and
-grips at `table_z`, so the estimator is not in that path at all. It is still
-live for `mt4_locate_at_pixel` and `mt4_locate_by_prompt`, which pass
-`object_height_mm=None`. **What replaces this item is validating the trade on
-hardware**: a table-height grip aims up to ~30 mm outward of a 20 mm cube's true
-centre (silhouette centroid times `_parallax_gain` 1.4-2.0) and near-exactly at
-a flat object. Nobody has measured which way that lands in practice.
+**7. ~~Fix `_assumed_height_mm`'s axis dependence.~~ Closed 2026-08-03 by §2z.**
+A second height cue reads the silhouette's radial stretch, which has no axis
+dependence, and `_height_corrected` takes the smaller of the two cues. Over 12
+synthetic cube poses it recovers 18.7-20.7 mm against a true 20; live on the arm
+the aim point moves from 18.0-22.1 mm outward to 4.0-9.9 mm. Every path shares
+it — the instruction loop, `mt4_locate_at_pixel` and `mt4_locate_by_prompt` all
+pass `object_height_mm=None`.
 
 **8. Re-run `calibrate_table_edge.py`** after reworking the wood colour model
 (hue wraparound plus a saturation floor that matches the measured 15–27 range,
@@ -1878,16 +2023,16 @@ and it is purely about safety:
   `object_entity`'s clearance check, `free_markers` and `free_placement_slots`
   would finally see a pen as an obstacle rather than as empty desk.
 
-**Does the table-height grip hold up on hardware? Measured in §2y: not for
-cubes.** Against `cube_top_homography` on six detections it is 9.0-24.5 mm out,
-mean ~17, outside the ~±10 mm jaw tolerance on 5 of 6, always outward as
-predicted. The height-inferring path is better on 5 of 6 (2.7-14.1 mm) and 43.2
-mm out on the sixth. So the choice is now between three things, and it is yours:
+**~~Does the table-height grip hold up on hardware?~~ Decided 2026-08-03 — see
+§2z.** It did not: 18.0-22.4 mm outward on 20 mm cubes, outside the ~±10 mm jaw
+tolerance. None of the three options offered here is what was taken. The
+measurement now infers height from two cues and uses the smaller, which is the
+third option ("one general path") arrived at by adding a cue rather than
+repairing the old one. Cubes land 4.0-9.9 mm out, flat objects do not move, and
+no cube special case entered the geometry layer.
 
-- *Keep it.* Simple, one path, and it is the right call for flat objects — which
-  is what it was chosen for, and which nothing has measured yet.
-- *Route compact objects to `cube_top_homography` after measuring.* A cube
-  special case living in the geometry layer, invisible to the model, worth ~14 mm
-  on the numbers above.
-- *Fix `_assumed_height_mm`'s axis dependence* and use one general path. The
-  most work, and the only option that ends with a single answer.
+What is left open is the **stapler shape** — elongated *and* tall, where both
+cues are loose at once and the aim point is up to 29 mm off across the grasp
+axis, the same as before. One view cannot separate those two facts. A second
+camera would; asking the model for a height would not, and would break the rule
+that the VLM supplies semantics and OpenCV supplies millimetres.

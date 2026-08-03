@@ -20,15 +20,20 @@ Two consequences worth knowing:
 * An object's own **height** cannot be ignored, even for "thin" things. The base
   projection is the flat table-plane homography, exact for a point *on* the
   table -- but a silhouette's centroid is not on the table, and this camera is
-  steeply oblique (nadir ~360-490mm away, 244mm up), so the flat inverse is off
+  steeply oblique (nadir ~360-490mm away, 242mm up), so the flat inverse is off
   by ~1.5x the height. A 12mm pen reads ~9mm from where it is, past the ~10mm
   the jaws tolerate: measured on hardware, the arm shoved the pen aside instead
   of gripping it, in exactly the direction this predicts. So the centroid is
   unprojected at half the object's height and the width is de-inflated by the
-  whole of it. One view cannot separate height from width, so the height is
-  *assumed* equal to the width unless ``object_height_mm`` says otherwise --
-  right for pens, markers and tools, wrong for a flat sheet. It is reported on
-  ``LocatedObject.height_mm`` because it is an assumption, not a measurement.
+  whole of it.
+
+  One view cannot measure height, so it is inferred from two independent cues
+  and the **smaller** of the two is taken -- see :func:`_height_corrected`.
+  Each cue is an over-estimate under a different shape, and each is tight
+  where the other is loose, so the minimum is right for both a 20mm cube and a
+  sheet of paper. It is reported on ``LocatedObject.height_mm`` because it is
+  an inference, not a measurement, and ``object_height_mm`` overrides it for a
+  caller that knows better.
 
 Extents also clip where an object's own contrast against the desk runs out: the
 white end of a white pen on light wood is not separable, so ``long_mm`` reads
@@ -106,9 +111,9 @@ class LocatedObject:
     long_mm: float
     short_mm: float
     confidence: float
-    # Height above the table assumed when unprojecting the centroid. Reported
-    # because it is an assumption, not a measurement, and it moves the grasp
-    # point by ~1.5x itself at this mount -- see _assumed_height_mm.
+    # Height above the table inferred when unprojecting the centroid. Reported
+    # because it is an inference, not a measurement, and it moves the grasp
+    # point by ~1.5x itself at this mount -- see _height_corrected.
     height_mm: float = 0.0
     # BGR crop around the object, for re-acquiring it in a later frame.
     template: np.ndarray = field(repr=False, default_factory=lambda: np.zeros((1, 1, 3), np.uint8))
@@ -469,8 +474,13 @@ def refine_at_box(
 
 def _rect_from_mask(
     mask: np.ndarray, origin: tuple[int, int]
-) -> tuple[tuple[float, float], list[tuple[float, float]]]:
-    """(centroid, 4 corners) in FRAME pixels from a crop-local mask."""
+) -> tuple[tuple[float, float], list[tuple[float, float]], np.ndarray]:
+    """(centroid, 4 corners, outline) in FRAME pixels from a crop-local mask.
+
+    The outline is the silhouette contour itself, not the rectangle's corners.
+    It is what :func:`_table_extents_mm` measures the radial sweep from, and a
+    minAreaRect around a swept shape is looser than the shape.
+    """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         raise LocateError("mask has no contour")
@@ -480,7 +490,8 @@ def _rect_from_mask(
     corners = [(float(cx) + ox, float(cy) + oy) for cx, cy in box]
     ys, xs = np.nonzero(mask)
     centroid = (float(xs.mean()) + ox, float(ys.mean()) + oy)
-    return centroid, corners
+    outline = contour.reshape(-1, 2).astype(np.float64) + np.array([ox, oy], np.float64)
+    return centroid, corners, outline
 
 
 def _parallax_gain(calib: Calibration, x: float, y: float) -> float:
@@ -516,18 +527,69 @@ def _unproject(
     return cam[0] + (fx - cam[0]) * k, cam[1] + (fy - cam[1]) * k
 
 
+def _radial_basis(
+    calib: Calibration, x: float, y: float
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Unit vectors (outward from the nadir, across it) at (x, y), or None.
+
+    Height displaces a silhouette purely along the outward vector, so this is
+    the frame every height cue is measured in. None when the camera geometry is
+    unmeasured, or when the point sits on the nadir itself and "outward" has no
+    direction.
+    """
+    cam = calib.cam_xy_robot
+    if not cam:
+        return None
+    dx, dy = x - float(cam[0]), y - float(cam[1])
+    n = math.hypot(dx, dy)
+    if n < 1e-6:
+        return None
+    return (dx / n, dy / n), (-dy / n, dx / n)
+
+
+def _table_extents_mm(
+    calib: Calibration,
+    outline_px: np.ndarray,
+    u: tuple[float, float],
+    v: tuple[float, float],
+) -> tuple[float, float]:
+    """Outline width (mm) along the outward radial axis, and across it.
+
+    Both measured on the flat table plane, which is the plane the sweep happens
+    in -- the outline is projected through ``pixel_to_robot`` before either
+    extent is taken, so lens and perspective foreshortening are already undone.
+    """
+    pts = np.array(
+        [
+            calib.pixel_to_robot(float(px), float(py), on_cube_top=False)
+            for px, py in outline_px
+        ],
+        dtype=np.float64,
+    )
+    if not len(pts):
+        return 0.0, 0.0
+    pu = pts @ np.array(u, dtype=np.float64)
+    pv = pts @ np.array(v, dtype=np.float64)
+    return float(pu.max() - pu.min()), float(pv.max() - pv.min())
+
+
 def _assumed_height_mm(
     silhouette_mm: float, gain: float, cos_radial: float
 ) -> float:
-    """Object height inferred from how much its own height inflated its width.
+    """Height inferred from how much the object's own height inflated its width.
 
     A silhouette is the union of the footprint and the top outline, the latter
     thrown outward from the nadir by ``h * gain``, so across the grasp axis it
     measures ``w + h * gain * cos_radial``. One view cannot separate w from h, so
     this assumes a cross-section **as tall as it is wide** -- true of pens,
-    markers and tools lying on a table, which is what this module is for, and
-    false of a flat sheet, which would be reported as thicker and nearer than it
-    is. Pass ``object_height_mm=0`` for something genuinely flat.
+    markers and tools lying on a table, false of a flat sheet, which it reports
+    as thicker and nearer than it is. Synthetic prisms through this
+    calibration: 0.1-3.9mm across the grasp axis for a 12mm pen, 5.2-25.1mm for
+    a 90x60x0.5mm sheet. Live on ArUco paper, which is flat and whose position
+    is known: it invents 15-22mm of height and moves the point 13.0-14.6mm.
+
+    Tight where the object really is round in section, loose for anything flat,
+    which is the half :func:`_height_from_sweep` answers.
     """
     if gain <= 0.0:
         # No measured camera geometry, so there is no correction to make and
@@ -535,6 +597,32 @@ def _assumed_height_mm(
         return 0.0
     denom = 1.0 + gain * max(0.0, min(1.0, cos_radial))
     return max(0.0, silhouette_mm / denom) if denom > 1e-6 else 0.0
+
+
+def _height_from_sweep(radial_mm: float, cross_mm: float, gain: float) -> float:
+    """Height inferred from how far the silhouette is stretched radially.
+
+    An object standing on the table images as its footprint unioned with its
+    top outline, and the top is thrown outward from the nadir by exactly
+    ``h * gain``. That stretch lands **entirely** on the radial axis: the
+    across-radial extent of the silhouette is the footprint's own, untouched.
+    So the difference between the two extents is the stretch, and the height
+    follows -- given a footprint about as deep as it is wide, which is what
+    ``cross_mm`` stands in for.
+
+    Tight for anything compact, whatever its height, and tight for anything
+    flat, whatever its outline: a sheet has no stretch to find and this returns
+    zero. Loose for a long object pointing at the camera, where the footprint's
+    own length is counted as stretch -- 42-108mm of invented height for a
+    140mm pen. That is the half :func:`_assumed_height_mm` answers.
+
+    Synthetic prisms through this calibration, error across the grasp axis:
+    0.0-1.2mm for a 20mm cube (the flat projection gives 2.6-17.6mm), 0.1-3.0mm
+    for a 60x40x1mm card, 0.1-1.8mm for a 45x40x30mm rock.
+    """
+    if gain <= 0.0:
+        return 0.0
+    return max(0.0, radial_mm - cross_mm) / gain
 
 
 def _median_width_px(mask: np.ndarray, long_axis_deg_px: float) -> float:
@@ -580,6 +668,7 @@ def _height_corrected(
     cy: float,
     axis_yaw: float,
     short_mm: float,
+    outline_px: np.ndarray,
     object_height_mm: float | None,
 ) -> tuple[float, float, float, float]:
     """Apply the object's own height to its centre and width. (cx, cy, short, h).
@@ -590,24 +679,50 @@ def _height_corrected(
     centroid ~1.5x its height away from the thing itself -- past what the jaws
     tolerate for a 12mm pen.
 
+    **The height is the smaller of two cues**, :func:`_assumed_height_mm` from
+    the width inflation and :func:`_height_from_sweep` from the radial stretch.
+    Both are upper bounds that go loose under opposite shapes -- the first
+    invents height for anything flat, the second for anything long pointing at
+    the camera -- and neither is ever tight on the shape that defeats the
+    other, so the minimum is the one number that is close for a cube, a card
+    and a pen alike. Measured across the grasp axis over 84 synthetic prisms
+    through this calibration: mean 3.9mm, and 9 of 84 outside the ~10mm the
+    jaws tolerate, against 7.2mm / 23 of 84 for the flat projection and
+    11.0mm / 32 of 84 for the width cue alone.
+
+    Taking the minimum means erring toward **under**-correction, and one shape
+    gets no correction at all: something long lying across the camera azimuth,
+    where the stretch cue reads no radial elongation and wins the minimum. A
+    140x12x12mm pen there stays 6.1-12.1mm outward, exactly where the flat
+    projection puts it. That is a genuine one-view ambiguity -- the same
+    silhouette is cast by a flat strip three times as wide, whose centre is
+    ~10mm away -- and resolving it in the pen's favour would over-correct every
+    flat object instead.
+
+    What defeats both cues is a mask that is not one object: two red cubes 44mm
+    apart segment as a 121mm blob, and every rule then aims at the gap. That is
+    the segmentation's job to refuse -- see :func:`_check_plausible` and the
+    two-window stability check in :func:`measure`.
+
     ``cos_radial`` is how much of the object's short axis points along the
     camera azimuth. Only that component is inflated by height, so a pen lying
     across the view direction needs no de-inflation and one lying along it
     needs all of it.
     """
     gain = _parallax_gain(calib, cx, cy)
+    basis = _radial_basis(calib, cx, cy)
     cos_radial = 1.0
-    cam = calib.cam_xy_robot
-    if cam:
-        d = math.hypot(cam[0] - cx, cam[1] - cy)
-        if d > 1e-6:
-            ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
-            cos_radial = abs(ax * (cam[0] - cx) + ay * (cam[1] - cy)) / d
-    height = (
-        _assumed_height_mm(short_mm, gain, cos_radial)
-        if object_height_mm is None
-        else max(0.0, float(object_height_mm))
-    )
+    if basis is not None:
+        u, v = basis
+        ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
+        cos_radial = abs(ax * u[0] + ay * u[1])
+    if object_height_mm is not None:
+        height = max(0.0, float(object_height_mm))
+    else:
+        height = _assumed_height_mm(short_mm, gain, cos_radial)
+        if basis is not None and len(outline_px):
+            radial_mm, cross_mm = _table_extents_mm(calib, outline_px, u, v)
+            height = min(height, _height_from_sweep(radial_mm, cross_mm, gain))
     if height > 0.0:
         short_mm = max(1.0, short_mm - height * gain * cos_radial)
         # The silhouette's centroid lies midway between the footprint and the
@@ -626,7 +741,7 @@ def _object_from_mask(
     """Geometry from a crop-local mask; None if the silhouette is degenerate."""
     x0, y0 = origin
     try:
-        centroid, corners = _rect_from_mask(mask, (x0, y0))
+        centroid, corners, outline = _rect_from_mask(mask, (x0, y0))
     except LocateError:
         return None
     robot = [calib.pixel_to_robot(cx, cy, on_cube_top=False) for cx, cy in corners]
@@ -659,7 +774,7 @@ def _object_from_mask(
     # the centroid of a silhouette sits half the object's height up, and the
     # width is inflated by the whole of it.
     cx, cy, short_mm, height = _height_corrected(
-        calib, centroid, cx, cy, axis_yaw, short_mm, object_height_mm
+        calib, centroid, cx, cy, axis_yaw, short_mm, outline, object_height_mm
     )
 
     th, tw = mask.shape[:2]
@@ -734,10 +849,12 @@ def measure(
     the mask, and segmentation is by far the least reliable step in the chain, so
     a disagreement between scales has to abstain rather than pick a winner.
 
-    ``short_mm`` is a silhouette width, so for anything with height it reads
-    *wide*: this camera is steeply oblique, and an object's side face projects
-    onto the table plane next to it (a 12mm round pen measures ~24mm). Treat it
-    as an upper bound, and verify the grasp rather than trusting it.
+    ``short_mm`` starts as a silhouette width, which reads *wide* for anything
+    with height: this camera is steeply oblique, and an object's side face
+    projects onto the table plane next to it (a 12mm round pen measures ~24mm).
+    It is de-inflated by the inferred height, so it is only as good as that
+    inference. Treat it as an upper bound, and verify the grasp rather than
+    trusting it.
     """
     exclude = marker_paper_mask(frame, calib, marker_xy) if marker_xy else None
     primary = _measure_one(frame, px, py, calib, win, exclude, object_height_mm)
@@ -850,8 +967,14 @@ def measure_box(
     _check_plausible(long_mm, short_mm, "the box")
     axis_yaw = math.degrees(math.atan2(long_v[1], long_v[0]))
 
+    # The box corners stand in for the outline there is no mask to supply. An
+    # image-aligned AABB is looser than a silhouette in both directions at
+    # once, so the radial-stretch cue reads high here and the width cue is
+    # usually what the minimum picks -- which is this path's historical
+    # behaviour, and appropriate for a last-resort measurement.
     cx, cy, short_mm, height = _height_corrected(
-        calib, centroid, cx, cy, axis_yaw, short_mm, object_height_mm
+        calib, centroid, cx, cy, axis_yaw, short_mm,
+        np.array(corners, dtype=np.float64), object_height_mm,
     )
 
     ix0, iy0 = int(math.floor(xa)), int(math.floor(ya))

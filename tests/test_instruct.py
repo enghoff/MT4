@@ -467,13 +467,16 @@ def test_a_destination_naming_an_undecoded_tag_is_refused():
 # -- grip geometry --------------------------------------------------------- #
 
 
-def test_a_pick_measures_at_zero_assumed_height():
-    """Grip as low as possible, at the point the model identified, oriented by
-    the GrabCut mask. That is exactly ``object_height_mm=0`` -- no height
-    inference and no parallax de-inflation anywhere in the pick path."""
+def test_a_pick_infers_the_objects_height():
+    """The pick path leaves ``object_height_mm`` unset, so the measurement
+    infers the height and unprojects the aim point to the table plane. Pinning
+    it: a fixed zero here aims 18.1-22.4mm outward of a 20mm cube, past the
+    ~10mm the jaws tolerate."""
     seen: dict[str, object] = {}
 
-    def _fake_measure(obs, g, *, label=None, object_height_mm=None):
+    sentinel = object()
+
+    def _fake_measure(obs, g, *, label=None, object_height_mm=sentinel):
         seen["height"] = object_height_mm
         seen["box"] = g.box_px
         return object(), ""
@@ -492,7 +495,7 @@ def test_a_pick_measures_at_zero_assumed_height():
         instruct.measure_grounding = saved
 
     assert obj is not None, why
-    assert seen["height"] == 0.0 == instruct.PICK_AT_TABLE_HEIGHT_MM
+    assert seen["height"] is sentinel, "the pick path must not pin a height"
     assert _close(seen["box"], (180.0, 80.0, 220.0, 120.0))
 
 

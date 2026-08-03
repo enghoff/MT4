@@ -297,12 +297,11 @@ def measure_grounding(
     stability check and the work-region gate, so a wrong reading cannot buy
     itself a target by being tried twice.
 
-    ``object_height_mm=0`` measures the object as if it were flat: the returned
-    XY is the plain table-plane projection of the mask centroid, with no
-    height-from-silhouette inference and no parallax de-inflation. That is what
-    the instruction loop passes -- see ``instruct.PICK_AT_TABLE_HEIGHT_MM`` for
-    which error that trades for which. ``None`` keeps the inferring behaviour,
-    for callers that want it.
+    ``object_height_mm`` is passed straight through. ``None`` -- what the
+    instruction loop uses -- infers the height from the silhouette and
+    unprojects the centroid to the table plane. A number overrides that, and
+    ``0`` measures the object as if it were flat, with no parallax
+    de-inflation at all.
     """
     from mt4_vision.locate import LocateError, measure_with_box_fallback
 

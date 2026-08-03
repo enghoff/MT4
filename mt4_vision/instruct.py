@@ -39,10 +39,17 @@ objects segmented on a frame where the bare-point desk-deviation path manages
 that can be sanity-checked before the arm moves. See :class:`Grounding`.
 
 **Grip geometry.** Every object is gripped at ``calib.table_z`` -- as low as the
-jaws go -- at the table-plane projection of the GrabCut mask's centroid, with
-the yaw of that mask's long axis. So ``object_height_mm=0`` on every
-measurement, and no step of a pick depends on how tall the thing is. What that
-trades is stated where it is paid: :data:`PICK_AT_TABLE_HEIGHT_MM`.
+jaws go -- with the yaw of the GrabCut mask's long axis. Nothing about the grip
+*height* depends on how tall the thing is: no object here is taller than the
+jaws' vertical clearance, so the lowest grip is always available.
+
+Where the jaws go in **XY** does depend on it. The camera looks at the desk from
+a steep angle, so a tall object's image is smeared outward from the point the
+camera sits above, and the middle of that smear is not above the object's
+footprint. Projecting it as if it were flat aims the jaws past the object --
+measured 18.1-22.4mm outward on 20mm cubes, against the ~10mm they tolerate.
+So the measurement infers the object's height and unprojects accordingly; see
+``locate._height_corrected`` for how, and for what it costs.
 
 **Coordinates are 0-1000, everywhere.** That is the space this model answers
 in, whatever a prompt asks for -- it is what Qwen document in
@@ -98,7 +105,7 @@ from mt4_vision.scene import capture_scene
 
 __all__ = [
     "ACTIONS", "COORD_SCALE", "MAX_NEW_TOKENS", "MAX_BOX_FRAME_SHARE",
-    "PICK_AT_TABLE_HEIGHT_MM", "Action", "Grounding", "Observation",
+    "Action", "Grounding", "Observation",
     "box_grounding", "box_readings", "build_prompt", "decide",
     "destination_grasp", "grasp_for", "measure_grounding", "observe",
     "point_readings", "to_frame_pixels", "load_calibration",
@@ -108,31 +115,6 @@ __all__ = [
 # of reason, and the 1664-token static cache holds one image plus this
 # comfortably.
 MAX_NEW_TOKENS = 220
-
-# Every pick measures at zero assumed object height: a target's XY is the plain
-# table-plane projection of its mask centroid, and the jaws close at
-# ``calib.table_z``. Grip as low as possible, at the point the model identified,
-# oriented by the GrabCut mask.
-#
-# This keeps the height-from-silhouette estimator out of the pick path. That
-# estimator infers 7.2-32.3mm for objects that are all 20mm, it assumes a cross
-# section as tall as it is wide (false for anything flat), and its error lands
-# as XY displacement of up to ~28mm against the ~10mm the jaws tolerate.
-#
-# The cost, and it is measured: a silhouette centroid sits *outward* of the real
-# footprint on this oblique mount, by roughly the object's height times
-# ``_parallax_gain`` (1.4-2.0 here). Against ``cube_top_homography`` on six cube
-# detections this path lands 9.0-24.5mm out, mean ~17, always outward -- outside
-# the ~10mm the jaws tolerate on 5 of the 6. The height-inferring path is better
-# on 5 of 6 (2.7-14.1mm) and 43.2mm out on the sixth.
-#
-# So a 20mm cube gets shoved more often than gripped, and this stays because it
-# is the right shape of error for something FLAT -- paper, a key, a card, where
-# there is no height to mis-attribute and no independent ground truth on this
-# desk to check it against. It is a choice of which error to carry, not a tuning
-# knob. Revisit it by routing compact objects to the fitted cube homography
-# after measurement, or by fixing the estimator's axis dependence.
-PICK_AT_TABLE_HEIGHT_MM = 0.0
 
 # TRANSFER leads because it is the shape of nearly every real task here: move a
 # thing to a place, in one step, with no park-look-decide in the middle that
@@ -535,9 +517,10 @@ def measure_source(
       falls back to desk-deviation at the box centre, then to the raw box.
       Measured on one live frame, GrabCut from a box segmented 4 of 4 objects
       where the point path managed 1 of 4.
-    * **Zero assumed height** (:data:`PICK_AT_TABLE_HEIGHT_MM`), so the
-      returned XY is the table-plane projection of the mask centroid and the
-      jaws will close at ``calib.table_z``.
+    * **Height inferred from the silhouette**, so the returned XY is where the
+      object meets the table rather than where its top face images. The jaws
+      still close at ``calib.table_z`` regardless -- height moves the aim
+      point, never the grip height. See ``locate._height_corrected``.
     * **Orientation from that same mask** -- ``axis_yaw_deg`` is the long axis
       of the mask's ``minAreaRect``, which is what ``object_entity`` turns into
       a wrist angle and a 90/180 periodicity.
@@ -547,9 +530,7 @@ def measure_source(
     """
     if action.source is None:
         return None, "no box in the reply"
-    return measure_grounding(
-        obs, action.source, object_height_mm=PICK_AT_TABLE_HEIGHT_MM
-    )
+    return measure_grounding(obs, action.source)
 
 
 def source_entity(obs: Observation, obj: Any) -> Entity:

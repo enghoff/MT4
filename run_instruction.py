@@ -52,11 +52,15 @@ nothing to refuse over a name. The box goes straight to the segmenter that
 turns pixels into millimetres.
 
 **Every object is gripped at table height.** The jaws close at ``table_z``, as
-low as they go, at the table-plane projection of the GrabCut mask's centroid,
-oriented by that mask's long axis. Nothing infers how tall the thing is;
-inferring it from the silhouette reads 7.2-32.3mm for objects that are all
-20mm. See ``instruct.PICK_AT_TABLE_HEIGHT_MM`` for which error that trades away
-and which it accepts.
+low as they go, oriented by the GrabCut mask's long axis. Nothing on this desk
+is taller than the jaws' vertical clearance, so the lowest grip is always
+available and no pick has to know how tall a thing is to decide its Z.
+
+*Where* the jaws go does need the height. The camera views the desk from a
+steep angle, so a tall object images smeared outward and the middle of that
+smear is not above its footprint -- 18.1-22.4mm outward on 20mm cubes, against
+the ~10mm the jaws tolerate. The measurement infers the height from the
+silhouette and unprojects; see ``locate._height_corrected``.
 
 **Moving something somewhere is ONE step.** ``TRANSFER`` names the object and
 its destination together and the arm carries out both halves without stopping,
