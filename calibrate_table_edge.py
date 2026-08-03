@@ -60,7 +60,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
+from mt4_vision.calib import (
+    DEFAULT_CALIB_PATH,
+    load_calibration,
+    update_calibration,
+)
 from mt4_vision.camera import capture_frame
 from mt4_vision.workspace import MAX_REACH_MM, joint_reachable
 
@@ -243,9 +247,13 @@ def main() -> int:
         print("\n--dry-run: calibration not written")
         return 0
 
-    calib.table_polygon_robot = polygon
-    calib.frame_size_px = [int(width), int(height)]
-    calib.save(args.calib)
+    # Only the two fields this script measures, merged onto the current file
+    # -- see calib.update_calibration. The probe above takes minutes.
+    update_calibration(
+        Path(args.calib), based_on=calib,
+        table_polygon_robot=polygon,
+        frame_size_px=[int(width), int(height)],
+    )
     print(f"\nwrote table_polygon_robot and frame_size_px to {args.calib}")
     return 0
 

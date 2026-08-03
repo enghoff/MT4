@@ -59,6 +59,7 @@ from mt4_vision.calib import (
     DEFAULT_CALIB_PATH,
     CalibrationError,
     load_calibration,
+    update_calibration,
 )
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import detect_cubes
@@ -310,8 +311,9 @@ def main() -> int:
         return 1
 
     nadir, H, rms = fit_nadir_height(records, calib)
-    calib.cam_xy_robot = [round(nadir[0], 1), round(nadir[1], 1)]
-    calib.cam_height_mm = round(H, 1)
+    cam_xy_robot = [round(nadir[0], 1), round(nadir[1], 1)]
+    cam_height_mm = round(H, 1)
+    calib.cam_xy_robot, calib.cam_height_mm = cam_xy_robot, cam_height_mm
     perr = [
         math.hypot(*(np.array(calib.robot_to_pixel(r["cx"], r["cy"], tz + r["h"])) - np.array([r["px"], r["py"]])))
         for r in records
@@ -325,7 +327,14 @@ def main() -> int:
     if args.dry_run:
         print("(dry run -- not writing)")
         return 0
-    calib.save(Path(args.calib))
+    # Merge onto the file as it stands NOW, writing only the two numbers this
+    # script measured. The sweep above takes minutes, and saving the whole
+    # object would revert anything written during it -- which is how these two
+    # were lost twice on 2026-08-03. See calib.update_calibration.
+    update_calibration(
+        Path(args.calib), based_on=calib,
+        cam_xy_robot=cam_xy_robot, cam_height_mm=cam_height_mm,
+    )
     print(f"Saved cam_xy_robot + cam_height_mm to {args.calib}")
     return 0
 

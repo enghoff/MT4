@@ -238,3 +238,78 @@ def test_naming_one_clear_does_not_excuse_another(tmp_path):
 def test_the_first_save_to_a_new_path_has_nothing_to_protect(tmp_path):
     make_calib().save(tmp_path / "fresh.json")
     assert (tmp_path / "fresh.json").exists()
+
+
+# ------------------------------------------- the load-early / save-late loss
+#
+# Every calibration script loads the file, drives the arm for minutes, then
+# saves. Calibration is a mutable dataclass, so that save writes back the file
+# as it was at LOAD time plus its own edits -- reverting anything written in
+# between. calibrate_height saves repeatedly *during* its run, so it does this
+# over and over. Measured 2026-08-03: cam_xy_robot and cam_height_mm were
+# written by calibrate_camera_nadir.py and were null again twice the same day,
+# with no error from anything.
+
+
+def test_a_stale_writer_no_longer_reverts_another_scripts_work(tmp_path):
+    """The exact sequence that lost the camera nadir, twice."""
+    from mt4_vision.calib import load_calibration, update_calibration
+
+    path = tmp_path / "vision_calibration.json"
+    make_calib().save(path)
+
+    # Script A loads the file and starts a long probe run.
+    stale = load_calibration(path)
+
+    # Script B finishes in the meantime and writes what it measured.
+    update_calibration(path, cam_xy_robot=[518.1, -35.0], cam_height_mm=244.0)
+
+    # Script A now saves what IT measured. The old way -- stale.save(path) --
+    # would write back a whole object that predates B and silently drop both.
+    stale.table_polygon_robot = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+    update_calibration(
+        path, table_polygon_robot=stale.table_polygon_robot
+    )
+
+    after = load_calibration(path)
+    assert after.table_polygon_robot == [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+    assert after.cam_xy_robot == [518.1, -35.0]
+    assert after.cam_height_mm == 244.0
+
+
+def test_the_old_whole_object_save_is_what_save_now_refuses(tmp_path):
+    """Belt to the braces: even if a script forgets to merge, it cannot lose
+    a measurement silently -- save() reads the file and refuses."""
+    from mt4_vision.calib import CalibrationError, load_calibration, update_calibration
+
+    path = tmp_path / "vision_calibration.json"
+    make_calib().save(path)
+    stale = load_calibration(path)
+    update_calibration(path, cam_height_mm=244.0)
+
+    try:
+        stale.save(path)
+    except CalibrationError as exc:
+        assert "cam_height_mm=244.0" in str(exc)
+    else:
+        raise AssertionError("a stale whole-object save was accepted")
+    assert load_calibration(path).cam_height_mm == 244.0
+
+
+def test_a_merge_warns_when_the_table_map_moved_underneath_it(tmp_path, capsys):
+    """The values were measured against a map that is no longer current, so
+    merging them is arithmetic the operator has to agree to."""
+    from mt4_vision.calib import load_calibration, update_calibration
+
+    path = tmp_path / "vision_calibration.json"
+    make_calib().save(path)
+    based_on = load_calibration(path)
+
+    refit = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]]
+    update_calibration(path, homography=refit)
+    update_calibration(path, based_on=based_on, cam_height_mm=244.0)
+
+    assert "has been re-fit since this run loaded it" in capsys.readouterr().err
+    # It still writes -- the caller measured something real, and refusing here
+    # would strand a completed hardware run with nowhere to put its result.
+    assert load_calibration(path).cam_height_mm == 244.0

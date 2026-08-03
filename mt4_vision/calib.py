@@ -27,9 +27,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -53,6 +55,58 @@ def _is_empty(value: object) -> bool:
     lost exactly as much as one that writes ``None``.
     """
     return value is None or (isinstance(value, (dict, list, tuple)) and not value)
+
+
+def update_calibration(
+    path: Path = DEFAULT_CALIB_PATH,
+    *,
+    based_on: "Calibration | None" = None,
+    clearing: Sequence[str] = (),
+    **fields: Any,
+) -> "Calibration":
+    """Merge measured fields into the file **as it stands now**, and save.
+
+    Every calibration script here has the same shape::
+
+        calib = load_calibration(path)   # t0
+        ... minutes of driving the arm ...
+        calib.save(path)                 # t1
+
+    ``Calibration`` is a mutable dataclass, so that last line writes back the
+    *whole* object -- which is the file as it was at t0, plus this script's
+    edits. Anything written between t0 and t1 is silently reverted. The gaps
+    are not small: 98 lines of cube sweeping in ``calibrate_camera_nadir``,
+    106 in ``calibrate_height``, 69 in ``calibrate_table_edge``. Worse,
+    ``calibrate_height`` saves *repeatedly during* its run, so every one of
+    those writes reverts the file to its t0 state again.
+
+    Measured 2026-08-03: ``calibrate_camera_nadir.py`` was run, wrote
+    ``cam_xy_robot`` and ``cam_height_mm``, and both were null again by the end
+    of the morning -- for the second time that day. Nothing reported an error,
+    because nothing was wrong from any single script's point of view.
+
+    So a script must not write the whole object. It re-reads the file at write
+    time and lays only what it measured on top. ``Calibration.save``'s
+    drop-check still runs underneath, which is what catches a merge that would
+    still lose something.
+
+    ``based_on`` is the calibration the caller actually computed against. If the
+    table map has changed underneath it, this says so -- the numbers being
+    written were derived from a different map, and merging them is arithmetic
+    the caller has to agree to.
+    """
+    current = load_calibration(path)
+    if based_on is not None and based_on.homography != current.homography:
+        print(
+            f"WARNING: {path} has been re-fit since this run loaded it. The "
+            "values about to be written were measured against the previous "
+            "table map, so they may not describe the current one. Re-run this "
+            "calibration if the camera or the arm moved.",
+            file=sys.stderr,
+        )
+    merged = dataclasses.replace(current, **fields)
+    merged.save(path, clearing=clearing)
+    return merged
 
 
 def cleared_fields(previous: dict, incoming: dict) -> list[str]:

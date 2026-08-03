@@ -42,6 +42,7 @@ from mt4_vision.calib import (
     CalibrationError,
     fit_transform,
     load_calibration,
+    update_calibration,
     reprojection_errors,
 )
 from mt4_vision.camera import capture_frame
@@ -336,7 +337,17 @@ def main() -> int:
                     o for o in new if json.dumps(o, sort_keys=True) not in seen
                 ]
             calib.probe_observations = new
-            calib.save(Path(args.calib))
+            # Only what this script measures, merged onto the file as it stands
+            # now. This closure fires REPEATEDLY through a probe run that takes
+            # minutes, and saving the whole object made every one of those
+            # writes revert the file to its state when the run started --
+            # silently undoing any other calibration finished in between. See
+            # calib.update_calibration.
+            measured = {"probe_observations": calib.probe_observations}
+            if calib.cube_top_homography is not None:
+                measured["cube_top_homography"] = calib.cube_top_homography
+                measured["cube_top_residual"] = calib.cube_top_residual
+            update_calibration(Path(args.calib), based_on=calib, **measured)
 
         def locate_probe(near_xy: tuple[float, float]) -> CubeDetection | None:
             """Re-detect the probe fresh (never trust a carried-over
