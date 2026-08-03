@@ -101,6 +101,119 @@ correctness problem that the objective exposes.
 
 ---
 
+## Measured Results, 2026-08-02
+
+First implementation pass. One live frame (1280x720, 9 cubes, 5 markers, plus a
+figurine, a remote, cable runs and the arm parked over the desk), saved and
+worked offline so every number below is reproducible against the same pixels.
+
+### Phase 0 gate: FAILED
+
+`locate.measure` was pointed at each HSV cube centroid -- exactly what a hint
+from a human or a VLM does -- and compared against the HSV +
+`cube_top_homography` answer for the same cube:
+
+| cube | HSV robot | generic robot | error |
+|---|---|---|---|
+| blue | (179, -186) | (174, -199) | 14.2mm |
+| blue | (157, -77) | (164, -83) | 9.7mm |
+| green | (166, 103) | (176, 95) | 12.5mm |
+| red | (143, 263) | (161, 242) | 27.7mm |
+| red | (84, -155) | (112, -150) | 29.1mm |
+
+n=5, mean **18.6mm**, median 14.2mm, max 29.1mm, against a ~10mm pick
+tolerance. One further cube raised `LocateError` outright. **The generic path
+cannot currently replace the cube path**, so nothing that acts on the arm
+should be switched over.
+
+**Root cause, and it is not the unprojection.** `_assumed_height_mm` divides by
+`1 + gain * cos_radial`, where `cos_radial` is measured across the object's
+*long axis*. A cube has no long axis -- `minAreaRect` picks one arbitrarily --
+so `cos_radial` came out 0.03, 0.06, 0.15, 0.38, 0.58 across five identical
+cubes. Where it is near zero the divisor collapses to 1 and the whole silhouette
+width is attributed to height: inferred heights of 7.2 to 32.3mm for objects
+that are all 20mm. The two worst cubes (cos_radial 0.03 and 0.06) are exactly
+the two with ~28mm error.
+
+So the estimator is unstable *for compact objects specifically*, which is
+unfortunate because compact is what the benchmark object is. A radial /
+tangential formulation would be axis-independent, and a first look at it
+(silhouette extent along the nadir direction minus the extent across it) gave
+heights of 1.9 to 15.9mm -- still scattered, because the silhouettes also
+include cast shadow. **Both would need fixing, and both change where the arm
+goes for every pointed-at object, so neither was attempted here.**
+
+### Phase 1 detection parity: works, and already outperforms HSV
+
+`mt4_vision/discover.py` proposes hints with no prior knowledge and hands each
+to the ordinary `measure` path. On the same frame it found **all 9 cubes**;
+`mt4_scene` reports **6**. The three it added expose two separate pre-existing
+bugs:
+
+1. **The desk polygon is ~20mm too tight at the back edge.** Two real,
+   reachable cubes are discarded by `detect_cubes`' `on_table` test, missing the
+   polygon by **17.1mm** and **0.2mm**. `off_table_blobs=7` in the scene summary
+   is the signature CLAUDE.md already names. The other five discards are the
+   arm and the wall, correctly rejected at x = -148 to -6990mm. Fix is to re-run
+   `calibrate_table_edge.py`, which rewrites the calibration and needs the arm
+   parked clear -- not done here.
+2. **One green cube is invisible to HSV entirely**, not even a raw blob. A
+   colour-range or saturation miss at the back of the desk, unrelated to (1).
+
+Timing: 0.18s to propose, 0.46s to measure everything, single-threaded.
+
+### The desk does not have to be uniform
+
+The concern that this method needs a plain desk is measurably wrong, and the
+tests now pin it: an illumination gradient of 90 grey levels corner to corner
+(larger than the object-to-desk contrast) plus horizontal grain changes neither
+which objects are found nor where they measure, to within 2mm. A bare desk with
+both nuisances turned on proposes **nothing**. That is what the local median
+background buys, and it is why a single reference colour was abandoned.
+
+### The real limit is width, and it bites at cube scale
+
+An object wider than the background kernel does not disappear cleanly -- its
+interior is absorbed but its **corners still deviate**, and each corner, cut out
+and measured alone, comes back as a small, plausible, stable object. Measured on
+a synthetic 183px square: four phantom 12x6mm objects, all four surviving the
+two-window stability check. On a real desk that is a book offering the arm four
+fake grasp points, which is worse than not seeing the book. `discover` now
+vetoes it with a second, coarser deviation pass.
+
+Tuning that veto exposed how tight the margin is. Coarse widths on the live
+frame, in full-res pixels:
+
+```text
+cubes                     24, 40, 40, 48, 57, 64
+arm base / remote / arm   94, 101, 242
+```
+
+A 20mm cube is only ~40px of footprint, but this mount is steeply oblique, so
+its side face projects out beside it and the silhouette reaches 64px -- past
+the 61px kernel. **Vetoing at exactly one kernel deletes cubes.** The threshold
+sits at 1.25 kernels, in the 64-94px gap. The practical scope is therefore
+narrower than "30mm": it is 30mm of *silhouette*, and an oblique camera inflates
+a footprint by 1.5-2x, so the honest object-width limit is nearer 15-20mm with a
+cube right at the boundary.
+
+The veto also has to be a per-pixel width test, not a per-component one. Judging
+whole connected components was tried first and deleted two real cubes, because
+at the coarse scale a cube 100px from the arm's base merges into the base's blob
+and inherits its width.
+
+### Known false positive
+
+One 40x4mm sliver at pixel (491, 392), robot (45, -140) -- a shadow edge or
+cable between the remote and a cube. It clears the keep-out by 7mm and is
+therefore reported as pickable. Nothing currently refuses it: the jaw-span gate
+in `grasp_feasibility` is inert, because `grip_span_s_at_zero_mm` and
+`grip_span_s_per_mm` are `null` in `vision_calibration.json`. Calibrating the
+jaw span would refuse a 4mm object on its own terms, which is better than
+inventing a width floor in the enumerator.
+
+---
+
 ## Detection Parity Is the Real Asymmetry **[r2]**
 
 Today `mt4_scene` lists **every cube automatically** and **only those objects
@@ -130,8 +243,8 @@ survived a decent hint"*. Today it runs from a hint. Generalizing it to
 enumerate all desk-deviating components turns it into a deterministic,
 VLM-free, camera-rate object proposer that feeds the measurement code already
 written for it. Geometry stays deterministic; the VLM only labels and selects.
-Risks to handle: the arm's own body, shadows, the desk edge, and the hull gate
-already in `within_pick_hull`.
+Risks to handle: the arm's own body, shadows, and the desk edge — the last of
+which `in_work_region` already gates on the measured desk polygon.
 
 **(b) Qwen as the enumerator.** `OBJECTS_PROMPT` is measured at 10 boxes, 3/3
 reproducible under greedy ([QWEN3-VL.md § Getting a JSON object
@@ -201,16 +314,31 @@ achievable with this camera at all.
 Three predicates currently decide whether a thing can be picked, and they
 disagree:
 
+**Partly fixed already.** Commit `4ca5542` (2026-08-02) replaced the marker hull
+with one region predicate, `workspace.in_work_region` /
+`work_region_block_reason`, and all three ladders now call it
+([entities.py:227](../mt4_vision/entities.py#L227),
+[entities.py:494](../mt4_vision/entities.py#L494),
+[locate.py:913](../mt4_vision/locate.py#L913)). Keep-out, reach, desk polygon
+and camera coverage are therefore no longer a source of disagreement, and
+`MAX_VERIFIABLE_RADIUS_MM` is gone. What is left:
+
 | Check | `pick_block_reason` (cube) | `object_entity` (obj) | `grasp_feasibility` |
 |---|---|---|---|
-| J1 keep-out (140mm) | ✓ | ✓ | ✓ |
-| Max reach (350mm) | ✓ | ✓ | ✓ |
-| Camera-verifiable radius (240mm) | — | — | ✓ |
-| Marker hull | ✓ | ✓ | — |
+| Work region (`work_region_block_reason`) | ✓ | ✓ | ✓ |
 | Blob area 400–5000px | ✓ | — | — |
 | Neighbour clearance | 45mm fixed | jaw-width-aware | — |
-| Jaw span vs object width | — | — | ✓ |
+| Jaw span vs object width | — | — | ✓ (inert, see below) |
 | Wrist angle in soft limits | — | — | ✓ |
+
+Blob area is legitimately detector-specific and should stay declared as an HSV
+add-on. The other two rows are the remaining drift.
+
+**The jaw-span check is currently a no-op.** `_span_mm` returns `None` unless
+`grip_span_s_at_zero_mm` and `grip_span_s_per_mm` are set, and neither is
+present in `vision_calibration.json` today. So nothing refuses an object too
+wide for the jaws. That matters more under a general enumerator, which will
+propose objects HSV never would.
 
 And `grasp_feasibility` is only ever called **at registration** — in
 `mt4_locate_at_pixel` and `mt4_locate_by_prompt`
@@ -711,14 +839,31 @@ neither of these.
 
 ## Build Order **[r2]**
 
-### Phase 0 — hardware gate: is the general geometry good enough?
+### Phase 0 — hardware gate: DONE, and it failed
 
-Run the same cube through the HSV+`cube_top_homography` path and the generic
-segment+`_assumed_height_mm`+`_unproject` path; compare XY. Then sweep XY error
-against known object heights using the rig
-[calibrate_camera_nadir.py](../calibrate_camera_nadir.py) already provides
-(grip a cube, sweep known heights). No VLM, no policy. This decides whether
-cube-agnosticism is reachable with this camera and what the height ceiling is.
+Run 2026-08-02; see Measured Results above. Mean 18.6mm error against a ~10mm
+tolerance, caused by `_assumed_height_mm` measuring inflation across an
+arbitrary axis on compact objects. **Nothing that commands the arm may switch to
+the generic path until this is fixed.**
+
+Still outstanding from this phase: the XY-error-versus-known-height sweep, using
+the rig [calibrate_camera_nadir.py](../calibrate_camera_nadir.py) already
+provides (grip a cube, sweep known heights). That needs the arm and was not run.
+
+### Phase 0a — fix the height estimator
+
+Two stacked causes, both needing hardware verification because both move where
+the arm goes for every pointed-at object:
+
+1. **Axis dependence.** Replace the across-the-long-axis inflation measurement
+   with a radial/tangential one, which needs no axis and so behaves the same on
+   a cube as on a pen.
+2. **Shadow in the silhouette.** `L_WEIGHT = 0.35` is not enough on this desk;
+   tangential extents of 28-48mm for 20mm cubes say the cast shadow is inside
+   the mask.
+
+Re-run the Phase 0 gate after each. The gate passes when cube error is within a
+few mm, not merely better.
 
 ### Phase 0b — repository prerequisites
 
@@ -727,13 +872,22 @@ Retreat for the camera before snapshots; mask the gripper region (generalizing
 returning frame + snapshot from a single capture. Unify the three pickability
 ladders into one predicate.
 
-### Phase 1 — detection parity
+### Phase 1 — detection parity: BUILT, not wired
 
-Generalize `_segment` into a class-agnostic desk enumerator (option a), feeding
-the existing measurement path. Measure enumeration recall per stratum. This is
-the phase that makes the flow the same length for every object, and it involves
-no VLM at all. Fall back to option (b) only if segmentation recall is poor, and
-record that the VLM has entered the perception loop.
+[mt4_vision/discover.py](../mt4_vision/discover.py) implements option (a) and
+[tests/test_discover.py](../tests/test_discover.py) covers it (16 tests, plus
+309 existing still green). Recall on the live frame is 9/9 cubes against
+`mt4_scene`'s 6.
+
+**Deliberately not wired into `build_snapshot` or `mt4_scene`.** Doing so would
+put objects carrying 9-29mm position error into the entity list, where
+`mt4_pick` would act on them. It stays a standalone module until Phase 0a
+passes. Remaining work once it does:
+
+- decide HSV/discover precedence for the same physical cube, via
+  `is_own_colour_blob` (audit row 8)
+- a width floor or a calibrated jaw span, so 4mm slivers are refused
+- recall per stratum, not just on cubes
 
 ### Phase 2 — Qwen point-and-bind
 

@@ -26,6 +26,15 @@ Chat replies are explanations for a competent colleague who has **not** read the
 - **Keep every number and observed fact.** Plain does not mean vague, and a measured value beats an adjective.
 - **Bold lead-ins, short paragraphs.** Decisions the user owns go in their own section at the end, stated as choices with consequences.
 
+## Reporting task completion (required)
+
+This governs the reply once you've *finished doing* something — not planning, analysis, or investigation replies, which follow "Explaining your work" above.
+
+- **Be brief.** A few sentences, not a report. Skip the step-by-step of what you tried.
+- **Lead with what the user needs to do next.** If something is blocking — you need an approval, a physical check at the arm, a decision only they can make — say that first, in plain terms. If nothing is blocking, say so in one line or drop the section; don't invent a next step to fill space.
+- **Summarize the result in one or two sentences** when it matches what was asked. Add detail only when the result differs from the request or something unexpected happened along the way.
+- **Skip code-level detail.** The user reads code casually, not in depth. Don't name functions, files, or internal mechanisms unless they asked about them directly — say what changed in terms of what it now does, not how the code does it.
+
 ## Primary tools
 
 | Tool | Use |
