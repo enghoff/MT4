@@ -26,6 +26,38 @@ Chat replies are explanations for a competent colleague who has **not** read the
 - **Keep every number and observed fact.** Plain does not mean vague, and a measured value beats an adjective.
 - **Bold lead-ins, short paragraphs.** Decisions the user owns go in their own section at the end, stated as choices with consequences.
 
+## Code comments describe the present (required)
+
+A comment says what the code does now, and why it has to be that way. It is not
+a changelog. Git already records what changed and when — `git log`, `git blame`
+and PR descriptions are the history. Someone reading the file wants the current
+contract, not a diff narrative they have to subtract from what they see.
+
+- **No before/after framing.** Do not write "previously", "used to", "no longer",
+  "changed from", "old behaviour was", "as of <date>", "fixed <date>", "this was
+  a literal `True` until", "two things used to stand here". If the sentence only
+  makes sense to someone who saw the old version, cut it.
+- **Keep the constraint, drop the history.** A rule learned from a past bug is
+  worth documenting — as a rule, in the present tense. Write "The guard compares
+  the predicted pose against the current one, so an already-violating pose can
+  still move toward legality." Not "This used to refuse every violating pose,
+  which froze the arm after a reset."
+- **Never narrate removals.** A comment about code that is not there wastes the
+  reader's attention. Delete the code and the comment together.
+- **Keep every number and measured fact** (see "Explaining your work" above).
+  Plain, present-tense comments are still dense. A date stays only when it is
+  part of a live fact — when a calibration was measured, which firmware a
+  constant was verified against — not as a marker of when an edit happened.
+- **Nothing addressed to a reviewer.** No "note the fix here", "as requested",
+  "per feedback", "this is the new version".
+- **One exception:** a compatibility shim, migration path or deprecation really
+  is about the past. State in one line what it is compatible with and the
+  condition for deleting it.
+
+Same rule for docstrings and for comments in firmware, tests and config. It does
+**not** apply to project docs like this file, `docs/`, or commit messages, where
+recording why a decision was made is the point.
+
 ## Reporting task completion (required)
 
 This governs the reply once you've *finished doing* something — not planning, analysis, or investigation replies, which follow "Explaining your work" above.
