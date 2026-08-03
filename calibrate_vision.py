@@ -521,6 +521,14 @@ def main() -> int:
             cam_xy_robot=prev.cam_xy_robot if prev else None,
             cam_height_mm=cam_height,
             color_ranges=prev.color_ranges if prev else {},
+            # Properties of the GRIPPER and of how the operator wants picks
+            # done. A camera calibration cannot invalidate either, and the
+            # jaw-span refusal fails open when unmeasured, so dropping these
+            # switches a safety gate off without saying so. Lost that way on
+            # 2026-08-03 -- see Calibration.save.
+            grip_span_s_at_zero_mm=prev.grip_span_s_at_zero_mm if prev else None,
+            grip_span_s_per_mm=prev.grip_span_s_per_mm if prev else None,
+            face_align_picks=prev.face_align_picks if prev else True,
             workspace_hull_px=hull.tolist(),
             raw_marker_observations={
                 str(mid): {
@@ -531,7 +539,17 @@ def main() -> int:
                 for mid in sorted(recorded)
             },
         )
-        calib.save(output)
+        # A full re-touch calibration: the camera pose, and possibly the arm
+        # and the desk, have all changed, so everything derived from the old
+        # geometry goes. Named rather than defaulted -- see Calibration.save.
+        calib.save(
+            output,
+            clearing=(
+                "cube_top_homography", "cube_top_residual",
+                "probe_observations", "color_xy_offset_mm",
+                "table_polygon_robot", "frame_size_px",
+            ),
+        )
         saved = True
         print(f"\nSaved to {output}")
     elif finish:

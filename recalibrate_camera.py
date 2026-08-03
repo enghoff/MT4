@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -47,7 +48,6 @@ import cv2
 import numpy as np
 
 from mt4_vision.calib import (
-    Calibration,
     CalibrationError,
     DEFAULT_CALIB_PATH,
     load_calibration,
@@ -211,16 +211,22 @@ def main() -> int:
         shutil.copy2(calib_path, backup_path)
         print(f"\nBacked up previous calibration to {backup_path}")
 
-    new_calib = Calibration(
+    # ``replace``, not a fresh ``Calibration``. Building one field by field
+    # meant anything not named took its dataclass default, and on 2026-08-03
+    # that silently reverted grip_span_s_at_zero_mm (212.3) and
+    # grip_span_s_per_mm (1.881) to None -- the jaw-opening model, a property
+    # of the gripper, which moving a camera cannot invalidate. Its refusal gate
+    # fails open when unmeasured, so nothing complained; the arm simply stopped
+    # declining objects too wide for it. Carrying everything and naming the
+    # exceptions inverts that: forgetting a field now preserves it.
+    new_calib = replace(
+        prev,
         homography=matrix,
-        table_z=prev.table_z,
-        safe_z=prev.safe_z,
-        travel_speed_us=prev.travel_speed_us,
-        approach_speed_us=prev.approach_speed_us,
-        grip_open_s=prev.grip_open_s,
-        grip_close_s=prev.grip_close_s,
-        cube_height_mm=prev.cube_height_mm,
         cube_top_homography=None,
+        # The residual table belongs to the cube-top map being cleared above.
+        cube_top_residual=None,
+        # Pixel<->robot pairs recorded through the OLD camera pose.
+        probe_observations=None,
         bundle_homography=report.bundle_h,
         raw_marker_observations={
             str(mid): {
@@ -243,14 +249,12 @@ def main() -> int:
         # cube_top_homography is cleared (pixel_to_robot falls back to it).
         cam_xy_robot=None,
         cam_height_mm=None,
-        color_ranges=prev.color_ranges,
         # NOT carried over: color_xy_offset_mm. Those offsets compensate the
         # color-dependent centroid bias (which side faces each HSV mask
         # admits) -- a function of the viewing geometry, so a camera move
         # invalidates them just like the parallax fallback below. Re-measure
         # at the new pose if needed.
         color_xy_offset_mm={},
-        face_align_picks=prev.face_align_picks,
         # Hull from every visible marker (matched or not), like
         # calibrate_vision.py -- a hull of only the matched markers would
         # silently exclude an occluded marker's corner of the desk from cube
@@ -259,7 +263,15 @@ def main() -> int:
             np.array([[m.px, m.py] for m in detected.values()], dtype=np.float32)
         ).reshape(-1, 2).tolist(),
     )
-    new_calib.save(output_path)
+    # Every loss this script intends, listed. Anything else that would go
+    # missing makes save() raise rather than write -- see Calibration.save.
+    new_calib.save(
+        output_path,
+        clearing=(
+            "cube_top_homography", "cube_top_residual", "probe_observations",
+            "cam_xy_robot", "cam_height_mm", "color_xy_offset_mm",
+        ),
+    )
     print(f"Saved refit calibration to {output_path}")
     return 0
 

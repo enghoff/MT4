@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -42,6 +43,29 @@ DEFAULT_CALIB_PATH = Path(
 
 class CalibrationError(Exception):
     """Raised when calibration data is missing, unloadable, or degenerate."""
+
+
+def _is_empty(value: object) -> bool:
+    """Does this field carry no measurement?
+
+    Empty containers count. ``color_xy_offset_mm={}`` is how that field is
+    cleared, and a caller that writes ``{}`` over a measured set of offsets has
+    lost exactly as much as one that writes ``None``.
+    """
+    return value is None or (isinstance(value, (dict, list, tuple)) and not value)
+
+
+def cleared_fields(previous: dict, incoming: dict) -> list[str]:
+    """Field names that held a value in ``previous`` and hold none in ``incoming``.
+
+    Compares the two dicts rather than two ``Calibration`` objects, so a field
+    added to the dataclass after an old file was written is not reported as
+    lost -- it was never there.
+    """
+    return sorted(
+        k for k, v in previous.items()
+        if not _is_empty(v) and _is_empty(incoming.get(k))
+    )
 
 
 # One-shot per process: a table-plane recalibration clears
@@ -263,7 +287,56 @@ class Calibration:
             float((w * deltas[:, 1]).sum() / denom),
         )
 
-    def save(self, path: Path = DEFAULT_CALIB_PATH) -> None:
+    def save(
+        self, path: Path = DEFAULT_CALIB_PATH, *, clearing: Sequence[str] = ()
+    ) -> None:
+        """Write the calibration, refusing to silently drop a measured value.
+
+        Most fields here cost arm time to measure and are used by code that
+        fails **open** when they are missing -- ``grip_s_for_span_mm`` warns
+        once and carries on, ``locate`` drops its parallax correction,
+        ``pixel_to_robot`` falls back to the flat table map. So a field that
+        quietly reverts to ``None`` does not break anything; it degrades
+        everything, silently, until someone notices weeks later.
+
+        That happened on 2026-08-03. ``recalibrate_camera.py`` rebuilt a fresh
+        ``Calibration`` naming 16 of the 22 fields, and the six it did not name
+        took their dataclass defaults. Four had been measured:
+        ``grip_span_s_at_zero_mm`` = 212.3 and ``grip_span_s_per_mm`` = 1.881
+        (the jaw-opening model, a property of the *gripper*, which a camera
+        recalibration has no business touching -- with it gone the width
+        refusal switched itself off), plus the camera nadir and height, which
+        that script clears on purpose.
+
+        Hence: **losing a value must be stated, not defaulted.** Pass the field
+        names in ``clearing`` when a script means to invalidate them, and this
+        raises otherwise. Adding a field to ``Calibration`` later cannot
+        re-open the hole, because the check reads whatever is on disk rather
+        than a list someone has to remember to extend.
+        """
+        path = Path(path)
+        if path.exists():
+            try:
+                # utf-8-sig: at least one archived calibration carries a BOM,
+                # and a parse failure here must not be the thing that turns the
+                # check off.
+                previous = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError) as exc:
+                raise CalibrationError(
+                    f"cannot read the existing {path} to check what this save "
+                    f"would drop: {exc}. Move it aside if it is truly junk"
+                ) from exc
+            allowed = set(clearing)
+            lost = [f for f in cleared_fields(previous, self.__dict__)
+                    if f not in allowed]
+            if lost:
+                had = ", ".join(f"{f}={previous[f]!r}" for f in lost)
+                raise CalibrationError(
+                    f"this save would drop {len(lost)} measured value(s) from "
+                    f"{path}: {had}. Carry them over (dataclasses.replace on "
+                    "the loaded calibration is the safe way), or say the loss "
+                    f"is deliberate with save(clearing={tuple(lost)!r})"
+                )
         path.write_text(json.dumps(self.__dict__, indent=2), encoding="utf-8")
 
 
