@@ -1034,6 +1034,120 @@ reason the stapler measures 55.8 × 38.4 mm and is refused. See the end of §2n.
 
 ---
 
+## 4b. Review backlog, 2026-08-03
+
+Four review passes over the whole branch (reuse, simplification, efficiency,
+altitude). The contained findings are applied and committed. These are the ones
+left, because each crosses a module boundary, changes behaviour, or was
+contested between reviewers. Ranked by value.
+
+**A. `locate.grasp_feasibility` and `entities.object_entity` are two answers to
+"can the arm take this object", and they have drifted in opposite directions.**
+`grasp_feasibility` tests region → jaw span → whether a J4 angle exists.
+`object_entity` tests region → antipodal grasp plan → cube clearance → region
+again at the moved grasp point. Each has a gate the other lacks. Five callers
+run **both** and hand-reconcile the answers (`mt4_mcp/server.py:445`, `:518`,
+`mt4_vision/__main__.py:147`, `:241`, `move_object_to_marker.py:133`), each with
+its own `if not ok and entity.reason is None:` merge. The acting paths —
+`mt4_pick`, `_reacquire`, `run_instruction` — read only `entity.pickable`, so
+**the J4 gate never runs where it matters** and an infeasible long-axis grasp is
+discovered by `motion.resolve_yaw_j4` raising mid-move. The two also disagree by
+3 mm about the same jaws: `jaw_span_block_reason` has no margin,
+`grasp.plan_grasp` uses `max_span - SPAN_MARGIN_MM`. Fix: delete
+`grasp_feasibility`, make `object_entity` the single computation, let callers
+read `entity.pickable` / `entity.reason`. Behaviour change — some objects that
+are pickable today would start being refused, correctly.
+
+**B. The pick-source / place-destination split is written out nine times in
+three modules.** `instruct._NEVER_PICKABLE_KINDS`, `wrong_kind_block_reason`,
+the `kinds = ("cube","object") if ... else ("marker","slot")` tuple,
+`grasp_for`'s `kind in ("marker","slot")`, the "not somewhere to put things"
+branch, the alternatives list, `capable = hit.pickable if ... else placeable`,
+plus `server.mt4_pick` and `server.mt4_place`. Fix: `PICK_KINDS` / `PLACE_KINDS`
+beside the `KIND_*` constants, and one `Entity.admits(role) -> (bool, reason)`
+returning the category-error sentence when the kind is wrong and `self.reason`
+when a physical gate failed.
+
+**C. There is no single notion of "does this word name this entity" — seven
+label parsers, none of them `Entity`'s.** `unmatched_nouns`' vocabulary build,
+`instruction_attributes`' vocabulary build, `_matches_attributes`' three-way
+dispatch, `wrong_kind_block_reason`'s label split, `register_object`'s word-wise
+merge, the `f"marker {num}"` parse done twice, `run_instruction.py:208`'s
+substring test (inconsistent — substring where the others are word-wise), and
+`server.py:587`'s `label.split()[0]` to recover a colour `entity.color` already
+holds. Fix: compute `Entity.names: frozenset[str]` once at build time from kind
++ measured colour + noun + printed marker number, and route every text match
+through `entity.answers_to(word)`. `Entity.color` already proves the pattern —
+it exists precisely because the label could not answer a question (§2r).
+
+**D. Three object registries, three dedupe policies.**
+`instruct.register_object` merges within `DUPLICATE_MM` and folds labels;
+`discover`'s merge loop uses the same 12 mm but keeps the larger measurement and
+never merges labels; `server._register_object` has **no** dedupe at all, so two
+`mt4_locate_at_pixel` calls on one pen yield `obj_1` and `obj_2` — the exact
+failure `register_object`'s docstring exists to prevent. `run_instruction`'s
+LOCATE_AT_PIXEL path also writes `objects[f"obj_{n}"]` directly, bypassing the
+deduplicating helper it uses on the grounding path.
+
+**E. `measure_box` re-implements the whole silhouette-to-`LocatedObject`
+transform**, so the parallax correction (now shared), the plausibility band (now
+shared) and the **two-window stability check** exist in inconsistent copies. The
+stability check runs only on the `measure` path, so a GrabCut or box measurement
+is acted on with no stability evidence at all. `measure_box` also stores no
+`mask`, which silently degrades `plan_object_grasp` back to the centroid grasp
+that `grasp.py` was written to replace. Fix: one pipeline parameterised by
+segmentation strategy.
+
+**F. `instruct` depends on `run_instruction` having run the grounding
+pre-pass.** The 75-line ground-measure-register loop lives in the CLI, and
+`_resolve_target` assumes it has already run — so an MCP-driven agent gets
+"register it with LOCATE_AT_PIXEL first" with no mechanism to satisfy it. The
+`held` / `objects.pop` / `history.append` rules are likewise enforced in the
+script and consumed by `build_prompt` and `unmatched_nouns` across the module
+boundary. Fix: a `TaskState` and an `instruct.step()` in `mt4_vision/`; the
+script keeps argparse, printing and the preview.
+
+**G. `qwen.py`'s HTTP client is a line-for-line copy of `grounding.py`'s** —
+health probe, hand-rolled multipart body, `URLError`/`HTTPError` mapping, the
+tunnel hint, ~60 lines twice. When the transport changes, one service gets it
+and the other silently does not.
+
+**H. Smaller, all verified:** `bind` computes an off-frame pixel that
+`entities._desk_pixel_projector` deliberately suppressed, undoing the one
+rejection the projector makes; three implementations of entity → `Grasp`, with
+`server._reacquire` honouring `calib.face_align_picks` and `Entity.as_grasp`
+ignoring it, so the same cube lands at a different wrist angle depending on
+which driver is running; two balanced-delimiter JSON scanners
+(`instruct._first_json_object` and `qwen._json_spans`, **not** drop-in
+equivalent — the fix is one scanner covering both); three entry points for
+"which reading of these numbers" plus two unrelated strategies for choosing
+between them; `ask_qwen.py` re-implements `preview.wrap_text`,
+`preview.draw_lock_ring` and `preview.LiveFeed`'s threading skeleton.
+
+**I. Grounding fires once per unmatched *word*, not per noun phrase.** A
+two-word target costs ~1.5 s of extra model time and a second measurement, and
+lands both hits on the same object for `register_object` to merge.
+`instruct.noun_phrase` already brackets the phrase.
+
+### Contested — do not act without re-measuring
+
+`discover.desk_pixel_mask` maps all 921,600 pixels through the homography in
+float64 (71 ms, 88.5 MB transient) where projecting the four desk-polygon
+vertices and calling `fillPoly` would take 0.37 ms. The efficiency reviewer
+measured them agreeing to 99.7%. The reuse reviewer ran both against the live
+calibration independently and reported that the shortcut depends on every
+polygon vertex staying in front of the camera, and that the vectorised version's
+NaN horizon guard is doing real work. Both cannot be right. `discover` is
+unwired, so nothing is paying the 71 ms today — settle it before wiring it in,
+not before.
+
+### Rejected
+
+Removing `discover.py` as dead code. It has no production caller and that is
+deliberate — §1 records the three decisions wiring it in needs first.
+
+---
+
 ## 5. Decisions you own
 
 **May the loop choose a destination the task deliberately left open?** This is
