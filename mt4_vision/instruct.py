@@ -1,43 +1,32 @@
-"""Natural-language instruction -> one validated action on one entity.
+"""Natural-language instruction -> one action on one entity.
 
 The policy layer. It decides *what to do next and to which thing*; every
-millimetre, every safety gate and every motion still belongs to the existing
-stack. Nothing here computes a robot coordinate.
+millimetre, every safety gate and every motion belongs to the existing stack.
+Nothing here computes a robot coordinate.
 
-Two deliberate choices, both from measurement rather than taste.
+**The model's target choice is taken at face value.** :func:`decide` asks for
+one action plus an ``entity_id`` and a point, and :func:`_resolve_target` turns
+those into an entity: the id when it names something in the snapshot, otherwise
+the point bound to the nearest entity of a usable kind. It does not compare the
+two against each other, against the instruction's wording, or against the
+detector's own labels. The one thing that can still refuse a resolved target is
+physical -- ``Entity.pickable`` / ``Entity.placeable`` carry reach, the J1
+keep-out, ground Z, finger clearance and the desk polygon, and that gate is what
+makes trusting the rest safe: nothing here can command a pose the envelope would
+have rejected anyway.
 
-**The model must both name and point, and the two must agree.** Naming alone
-leans on attribute-to-instance binding, which this build does badly -- it
-labelled a red cube "green" while boxing it perfectly (docs/QWEN3-VL.md).
-Pointing alone was the first design here, on the theory that localization is
-the stronger skill. Measured on the live desk 2026-08-02, that theory is only
-half right: asked for "the red cube" the model named ``cube_7`` correctly and
-pointed 151px away from it, and asked for a stapler that was not on the desk at
-all it pointed close enough to a blue cube for a nearest-entity rule to bind
-it and report success.
-
-So neither signal is trusted alone. The id must exist in the current snapshot,
-the point must land on an entity, and they must be the *same* entity;
-disagreement is treated as ambiguity and refused. Two independent channels
-agreeing is a far stronger claim than either one, and the cost of the extra
-strictness is a retry, which is the cheap failure.
-
-**Coordinates are 0-1000, not pixels.** Measured on this build, 8 replies out
-of 8: a box reported at x=807 sits at 1033px in a 1280-wide frame. Naively
-treating the reply as pixels lands the point 206-285px away -- still on the
-desk, so segmentation happily measures *something* and returns a confident
-wrong answer. :func:`to_frame_pixels` is the only place that conversion
-happens, and :func:`alternate_reading` is the only sanctioned way to second-
-guess it.
+**Coordinates.** A grounding reply (:func:`locate_target`, which says nothing
+about coordinate space) comes back 0-1000 normalized; :func:`to_frame_pixels`
+scales it. A decision reply comes back in pixels, because ``build_prompt``
+prints every entity's own pixel as a worked example; :func:`point_readings`
+returns both readings, pixels first, and binding settles which was meant.
 
 **Grounding asks for a box, not a point.** ``bbox_2d`` unlocks GrabCut
 segmentation, bounds the mask, and gives an extent that can be sanity-checked;
 a point gives none of the three. See :class:`Grounding`.
 
-One capture per decision. ``mt4_scene`` and ``mt4_camera_view`` each grab their
-own frame, so the ids drawn on the overlay come from a different exposure than
-the entity list; harmless for a still desk, wrong for point-and-bind.
-:func:`observe` does it once.
+One capture per decision, so the ids drawn on the overlay and the ids in the
+entity list come from the same exposure -- :func:`observe` does it once.
 """
 
 from __future__ import annotations
@@ -54,38 +43,52 @@ from mt4_vision.calib import Calibration, load_calibration
 from mt4_vision.camera import capture_frame
 from mt4_vision.entities import Entity, Snapshot, build_snapshot
 from mt4_vision.discover import MERGE_MM
-from mt4_vision.preview import BIG_BOX_SHARE, annotate_for_pointing
+# Re-exported via __all__ so `from mt4_vision.instruct import to_frame_pixels`
+# keeps working for callers and tests; only point_readings is used here.
+from mt4_vision.instruct_reply import (
+    COORD_SCALE,
+    MAX_BOX_FRAME_SHARE,
+    Grounding,
+    alternate_reading,
+    locate_target,
+    measure_grounding,
+    point_readings,
+    to_frame_pixels,
+)
+from mt4_vision.preview import annotate_for_pointing
 from mt4_vision.qwen import DEFAULT_URL, QwenError, ask
 from mt4_vision.scene import capture_scene
 from mt4_vision.workspace import PICK_CLEARANCE_MM
 
-# The model's coordinate space. Not pixels -- see the module docstring.
-COORD_SCALE = 1000.0
-# A point must land this close to an entity to name it, and no second entity
-# may be this close. Expressed in millimetres and converted to pixels at the
-# candidate's own position, because this camera is oblique and mm-per-pixel
-# varies across the frame. PICK_CLEARANCE_MM is the right scale by
-# construction: two objects nearer than the fingers need are not independently
-# pickable anyway, so a point between them is a real ambiguity, not a
-# resolution problem.
+__all__ = [
+    "ACTIONS", "BIND_RADIUS_MM", "COORD_SCALE", "DUPLICATE_MM", "MAX_NEW_TOKENS",
+    "MAX_BOX_FRAME_SHARE", "Action", "Grounding", "Observation",
+    "alternate_reading", "bind", "build_prompt", "decide", "grasp_for",
+    "is_question", "locate_target", "measure_grounding", "observe",
+    "point_readings", "register_object", "to_frame_pixels", "unmatched_nouns",
+    "load_calibration",
+]
+
+# A point must land this close to an entity to name it, and no second entity may
+# be this close. In millimetres, converted to pixels at the candidate's own
+# position, because this camera is oblique and mm-per-pixel varies across the
+# frame. PICK_CLEARANCE_MM is the right scale: two objects closer together than
+# the fingers need are not independently pickable, so a point between them is a
+# real ambiguity rather than a resolution problem.
 BIND_RADIUS_MM = PICK_CLEARANCE_MM
-# Short replies only. A decision is action + point + a clause of reason; the
-# 1664-token static cache holds one image plus this comfortably, and anything
-# longer means the model started narrating.
+# Short replies only: a decision is action + point + a clause of reason, and the
+# 1664-token static cache holds one image plus this comfortably.
 MAX_NEW_TOKENS = 220
 # Two grounded measurements this close describe one physical thing. THE same
-# constant discover uses, not a copy of it: these are the two paths that can add
-# an object to the world, and they have to agree about when two hits are one
-# object or the same stone becomes obj_3 and obj_4.
+# constant discover uses, not a copy: they are the two paths that can add an
+# object to the world and must agree about when two hits are one object.
 DUPLICATE_MM = MERGE_MM
 
-# TRANSFER leads because it is the shape of nearly every real task here: move
-# a named thing to a named place. Splitting that into PICK then PLACE cost a
-# park, a capture and a second decision in between, and bought nothing -- once
-# the object is in the jaws there is nothing left to see that changes where it
-# should go. PICK_ENTITY and PLACE_ENTITY remain for the halves that occur on
-# their own: "pick up the stapler" with no destination, and putting down
-# something the gripper was already holding when the run started.
+# TRANSFER leads because it is the shape of nearly every real task here: move a
+# named thing to a named place, in one step, with no park-look-decide in the
+# middle that could not answer anything anyway. PICK_ENTITY and PLACE_ENTITY are
+# for the halves that occur alone -- "pick up the stapler" with no destination,
+# and putting down something the gripper was already holding.
 ACTIONS = (
     "TRANSFER", "PICK_ENTITY", "PLACE_ENTITY", "LOCATE_AT_PIXEL", "DONE", "STOP",
 )
@@ -101,11 +104,8 @@ class Observation:
     calib: Calibration
     held: str | None = None
     # What this task has already done, oldest first, in prose. Without it the
-    # loop is memoryless and a completed task looks exactly like an untouched
-    # one: measured on a live run, "pick up the green cube and place it on
-    # marker 2" succeeded at step 2 and was then carried out twice more,
-    # because every fresh observation showed an empty gripper, a green cube on
-    # the desk, and that same instruction. The model was right every time.
+    # loop is memoryless: a completed task looks exactly like an untouched one,
+    # since both show an empty gripper and the same instruction.
     history: tuple[str, ...] = ()
     # The detections this snapshot was built from, kept so the entity list can
     # be rebuilt without going back to the camera -- see :meth:`relisted`.
@@ -119,17 +119,11 @@ class Observation:
     def relisted(self, *, objects: Any = (), token: str = "s1") -> "Observation":
         """This same frame, re-listed with a newly registered object in it.
 
-        Registering an object has to get it into the entity list before the
-        decision, and the obvious way to do that is to observe again. But
-        ``capture_frame`` reopens the camera and burns 20 warm-up reads --
-        2-3 SECONDS -- and it does it once per unmatched noun, while the arm is
-        parked and nothing on the desk has moved. The frame that would be
-        thrown away is the one already in hand.
-
-        Rebuilding the snapshot and the overlay from it instead costs about
-        5ms. Same pixels, so the ids the model is about to answer with still
-        describe the frame it is looking at, which is the property the whole
-        one-snapshot-one-id-space rule depends on.
+        A newly registered object has to reach the entity list before the
+        decision. Observing again would cost a fresh capture per noun; rebuilding
+        the snapshot and overlay from the frame already in hand costs ~5ms and
+        keeps the same pixels, so the ids the model answers with still describe
+        the frame it is looking at.
         """
         snapshot = build_snapshot(self.scene, token=token, objects=objects)
         return replace(
@@ -143,9 +137,9 @@ class Observation:
 class Action:
     """A validated decision, or a refusal.
 
-    ``ok`` means the decision is safe to act on: an entity action that passed
-    every check, or ``DONE``. Every ``STOP`` is ``ok=False``, whether the model
-    chose it or validation forced it, so a caller has one thing to branch on.
+    ``ok`` means there is something to act on: a resolved entity action, or
+    ``DONE``. Every ``STOP`` is ``ok=False``, whether the model chose it or
+    resolution forced it, so a caller has one thing to branch on.
     """
 
     kind: str
@@ -154,18 +148,14 @@ class Action:
     entity_id: str | None = None
     label: str | None = None
     point_px: tuple[float, float] | None = None
-    # The same reply's point under the other coordinate convention, when there
-    # is one. Never acted on -- it exists so the preview can show both and a
-    # reader can see at a glance which one the stack believed.
+    # The same point under the other coordinate convention, when there is one.
+    # Never acted on: the preview draws both so a reader can see which was used.
     alt_point_px: tuple[float, float] | None = None
-    # What the model itself claimed the id was, before binding. Kept to measure
-    # how often naming and pointing agree; never used to choose.
+    # The id string the model wrote, whatever it was. Reported, never used to
+    # choose -- the transcript prints "[model said ...]" when it differs.
     model_entity_id: str | None = None
-    # TRANSFER only: the destination, resolved by the same rules and against the
-    # same snapshot as the source. Both halves have to hold before the arm moves
-    # at all, which is the point of naming them together -- a transfer that is
-    # going to be refused for its destination should be refused before the
-    # object is in the jaws, not after.
+    # TRANSFER only: the destination, resolved by the same rules against the
+    # same snapshot as the source, so both ends hold before the gripper opens.
     dest_entity_id: str | None = None
     dest_label: str | None = None
     dest_point_px: tuple[float, float] | None = None
@@ -214,10 +204,28 @@ def observe(
     history: Sequence[str] = (),
     objects: Any = (),
     token: str = "s1",
+    frame: np.ndarray | None = None,
 ) -> Observation:
-    """One frame -> snapshot and pointing overlay built from the same pixels."""
+    """One frame -> snapshot and pointing overlay built from the same pixels.
+
+    ``frame`` lets a caller supply pixels it already holds instead of opening
+    the camera here. That is not an optimisation but a requirement for any
+    session that also shows a live feed: only one consumer can hold the
+    capture device, so a caller running a ``FrameStream`` for its preview
+    cannot let this function open a second one (on Windows DSHOW the second
+    open simply fails). It is also faster -- ``capture_frame`` reopens the
+    device and burns 20 exposure warm-up reads, 2-3 SECONDS, on every step.
+
+    The caller then owns the freshness guarantee this used to provide. A frame
+    off a continuously-drained stream is only as current as the moment it was
+    pulled, so pull it *after* the arm has parked (``FrameStream.fresh``
+    blocks for a frame whose capture started after the call, which is exactly
+    that guarantee); handing in a frame captured before the last move gets a
+    snapshot of a desk that no longer exists.
+    """
     calib = load_calibration()
-    frame = capture_frame(camera)
+    if frame is None:
+        frame = capture_frame(camera)
     scene = capture_scene(calib, frame)
     snapshot = build_snapshot(scene, token=token, objects=objects)
     annotated = annotate_for_pointing(frame, snapshot.entities)
@@ -320,6 +328,18 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "on the desk with no marker on it. If the task rules one out -- 'not on "
         "a marker', 'somewhere clear', 'a non-marker location' -- use the other "
         "kind.\n"
+        # The guard that catches this is deterministic and lives outside the
+        # prompt (missing_place_target_reason), so this sentence is not what
+        # makes it safe -- it is what stops the loop burning a park, a capture
+        # and a decision on a reply that was always going to be refused.
+        # Measured live 2026-08-03, "place it on marker 0" on a desk of markers
+        # 1-4: the model answered marker_3, then marker_1, then "task already
+        # completed", never once saying the number was not there.
+        "A number in the task is an identity, not a hint: 'marker 0' means the "
+        "entity whose id is exactly marker_0. If that id is not in the list "
+        "above, the task names something that is not on this desk -- answer "
+        "STOP and say which number is missing. A different number is never a "
+        "substitute for it.\n"
         f"point_2d is the centre of that same thing, in PIXELS of this "
         f"{w}x{h} image -- read them off the numbered grid drawn on it. Do not "
         "normalize or rescale. Required for TRANSFER, PICK_ENTITY, "
@@ -352,131 +372,6 @@ def _first_json_object(text: str) -> dict[str, Any] | None:
                     continue
                 if isinstance(got, dict):
                     return got
-    return None
-
-
-def to_frame_pixels(
-    coords: Sequence[float], size: tuple[int, int]
-) -> tuple[float, ...]:
-    """Model coordinates as frame pixels. The only place this convention lives.
-
-    Takes a point ``(x, y)`` or a box ``(x1, y1, x2, y2)`` -- even indices are
-    x, odd are y -- and returns the same shape.
-
-    **Asked for a coordinate with nothing to anchor it, this build answers in
-    0-1000 normalized space whatever the prompt says.** Measured 2026-08-02
-    against known pixel positions: four objects (three cubes from the HSV
-    detector plus a hand-read stapler) x two prompt forms (``point_2d`` and
-    ``bbox_2d``), on both the raw frame and the grid-annotated one. Eight
-    replies out of eight normalized, landing 1-10px from truth. Read as pixels,
-    those same replies land 206-285px away.
-
-    Asking for pixels does not change it. The prompt used to say "coordinates
-    are pixels of this 1280x720 image; the grid drawn on it is labelled in
-    pixels", and the model answered normalized anyway -- the grid overlay makes
-    no measurable difference either.
-
-    **Showing it a pixel does.** Once the entity list started printing "at image
-    point (x, y)" for every entity, the decision reply switched to pixels --
-    measured 2026-08-03, 5/5, within 0.4px of the named entity's own pixel.
-    A worked example in the prompt beats an instruction about the format. So
-    this function is the right default for an *unanchored* answer only;
-    ``decide`` resolves its point through :func:`point_readings` instead.
-
-    Nor does an in-frame test, which is what this function used to do, and
-    which is the bug this replaces. A normalized coordinate is *almost always*
-    in frame at this resolution: x <= 1000 < 1280 always, and y <= 720 over the
-    lower 72% of the range. "Use as pixels when it fits, rescale otherwise"
-    therefore fires the wrong way on nearly every reply. That is what sent
-    "pick up the stapler" to (700, 687) -- bare desk near the bottom edge, 280px
-    from the stapler -- where it failed as "could not segment an object". The
-    quieter version of the same bug lands on a *different object* and measures
-    it confidently.
-
-    The one reading that can be ruled out from the numbers alone is normalized:
-    no normalized coordinate exceeds ``COORD_SCALE``. So a coordinate above it
-    means pixels, and everything else is scaled. That leaves a genuine blind
-    spot -- a true pixel answer whose coordinates all happen to fall under 1000
-    -- so callers that can afford a retry should offer
-    :func:`alternate_reading` when the first reading fails to measure.
-    """
-    values = [float(c) for c in coords]
-    if any(abs(v) > COORD_SCALE for v in values):
-        return tuple(values)
-    w, h = size
-    sx, sy = w / COORD_SCALE, h / COORD_SCALE
-    return tuple(v * (sx if i % 2 == 0 else sy) for i, v in enumerate(values))
-
-
-def point_readings(
-    point: Sequence[float], size: tuple[int, int]
-) -> tuple[tuple[float, float], ...]:
-    """Both in-frame readings of a **decision** reply's point, best first.
-
-    The convention is a property of the prompt, not of the model, and the two
-    prompts in this module differ:
-
-    * :func:`locate_target` deliberately says nothing about coordinate space, so
-      the model falls back to its trained default and answers 0-1000 normalized.
-      Measured 8/8 (see :func:`to_frame_pixels`).
-    * :func:`build_prompt` asks for pixels **and prints every entity's own pixel
-      in the list**, so the model has a worked example of the space in front of
-      it. Measured 2026-08-03, five consecutive decisions on one frame: the
-      reply was the named entity's pixel to **0.4px**, every time. Read as
-      normalized, those same five land **160px** away.
-
-    That second measurement is why this exists. Pixels-first was wrong before
-    the entity list carried pixels, and is right now -- so both readings are
-    returned, in order, and the caller resolves them against the snapshot rather
-    than trusting either.
-
-    Readings outside the frame are dropped, and an exact duplicate is returned
-    once: a coordinate above ``COORD_SCALE`` rules normalized out, so there is
-    only one reading to have.
-    """
-    try:
-        values = [float(point[0]), float(point[1])]
-    except (TypeError, ValueError, IndexError):
-        return ()
-    w, h = size
-    out: list[tuple[float, float]] = []
-
-    def keep(candidate: tuple[float, float] | None) -> None:
-        if candidate is None:
-            return
-        if not (0 <= candidate[0] <= w and 0 <= candidate[1] <= h):
-            return
-        if candidate not in out:
-            out.append(candidate)
-
-    keep((values[0], values[1]))
-    scaled = to_frame_pixels(values, size)
-    keep((float(scaled[0]), float(scaled[1])))
-    return tuple(out)
-
-
-def alternate_reading(
-    coords: Sequence[float], size: tuple[int, int]
-) -> tuple[float, ...] | None:
-    """The other possible reading of the same numbers, or None if there is none.
-
-    Only ever raw-as-pixels, and only when that lands inside the frame:
-    :func:`to_frame_pixels` already returns raw pixels whenever a coordinate
-    rules normalized out, so in that case there is nothing else to try.
-
-    This exists so a failed measurement can be retried rather than reported,
-    without ever *silently* choosing between the two -- the retry still has to
-    survive segmentation, the two-window stability check and the work-region
-    gate before it becomes a target.
-    """
-    values = [float(c) for c in coords]
-    if any(abs(v) > COORD_SCALE for v in values):
-        return None
-    w, h = size
-    if all(0 <= v <= w for v in values[0::2]) and all(
-        0 <= v <= h for v in values[1::2]
-    ):
-        return tuple(values)
     return None
 
 
@@ -537,18 +432,9 @@ def grasp_for(entity: Entity, calib: Calibration):
     """The motion-layer pose for acting on ``entity``, taken from the snapshot.
 
     No fresh capture. The loop parks the arm and captures once per step, the
-    decision is made against that frame, and the arm then acts on the entity
-    positions it produced. Nothing but the arm moves on this desk, and the arm
-    is parked while the model thinks, so a second look before the grasp was
-    re-measuring a scene that had not changed.
-
-    What that second look used to buy was a template re-match for registered
-    objects, and it was the wrong tool for the job. Measured 2026-08-03: a
-    stapler lying against marker 1's paper stored a 59x59px template in which
-    the ArUco tag covered 30% of the area and carried 87% of the pixel
-    variance, the desk around it having a standard deviation of one grey level.
-    The match therefore tracked the tag, not the stapler -- it "re-acquired" a
-    lifted stapler onto the marker's own centre, 4mm out.
+    decision is made against that frame and the arm acts on the entity positions
+    it produced. Nothing but the arm moves on this desk, and the arm is parked
+    while the model thinks, so there is nothing a second look would find.
 
     Markers and slots are calibrated positions with nothing to detect, and a
     destination has no orientation of its own, so the landing yaw is squared to
@@ -615,374 +501,6 @@ def is_question(instruction: str) -> bool:
         return True
     first = text.split()[0].strip(".,!?;:'\"") if text.split() else ""
     return first in _INTERROGATIVE
-
-
-def named_destination_block_reason(
-    instruction: str, snapshot: Snapshot, *, moving: str | None = None
-) -> str | None:
-    """Why the marker this task names cannot be placed on, or None.
-
-    Checked *before* a pick, deterministically, from the printed tag number in
-    the instruction. Without it the loop picks first and discovers at the
-    place step that the destination was never available -- measured
-    2026-08-02, "put the blue cube on marker 2" (occupied) returned
-    ``PICK_ENTITY cube_2`` and would have stranded a cube in the jaws.
-
-    ``moving`` is the entity about to be picked. A destination occupied by
-    *that* entity is not blocked, it is already done: "put the green cube on
-    marker 2" with the green cube sitting on marker 2 must not refuse itself.
-
-    Silent when the task names no marker, which is most of them.
-    """
-    text = instruction.lower()
-    for e in snapshot.entities:
-        if e.kind != "marker":
-            continue
-        num = e.id.split("_")[-1]
-        if f"marker {num}" not in text and f"marker{num}" not in text:
-            continue
-        if e.placeable or (moving is not None and e.holds == moving):
-            continue
-        return (
-            f"{e.id} ({e.label}) cannot be placed on: "
-            f"{e.reason or 'no reason given'}"
-        )
-    return None
-
-
-# Kinds that exist to be placed *on*, never picked up. Naming one as the thing
-# to pick is a category error, and the model resolves it by picking whatever it
-# can instead -- measured 2026-08-02: "pick up slot 5" returned PICK_ENTITY
-# cube_2, a silent substitution of exactly the sort this layer exists to stop.
-_NEVER_PICKABLE_KINDS = ("marker", "slot")
-
-# Ways a task rules markers out as a destination. Matched as substrings of the
-# lowered instruction, so each entry covers its inflections.
-_NO_MARKER_PHRASES = (
-    "non-marker", "non marker", "nonmarker",
-    "not a marker", "not on a marker", "not onto a marker", "not marker",
-    "no marker", "without a marker", "other than a marker",
-    "away from the marker", "off the marker", "off a marker",
-    "avoid the marker", "avoiding the marker", "clear of the marker",
-)
-
-
-def excluded_destination_kind(instruction: str) -> str | None:
-    """The destination kind this task forbids, or None.
-
-    Both destination kinds reach the model as "can be placed on" and nothing
-    else tells them apart, so a task that rules one out is asking for a
-    distinction the entity list does not draw. Measured live 2026-08-02, "place
-    it on a non-marker location" answered ``PLACE_ENTITY marker_0`` twice: once
-    pointing at a second marker, and once -- after the prompt was taught what a
-    slot is -- naming ``marker_0`` while pointing squarely at ``slot_4``.
-
-    Reading the constraint here rather than trusting the prompt is the same
-    discipline as everywhere else in this layer: the entity's kind is ground
-    truth from the snapshot, so a task that names a kind can be checked against
-    it instead of hoped for. Note this is *not* target substitution -- it never
-    changes which physical thing is acted on beyond what the instruction itself
-    states, and a destination that survives it still has to pass ``placeable``.
-    """
-    text = instruction.lower()
-    if any(p in text for p in _NO_MARKER_PHRASES):
-        return "marker"
-    return None
-
-
-def wrong_kind_block_reason(
-    instruction: str, named: Entity | None, snapshot: Snapshot
-) -> str | None:
-    """Refuse a pick whose target the instruction never mentions.
-
-    Fires only when both hold: the instruction names a never-pickable kind, and
-    **no word of the chosen entity's own label appears in the instruction**.
-    "pick up slot 5" choosing ``cube_2`` ("blue cube") matches neither "blue"
-    nor "cube", so it is refused. "pick up the stapler and place it on marker 4"
-    choosing ``obj_1`` ("stapler") matches "stapler", so it passes.
-
-    The first version of this compared ``named.kind`` against the instruction
-    instead of the label, and that was wrong in the one way that mattered: a
-    registered object's kind is the word "object", which no real instruction
-    ever contains. Every "pick up the <thing> and put it on marker N" was
-    therefore refused -- the main non-cube use case, broken by the guard meant
-    to protect it. Cubes hid the bug, because "cube" *is* both their kind and a
-    word people type. Labels are what users actually name things by; kinds are
-    an internal taxonomy.
-    """
-    if named is None:
-        return None
-    text = instruction.lower()
-    asked = [k for k in _NEVER_PICKABLE_KINDS if k in text]
-    if not asked:
-        return None
-    words = {
-        w for w in named.label.lower().replace("(", " ").replace(")", " ").split()
-        if w.isalpha() and len(w) > 2
-    }
-    if any(w in text for w in words):
-        return None
-    return (
-        f"the task asks for a {asked[0]}, which is a place target and cannot "
-        f"be picked up, and nothing in {named.id} ({named.label!r}) is named in "
-        "the task -- name a pickable thing or say it cannot be done"
-    )
-
-
-@dataclass(frozen=True)
-class Grounding:
-    """Where the model says a named thing is, in frame pixels.
-
-    ``box_px`` is the whole point of asking for a box rather than a point, and
-    it buys three things a point cannot:
-
-    * **GrabCut.** ``locate.measure_grabcut`` seeds a silhouette from the box.
-      Measured on one live frame, the desk-deviation path that a bare point
-      feeds segmented 1 of 4 objects; from the box, GrabCut segmented 4 of 4,
-      and landed 6.3-12.4mm from where the HSV cube detector puts the same
-      three cubes.
-    * **A bound on the mask.** Desk-deviation floods into shadow and adjacent
-      objects with nothing to stop it; the box says how far the object goes.
-    * **A size check.** A box has an extent, so a reading that puts a stapler
-      at 400mm long can be rejected before the arm moves. A point has no
-      extent and cannot be sanity-checked at all.
-
-    ``alt_point_px`` / ``alt_box_px`` are the same reply under the other
-    coordinate convention -- see :func:`alternate_reading`. They are a retry,
-    never a silent second choice.
-    """
-
-    label: str
-    point_px: tuple[float, float]
-    box_px: tuple[float, float, float, float] | None = None
-    alt_point_px: tuple[float, float] | None = None
-    alt_box_px: tuple[float, float, float, float] | None = None
-
-
-def locate_target(
-    obs: Observation, noun: str, *, url: str = DEFAULT_URL
-) -> tuple[Grounding | None, str]:
-    """Ask only "where is the <noun>", and return a :class:`Grounding` or why not.
-
-    A separate, single-purpose call rather than another field on the decision
-    prompt. Asked to choose an action *and* ground an unknown noun, this build
-    reliably does neither -- it forces the task onto whatever cube it can see
-    and explains in its reason why that is wrong. Asked nothing but "locate
-    the stapler", with the keys spelled out, it is the grounding prompt that
-    measured 10/10 (docs/QWEN3-VL.md).
-
-    **The prompt deliberately says nothing about the coordinate space.** The
-    model ignores that instruction either way (see :func:`to_frame_pixels`),
-    and a stated convention it does not follow is worse than no statement at
-    all -- it invites the reader to trust the wrong reading.
-    """
-    prompt = (
-        f"Locate the {noun} in this image. If there is no {noun} visible, "
-        'reply with an empty list [].\n'
-        "Reply with ONLY JSON, no prose, no markdown fence:\n"
-        f'[{{"bbox_2d": [x1, y1, x2, y2], "label": "{noun}"}}]\n'
-        "One tight box around the whole object."
-    )
-    try:
-        reply = ask(prompt, obs.annotated, url=url, max_new_tokens=120, do_sample=False)
-    except QwenError as exc:
-        return None, f"grounding call failed: {exc}"
-
-    from mt4_vision.qwen import parse_regions
-
-    regions = parse_regions(reply.text)
-    # Boxes first: a point reply is still accepted, because the model
-    # occasionally answers with one anyway, but it loses everything in the
-    # Grounding docstring and is the weaker input.
-    for r in sorted(regions, key=lambda g: 0 if g.kind == "box" else 1):
-        prim = to_frame_pixels(r.coords, obs.size)
-        alt = alternate_reading(r.coords, obs.size)
-        g = _grounding(noun, r.kind, prim, alt, obs.size)
-        if g is not None:
-            return g, ""
-    return None, f"no usable {noun} location in {reply.text.strip()[:120]!r}"
-
-
-# A box larger than this share of the frame is the model declining to answer,
-# not an object. Asked to locate something that is not there, this build
-# sometimes returns the whole image rather than the empty list the prompt asks
-# for -- measured on "location", box (0, 0, 1000, 1000), 100% of the frame.
-#
-# The plausibility band in ``locate.measure_box`` caught that one, but only
-# after projecting it: a box spanning the frame includes pixels above the desk
-# horizon, where this camera's homography diverges, so the refusal read "box
-# measures 315037x312990mm". True, useless, and three layers from the cause.
-#
-# The threshold has room. The largest thing the stack will measure is
-# ``MAX_PLAUSIBLE_LONG_MM`` = 200mm; at this mounting that is roughly a third of
-# the frame's width, so well under a tenth of its area.
-# THE threshold the overlay calls out at, not a copy: the picture and the
-# refusal have to agree about what counts as "the model declined to answer".
-MAX_BOX_FRAME_SHARE = BIG_BOX_SHARE
-
-
-def _grounding(
-    label: str,
-    kind: str,
-    prim: Sequence[float],
-    alt: Sequence[float] | None,
-    size: tuple[int, int],
-) -> Grounding | None:
-    """Assemble a Grounding, or None when the reading cannot be an object.
-
-    Two rejections, both about the primary reading: a centre outside the frame,
-    and a box covering most of it (see :data:`MAX_BOX_FRAME_SHARE`).
-    """
-    w, h = size
-
-    def centre(c: Sequence[float]) -> tuple[float, float]:
-        if len(c) == 2:
-            return float(c[0]), float(c[1])
-        return (float(c[0]) + float(c[2])) / 2, (float(c[1]) + float(c[3])) / 2
-
-    def box(c: Sequence[float]) -> tuple[float, float, float, float] | None:
-        if len(c) != 4:
-            return None
-        x1, y1, x2, y2 = (float(v) for v in c)
-        return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
-
-    cx, cy = centre(prim)
-    if not (0 <= cx <= w and 0 <= cy <= h):
-        return None
-    prim_box = box(prim) if kind == "box" else None
-    if prim_box is not None and w > 0 and h > 0:
-        bx0, by0, bx1, by1 = prim_box
-        if (bx1 - bx0) * (by1 - by0) > MAX_BOX_FRAME_SHARE * w * h:
-            return None
-    return Grounding(
-        label=label,
-        point_px=(cx, cy),
-        box_px=prim_box,
-        alt_point_px=None if alt is None else centre(alt),
-        alt_box_px=None if alt is None or kind != "box" else box(alt),
-    )
-
-
-def measure_grounding(
-    obs: Observation, g: Grounding, *, label: str | None = None
-) -> tuple[Any | None, str]:
-    """Turn a :class:`Grounding` into a measured object, or say why not.
-
-    Prefers GrabCut from the box and falls back to the desk-deviation point
-    path, which is what ``locate.measure_with_box_fallback`` already arranges.
-    On failure it retries under the other coordinate reading rather than
-    reporting -- the retry still has to survive segmentation, the two-window
-    stability check and the work-region gate, so a wrong reading cannot buy
-    itself a target by being tried twice.
-    """
-    from mt4_vision.locate import LocateError, measure_with_box_fallback
-
-    name = label or g.label
-    marker_xy = [(e.x, e.y) for e in obs.snapshot.entities if e.kind == "marker"]
-    attempts: list[tuple[str, tuple[float, float], tuple[float, ...] | None]] = [
-        ("", g.point_px, g.box_px)
-    ]
-    if g.alt_point_px is not None and g.alt_point_px != g.point_px:
-        attempts.append(("alternate coordinate reading: ", g.alt_point_px, g.alt_box_px))
-
-    why = ""
-    for prefix, point, bx in attempts:
-        try:
-            obj = measure_with_box_fallback(
-                obs.frame, point[0], point[1], obs.calib, name,
-                box=None if bx is None else (bx[0], bx[1], bx[2], bx[3]),
-                marker_xy=marker_xy,
-            )
-        except LocateError as exc:
-            why = why or f"{prefix}{exc}"
-            continue
-        return obj, ""
-    return None, why or f"nothing measurable at the {name} location"
-
-
-def noun_phrase(instruction: str, head: str) -> str:
-    """The run of words ending at ``head`` that could be describing it.
-
-    A crude noun-phrase bracket, and crude is the point: it walks left from the
-    head noun while the words are plausible modifiers (short, alphabetic, not
-    a preposition or verb) and stops at the first that is not. "the grey rock
-    next to the blue cube" with head "rock" gives "the grey rock", so "blue"
-    stays out.
-
-    Without this, attributes were harvested from the whole sentence, and a
-    landmark mentioned only to disambiguate became a requirement of the target.
-    Measured 2026-08-02: "pick up the grey rock next to the blue cube" was
-    refused as ``the task says ['blue', 'grey', 'rock'] but obj_5 is 'rock'``
-    -- a correct-looking sentence about a contradiction that was never in the
-    instruction.
-
-    Returns ``""`` when the head does not appear at all. That is an abstention,
-    not a fallback to the whole sentence: if the instruction never mentions
-    what this entity is called, no word in it can be shown to describe the
-    entity, and harvesting the sentence anyway manufactures a contradiction.
-    Measured 2026-08-02: the model named ``obj_2`` (label "stone") for "the
-    grey rock", and the whole-sentence fallback refused it as ``the task says
-    ['blue', 'grey', 'rock'] but obj_2 is 'stone'`` -- three words, none of
-    which the instruction ever claimed about a stone.
-    """
-    words = instruction.lower().replace(",", " ").split()
-    stripped = [w.strip(".!?;:'\"") for w in words]
-    try:
-        end = stripped.index(head)
-    except ValueError:
-        return ""
-    start = end
-    # Anything that ends a modifier run: prepositions, conjunctions and verbs
-    # all live in _FILLER, but so do articles, which must NOT end it.
-    articles = {"the", "a", "an", "its", "this", "that", "these", "those"}
-    while start > 0:
-        w = stripped[start - 1]
-        if w in articles:
-            start -= 1
-            continue
-        if not w.isalpha() or w in _FILLER:
-            break
-        start -= 1
-    return " ".join(stripped[start : end + 1])
-
-
-def instruction_attributes(
-    instruction: str, snapshot: Snapshot, *, head: str | None = None
-) -> set[str]:
-    """Ground-truth-checkable words the instruction uses to name its target.
-
-    Only words the *vision system* already knows the answer to: cube colours
-    come from HSV, marker numbers from the printed ArUco tag. Those are facts,
-    not opinions, so a model naming an entity whose own label contradicts them
-    can be refused outright rather than trusted.
-
-    Deliberately narrow. "the leftmost one" or "the one by the stapler" are not
-    checkable this way and yield nothing, which is the honest answer -- the
-    check abstains instead of guessing.
-
-    ``head`` narrows the search to the noun phrase around that word (see
-    :func:`noun_phrase`), so a landmark elsewhere in the sentence does not
-    become a requirement of the target. Marker numbers are still read from the
-    whole instruction, because "put the blue cube on marker 3" names the
-    destination outside the target's phrase by construction.
-    """
-    text = instruction.lower() if head is None else noun_phrase(instruction, head)
-    whole = instruction.lower()
-    # Words naming the *kind* discriminate nothing -- every cube's label
-    # contains "cube", so counting it made a blue cube satisfy "the red cube"
-    # and turned the check into a no-op for exactly the mistake it exists to
-    # catch. Only attributes that can tell two entities of a kind apart.
-    generic = {e.kind for e in snapshot.entities} | {"open", "slot", "marker"}
-    vocab = {
-        w for e in snapshot.entities for w in e.label.lower().split()
-    } - generic
-    found = {w for w in vocab if w.isalpha() and len(w) > 2 and w in text}
-    for e in snapshot.entities:
-        if e.kind == "marker":
-            num = e.id.split("_")[-1]
-            if f"marker {num}" in whole:
-                found.add(f"marker{num}")
-    return found
 
 
 # Words that cannot name a physical target, so they must never reach the
@@ -1103,57 +621,6 @@ def unmatched_nouns(
     return {w for w in words if len(w) > 2 and w not in _FILLER and w not in vocab}
 
 
-def _matches_attributes(entity: Entity, attrs: set[str]) -> bool:
-    """Every named attribute must hold, not merely one of them.
-
-    ``any`` was wrong and dangerously so: "the red cube" extracts more than one
-    word, and a blue cube satisfying just one of them would be accepted.
-
-    **Never require what nothing measured.** A colour word is checked against
-    ``entity.color``, which the HSV detector fills for a cube and
-    ``detect.classify_color`` for a registered object -- and which is None when
-    the thing is not clearly any named colour (a grey stapler, a two-tone toy).
-    None abstains: the word neither confirms nor contradicts, so it does not
-    decide.
-
-    Reading the colour off the label instead is what broke "pick up the green
-    statue" on a desk holding a green statue. Absence from a label conflates
-    "measured, and it is not green" with "nobody established a colour", and the
-    second is not a contradiction. Worse, it was unfalsifiable: the attribute
-    vocabulary is pooled from every entity's label, while a registered object's
-    label only gained words *no* entity's label had -- so a shared adjective was
-    required by construction and absent by construction.
-
-    Nouns keep the label test. There the label is the whole of what is known
-    (obj_2 answers to "stone", not "rock"), so absence really is contradiction.
-    """
-    label = entity.label.lower()
-    known_colors = _color_vocabulary()
-    for a in attrs:
-        if a.startswith("marker") and a[6:].isdigit():
-            if not (entity.kind == "marker" and entity.id.split("_")[-1] == a[6:]):
-                return False
-        elif a in known_colors:
-            if entity.color is not None and entity.color.lower() != a:
-                return False
-        elif a not in label:
-            return False
-    return bool(attrs)
-
-
-def _color_vocabulary() -> frozenset[str]:
-    """Every colour name the detector can actually produce.
-
-    Read from ``detect.COLOR_RANGES`` rather than written out here, so a colour
-    added to the bands (the docstring there invites adding "orange") is checked
-    the same way as the rest instead of quietly falling through to the noun
-    test, where it would be matched as a substring of a label.
-    """
-    from mt4_vision.detect import COLOR_RANGES
-
-    return frozenset(COLOR_RANGES)
-
-
 def _said_id(got: dict[str, Any], key: str) -> str | None:
     """The id the model wrote under ``key``, or None.
 
@@ -1181,40 +648,22 @@ def _resolve_target(
 ) -> Action:
     """Resolve ONE target -- the entity to act on, or a refusal saying why not.
 
-    ``kind`` is the whole rule set, not a label: it selects which entity kinds
-    are candidates, which of the task's attributes are allowed to describe this
-    target, and whether an exclusion like "not on a marker" applies. Passing
-    PICK_ENTITY resolves a thing to grasp; PLACE_ENTITY resolves a place to put
-    one; LOCATE_AT_PIXEL resolves nothing and returns the point to measure at.
+    ``kind`` selects which entity kinds the point may bind to and which physical
+    capability is required. PICK_ENTITY resolves a thing to grasp; PLACE_ENTITY
+    resolves a place to put one; LOCATE_AT_PIXEL resolves nothing and returns the
+    point to measure at.
 
     A TRANSFER calls this twice against the same snapshot, once with each of the
-    first two kinds. That is the entire reason it is a function: the two halves
-    of a transfer answer to exactly the rules the two separate actions always
-    did, so a transfer cannot become an easier way to get something wrong.
+    first two kinds, so both ends are resolved before the gripper opens.
 
     Gripper state is deliberately NOT checked here. Whether the jaws may be full
     depends on the action -- a PLACE needs them full, a TRANSFER needs them
     empty and then fills them -- and that belongs to the caller.
     """
-    # Existence before geometry: a task naming something absent should say so,
-    # not complain that the accompanying point was out of frame.
-    known = {e.id for e in obs.snapshot.entities}
-    if said is not None and said not in known and kind != "LOCATE_AT_PIXEL":
-        return Action(
-            "STOP", False,
-            f"{said!r} is not in this snapshot (ids: {', '.join(sorted(known))}) "
-            "-- if the task names something the vision system has not found, "
-            "the answer is LOCATE_AT_PIXEL or STOP, never a nearby substitute",
-            model_entity_id=said, raw=raw,
-        )
-
-    # The point is a tie-breaker, not the target, so an unusable one degrades to
-    # "no point" instead of failing the decision.
-    #
-    # Both readings are kept rather than one conversion applied. The decision
-    # prompt prints each entity's pixel, and the model answers in that space --
-    # so pixels lead. But "lead" is all: which reading is used gets settled by
-    # binding against the snapshot below, not decided here.
+    # Both coordinate readings are kept: the primary (pixels of the submitted
+    # frame) leads, because that is the space the prompt asks for and prints
+    # every entity's own pixel in, and the alternate is carried only so the
+    # preview can draw both and a reader can see at a glance which was believed.
     readings = (
         point_readings(point, obs.size)
         if isinstance(point, (list, tuple)) and len(point) == 2
@@ -1222,13 +671,6 @@ def _resolve_target(
     )
     pt: tuple[float, float] | None = readings[0] if readings else None
     alt_pt: tuple[float, float] | None = readings[1] if len(readings) > 1 else None
-    if pt is None and said is None:
-        return Action(
-            "STOP", False,
-            f"neither a usable entity_id nor a usable {point_key} (got "
-            f"{said!r} and {point!r}) -- nothing identifies a target",
-            model_entity_id=said, raw=raw,
-        )
 
     if kind == "LOCATE_AT_PIXEL":
         if pt is None:
@@ -1238,194 +680,93 @@ def _resolve_target(
                 "is nothing to measure",
                 model_entity_id=said, raw=raw,
             )
-        label = said_label.strip() or "object"
-        hit, _err = bind(obs, pt)
-        if hit is not None:
-            return Action(
-                "STOP", False,
-                f"asked to register a new object, but that point is already "
-                f"{hit.id} ({hit.label}) -- use it instead of registering a duplicate",
-                entity_id=hit.id, point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
-            )
+        # No "that point is already an entity" refusal any more. Registering a
+        # second id for something already listed is untidy, not dangerous: the
+        # duplicate is measured at the same place, so acting on it acts on the
+        # same object. Refusing the whole task over it was the expensive half.
         return Action(
-            kind, True, why or f"register {label}", label=label,
+            kind, True, why or f"register {said_label.strip() or 'object'}",
+            label=said_label.strip() or "object",
             point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
         )
 
-    if kind == "PICK_ENTITY":
-        unknown = unmatched_nouns(instruction, obs.snapshot)
-        if unknown:
-            return Action(
-                "STOP", False,
-                f"the task names {sorted(unknown)}, which nothing in this "
-                "snapshot is -- register it with LOCATE_AT_PIXEL first, or say "
-                "it is not there. Picking the nearest cube instead is the one "
-                "outcome nothing downstream can detect",
-                point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
-            )
-
+    # ---- resolution ------------------------------------------------------
+    #
+    # Two channels, taken in order of explicitness, and NOTHING cross-examines
+    # them. Owner's decision 2026-08-03: once the model has named a target, that
+    # is the target. Get the loop working; add a check back when a specific
+    # failure demands it, rather than failing because the reply is not trusted.
+    #
+    # What used to sit here, and is gone (see §2u of docs/qwen3_vl_policy_status.md
+    # for the full list and the reasoning): an unmatched-noun refusal, a
+    # wrong-kind refusal, two attribute-contradiction refusals, a rival-ambiguity
+    # refusal, a named-vs-pointed disagreement refusal, a banned-destination-kind
+    # refusal, and a coordinate-space disagreement refusal. Every one of them
+    # could turn a reply that identified the right thing into an abandoned task,
+    # and between them they abandoned three consecutive real runs.
+    #
+    # The one gate left is not about the model at all: whether the arm can
+    # physically do it. ``Entity.pickable`` / ``Entity.placeable`` carry reach,
+    # the J1 keep-out, ground Z, finger clearance and the desk polygon, and
+    # ``Entity.reason`` says which of them failed. That gate is the reason this
+    # relaxation is safe to make: nothing here can command a pose the envelope
+    # would not have allowed anyway.
     kinds = ("cube", "object") if kind == "PICK_ENTITY" else ("marker", "slot")
-    # A forbidden kind is not a candidate for the point either. Without this the
-    # nearest-entity search still ranks markers, and two free markers a few
-    # dozen pixels apart made the point ambiguous on a task that had already
-    # excluded both -- measured: "48px from marker_2 and 85px from marker_0,
-    # both within 87px", on "place it on a non-marker location".
-    banned = excluded_destination_kind(instruction) if kind == "PLACE_ENTITY" else None
-    if banned is not None:
-        kinds = tuple(k for k in kinds if k != banned)
-    # Resolve the coordinate space against the snapshot. A reading only wins by
-    # landing on something that is actually there, and if both readings land on
-    # *different* entities the reply does not identify one -- refuse rather than
-    # pick the convention that flatters the answer.
-    pointed, point_err = None, "no usable point in the reply"
-    landed = []
-    for cand in readings:
-        hit_e, err = bind(obs, cand, kinds=kinds)
-        if hit_e is not None:
-            landed.append((cand, hit_e))
-        elif point_err == "no usable point in the reply":
-            point_err = err
-    if len({e.id for _c, e in landed}) > 1:
-        both = ", ".join(f"{c[0]:.0f},{c[1]:.0f} -> {e.id}" for c, e in landed)
-        return Action(
-            "STOP", False,
-            f"the point {point} reads as two different entities depending on the "
-            f"coordinate space ({both}) -- the reply does not identify one",
-            point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+
+    # 1. The id, when it names something in this snapshot. The model's own
+    #    answer, at face value -- no attribute check, no kind check, no
+    #    comparison against where it pointed.
+    hit = obs.snapshot.get(said) if said else None
+
+    # 2. Failing that, the point. Restricted to kinds this action can use, which
+    #    is a resolution aid rather than a verdict: it is what makes a
+    #    destination point land on the marker under it instead of a cube beside
+    #    it. Both coordinate readings are tried and the first that lands wins --
+    #    where the two used to disagree the reply was refused, and now the
+    #    primary (pixel) reading simply leads, because that is the space the
+    #    prompt asks for and prints every entity's own pixel in.
+    point_err = "no point in the reply"
+    if hit is None:
+        for cand in readings:
+            pointed, err = bind(obs, cand, kinds=kinds)
+            if pointed is not None:
+                hit, pt = pointed, cand
+                alt_pt = next((c for c in readings if c != cand), None)
+                break
+            if point_err == "no point in the reply":
+                point_err = err
+
+    if hit is None:
+        # Nothing identified a target: not a judgement about the reply, an
+        # absence of one. Both channels are reported because which was tried
+        # is the whole of what a reader needs to know here.
+        said_note = (
+            f"{said!r} is not one of this snapshot's ids "
+            f"({', '.join(sorted(e.id for e in obs.snapshot.entities))})"
+            if said else "the reply named no entity_id"
         )
-    if landed:
-        pt, pointed = landed[0]
-        alt_pt = next((c for c in readings if c != pt), None)
-    named = obs.snapshot.get(said) if said else None
-
-    # A target needs at least one channel that holds up, and no channel that
-    # contradicts. Measured on this desk, neither is dependable alone: the
-    # model pointed 149px off a cube it had named correctly, and pointed onto a
-    # real cube for an object that was not present at all.
-    # A two-part instruction names attributes of two different targets: "put
-    # the blue cube on marker 3" yields {blue, marker3}, and demanding one
-    # entity satisfy both refuses the blue cube for not being marker 3. Keep
-    # only the attributes that can describe the kind being resolved, and read
-    # them from the target's own noun phrase rather than the whole sentence --
-    # otherwise a landmark ("next to the blue cube") becomes a requirement.
-    if kind == "PICK_ENTITY":
-        mismatch = wrong_kind_block_reason(instruction, named, obs.snapshot)
-        if mismatch is not None:
-            return Action(
-                "STOP", False, mismatch,
-                entity_id=None, model_entity_id=said, raw=raw,
-            )
-
-    head = None if named is None else named.label.lower().split()[-1]
-    attrs = {
-        a
-        for a in instruction_attributes(instruction, obs.snapshot, head=head)
-        if (a.startswith("marker") and a[6:].isdigit()) == (kind == "PLACE_ENTITY")
-    }
-    verified = named is not None and attrs and _matches_attributes(named, attrs)
-    if named is not None and attrs and not verified:
         return Action(
             "STOP", False,
-            f"the task says {sorted(attrs)} but {named.id} is {named.label!r} "
-            "-- the detector's own label contradicts the choice",
+            f"nothing in the reply identifies a target: {said_note}, and "
+            f"{point_err}",
             point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
         )
 
-    if verified:
-        # Attribute-verified names outrank a stray point, but must still be the
-        # unique match: "the red cube" with two red cubes is ambiguous unless
-        # the point picks one out.
-        rivals = [
-            e for e in obs.snapshot.entities
-            if e.kind in kinds and e is not named and _matches_attributes(e, attrs)
-            and (e.pickable if kind == "PICK_ENTITY" else e.placeable)
-        ]
-        if rivals and (pointed is None or pointed.id != named.id):
-            ids = ", ".join(sorted([named.id] + [r.id for r in rivals]))
-            return Action(
-                "STOP", False,
-                f"{sorted(attrs)} matches {ids} and the point does not single "
-                "one out -- say which",
-                point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
-            )
-        hit = named
-    elif pointed is not None and (named is None or pointed.id == named.id):
-        hit = pointed
-    elif (
-        named is not None and pointed is not None
-        and banned is not None and named.kind == banned
-    ):
-        # There IS something in the task to settle it: the name is of the kind
-        # the task excluded and the point is not. Measured live, this is the
-        # common shape of the disagreement -- the model points at the right
-        # place and writes the wrong id beside it.
-        hit = pointed
-    elif named is not None and pointed is not None:
-        return Action(
-            "STOP", False,
-            f"named {named.id} ({named.label}) but pointed at {pointed.id} "
-            f"({pointed.label}), with nothing in the task to settle which",
-            point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
-        )
-    else:
-        why_not = point_err or "could not resolve a target"
-        if (
-            kind == "PLACE_ENTITY" and named is not None
-            and named.kind not in ("marker", "slot")
-        ):
-            # Measured live: step 2 of "move the green cube to an open slot"
-            # answered PLACE_ENTITY cube_2 -- the id of the cube it had just
-            # picked up in step 1, which by then named a different cube. The
-            # refusal that came out was about the accompanying point being
-            # 177px from a slot, which is true and tells the reader nothing
-            # about what actually went wrong.
-            why_not = (
-                f"{named.id} is a {named.kind} ({named.label!r}), which is not "
-                "somewhere to put things -- a destination is a marker_N or a "
-                f"slot_N; the point did not name one either -- {why_not}"
-            )
-        elif named is not None and banned is not None and named.kind == banned:
-            # Otherwise this reads "it does not name anything in the list" on a
-            # reply that named marker_0 -- true of the point, and flatly wrong
-            # about the reply, which is the sentence a user has to act on.
-            why_not = (
-                f"the task rules out placing on a {banned} and {named.id} "
-                f"({named.label}) is one, so the name cannot stand; the point "
-                f"could not stand in for it either -- {why_not}"
-            )
-        return Action(
-            "STOP", False, why_not,
-            point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
-        )
-
-    if banned is not None and hit.kind == banned:
-        alts = [
-            e.id for e in obs.snapshot.entities
-            if e.kind != banned and e.kind in ("marker", "slot") and e.placeable
-        ]
-        return Action(
-            "STOP", False,
-            f"the task rules out placing on a {banned}, and {hit.id} "
-            f"({hit.label}) is one"
-            + (
-                f" -- {', '.join(alts[:6])} are not"
-                if alts else " -- and nothing else here can be placed on"
-            ),
-            entity_id=None, point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
-        )
-
+    # ---- the one gate: can the arm actually do this ----------------------
     capable = hit.pickable if kind == "PICK_ENTITY" else hit.placeable
     if not capable:
         verb = "picked up" if kind == "PICK_ENTITY" else "placed on"
         return Action(
             "STOP", False,
             f"{hit.id} ({hit.label}) cannot be {verb}: {hit.reason}",
-            entity_id=hit.id, point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+            entity_id=hit.id, point_px=pt, alt_point_px=alt_pt,
+            model_entity_id=said, raw=raw,
         )
 
     return Action(
         kind, True, why or f"{kind.lower()} {hit.id}", entity_id=hit.id,
-        label=hit.label, point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+        label=hit.label, point_px=pt, alt_point_px=alt_pt, model_entity_id=said,
+        raw=raw,
     )
 
 
@@ -1465,15 +806,24 @@ def decide(
         )
 
     if kind in ("DONE", "STOP"):
+        # DONE is taken at face value. It used to be audited against the
+        # instruction's named destination -- "reported the task complete, but
+        # marker_0 is not on this desk" -- and that audit is gone with the rest
+        # (owner's decision 2026-08-03): it turned the model's own report of
+        # success into a failure, which is the most expensive place to be wrong.
+        # Nothing downstream re-examines DONE, and nothing here does either;
+        # every outcome line already says "commanded, not checked".
+        #
         # ok means "there is something to act on". A model-chosen STOP is still
-        # a refusal, and reads identically to a validation-forced one; DONE is
-        # the loop's only successful exit.
+        # a refusal; DONE is the loop's only successful exit.
         return Action(kind, kind == "DONE", why or kind.lower(),
                       model_entity_id=said, raw=raw)
 
-    # A question is not an order. The action set cannot answer one, so the
-    # model answers with whatever action fits -- measured: "is there anything
-    # on the desk that is not a cube" returned PICK_ENTITY cube_2.
+    # A question is not an order. Kept when everything around it was removed,
+    # because it is not a check on the model's judgement at all -- it reads the
+    # INSTRUCTION, and no phrasing of a genuine pick-and-place trips it. Without
+    # it "is there anything on the desk that is not a cube" moves the arm:
+    # measured, that returned PICK_ENTITY cube_2 and the cube was picked up.
     if is_question(instruction):
         return Action(
             "STOP", False,
@@ -1482,20 +832,14 @@ def decide(
             model_entity_id=said, raw=raw,
         )
 
-    # If the task names a destination that cannot be placed on, refuse now
-    # rather than after the pick. The alternative strands the object in the
-    # jaws at a step that was never going to succeed.
-    if kind in ("PICK_ENTITY", "TRANSFER"):
-        blocked = named_destination_block_reason(
-            instruction, obs.snapshot, moving=said
-        )
-        if blocked is not None:
-            return Action(
-                "STOP", False,
-                f"the task's destination is not available, so the pick would "
-                f"strand the object: {blocked}",
-                model_entity_id=said, raw=raw,
-            )
+    # Two things used to stand here and are gone: a refusal when the instruction
+    # named a destination the snapshot has no id for ("marker 0" on a desk of
+    # markers 1-4), and a refusal when that named destination existed but was
+    # blocked. Both second-guessed the reply from the instruction's text, and the
+    # first was measured refusing tasks whose destination the snapshot was
+    # offering. What remains catches the same thing later and physically: an
+    # unplaceable destination is refused by ``Entity.placeable`` in
+    # _resolve_target, and for a TRANSFER that happens before the gripper opens.
 
     if kind == "TRANSFER":
         if obs.held:

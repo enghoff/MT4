@@ -164,6 +164,8 @@ is what `instruct.py` actually implements and what works. It needs a third pass.
 | Gripped the stapler, then named `obj_1` as the **place destination** | The held object stayed in the registry and was still listed as an entity | `objects.pop(action.entity_id, None)` on a successful pick |
 | "could not segment an object at (700, 687)" for a stapler in plain view | **Coordinate space read backwards** — see §2a | `to_frame_pixels`, and grounding now asks for `bbox_2d` |
 | Step 2 re-grounded the held stapler onto the gripper, registering a phantom at robot (−50, −97), r = 109 mm — inside the J1 keep-out | The noun that started the task stayed "unmatched" once the object left the desk, so every later step searched for it again | `unmatched_nouns(..., held=held)` treats the held label as known vocabulary |
+| "place it on **marker 0**" moved a clamp onto marker 3, then onto marker 1, then reported `DONE` — on a desk with no marker 0 — see §2s | Every marker-number check derived its requirement by walking the *snapshot's* markers, so a number the desk lacks produced **no** requirement | `named_place_targets()` reads the number from the instruction; `missing_place_target_reason()` refuses before any binding |
+| A reply with `entity_id: null` picked whatever it pointed at, unchecked — see §2s | `_matches_attributes` ran against the id the model *wrote*, and every branch that settles on the point instead skipped it | One gate on the entity finally chosen, in `_resolve_target` |
 
 The last one is the third variant of the same underlying mistake — the model
 naming the held object instead of the destination (`cube_3`, then `obj_1`).
@@ -894,6 +896,308 @@ destination rather than the object's centroid (§2c), so an elongated object
 lands off-centre by the grasp offset. And the mask remains unstable: the same
 stapler measured 82 × 36, 122 × 24, 91 × 26, 67 × 36 and 59 × 44 mm across five
 frames in one session (§2b in the ranked list below).
+
+### 2s. Identity checks that were no-ops exactly when they mattered — fixed
+
+Reported symptom, 2026-08-03. The desk's calibration carries markers 1, 2, 3 and
+4, and no marker 0:
+
+```
+python run_instruction.py --camera 1 "pick up the clamp and place it on marker 0"
+
+[1] registered obj_1: clamp at (48, 234) 153x25mm
+    TRANSFER  obj_1 (clamp)  -> marker_3 (marker 3 (free))
+    reason: clamp is on marker_3
+    -> moved the clamp onto marker 3 (free)  (commanded, not checked)
+[2] registered obj_2: clamp at (104, 163) 148x20mm
+    TRANSFER  obj_2 (clamp)  -> marker_1 (marker 1 (free))
+    reason: clamp is on marker_1 as per task
+    -> moved the clamp onto marker 1 (free)  (commanded, not checked)
+[3] DONE
+    reason: task already completed
+```
+
+Three `ok=True` decisions, two real arm moves, and not one of them touched
+anything the instruction named. This is the outcome the whole entity layer
+exists to prevent, and it went through every gate.
+
+**Two independent defects, both of the same shape: a check that abstains
+precisely when it has something to say.**
+
+**1. The requirement was derived from the snapshot, not from the instruction.**
+`instruction_attributes` built its marker attribute by iterating the snapshot's
+markers and asking whether the text mentioned each one:
+
+```python
+for e in snapshot.entities:
+    if e.kind == "marker":
+        num = e.id.split("_")[-1]
+        if f"marker {num}" in whole:
+            found.add(f"marker{num}")
+```
+
+With markers 1–4 in the snapshot and "marker 0" in the text, that loop matches
+nothing and returns an **empty** attribute set. `_resolve_target` then computes
+`verified = named is not None and attrs and _matches_attributes(...)`, which is
+false for an empty `attrs`, falls through to the point, and accepts whatever the
+point landed on. Every destination satisfies an empty requirement vacuously. So
+the guard against putting the object on the wrong marker worked for every number
+the desk has and switched itself off for every number it does not — which is the
+only case where the model has no correct answer available and will invent one.
+`named_destination_block_reason` had the identical structure and the identical
+blind spot: it pre-flights whether the named marker is *occupied*, and a marker
+that does not exist is not occupied.
+
+Numbers are now read from the instruction by `named_place_targets()`
+(`\b(marker|slot)s?\s*#?\s*(\d+)\b`), which is snapshot-independent by
+construction, and `missing_place_target_reason()` refuses before any binding
+runs, naming the numbers that do exist:
+
+```
+the task names marker 0, which is not on this desk -- the markers here are
+1, 2, 3, 4. Nothing else may stand in for it, so the task cannot be carried
+out as written
+```
+
+It reads existence from the **calibration**, not from this frame's decode:
+`capture_scene` lists every calibrated marker whether or not its tag was
+legible, so a marker in shadow — or under the very object being moved — is still
+"on this desk" and never trips this. What trips it is a number nobody taped
+down. The same check now also runs on `DONE`, because `DONE` is the one claim in
+this layer nothing downstream re-examines: `run_instruction` returns success on
+it without looking at the desk, and step 3 above was making it.
+
+**2. The attribute check ran against the id the model wrote, never against the
+entity chosen.** `_matches_attributes` was applied only to `named`. But
+`_resolve_target` has three branches that settle on `pointed` instead — a reply
+with `entity_id: null`, a reply whose name and point disagree in a way the task
+resolves, and the excluded-kind branch — and none of them checked anything.
+Reproduced offline against the live snapshot shape:
+
+| reply | task | old result |
+|---|---|---|
+| `PICK_ENTITY`, `entity_id: null`, point on the blue cube | "pick up the **red** cube" | `ok=True`, `cube_2`, the blue one |
+| `TRANSFER`, `dest_entity_id: null`, `dest_2d` on marker 1 | "…place it on **marker 3**" | `ok=True`, dest `marker_1` |
+
+The module docstring claims "neither signal is trusted alone". Pointing alone
+was in fact trusted, and silently, whenever the model declined to name. One gate
+on the entity finally chosen — the same predicate the named half was already
+held to — closes all three branches at once.
+
+**Scope.** Both fixes now cover `slot_N` as well as `marker_N`, since both are
+place targets named by number, and a number is an identity rather than a
+description: `slot 3` is not satisfied by `marker_3`. The decision prompt gained
+one sentence saying so, which is not what makes this safe — the deterministic
+guard is — but stops the loop spending a park, a capture and a decision on a
+reply that was always going to be refused.
+
+**Not fixed, and worth knowing.** Step 3 also shows the mask flooding:
+`the box measured 15362x7582mm, outside the plausible 4-200mm range`. That is
+caught and reported honestly by `locate.measure_box`'s plausibility band, and it
+is the same segmentation instability as §2b — the clamp measured 153 × 25 then
+148 × 20 mm on consecutive frames before failing outright on the third.
+
+**13 regression tests** in `tests/test_instruct.py` pin all of it, including the
+live transcript above and the controls that must still pass: a transfer to a
+marker the task actually names, a point-only reply that lands on the right
+thing, and an unnumbered destination the model remains free to choose.
+
+### 2t. A run abandoned with the object in the jaws — three causes, fixed
+
+Reported symptom, 2026-08-03, on the newly interactive `run_instruction.py`:
+
+```
+> move stapler to center aruco marker
+
+[1] cubes=0 ... free_markers=3 unknown=1
+    registered obj_1: aruco at (180, -142) 54x20mm
+    registered obj_2: stapler at (48, 234) 157x25mm
+    PICK_ENTITY  obj_2 (stapler)
+    -> holding the stapler  (commanded, not checked)
+
+[2] ... objects=1
+    STOP  [model said stapler]
+    reason: 'stapler' is not in this snapshot (ids: cube_1, cube_2, marker_1, ...)
+    -> refused, stopping. The scene or the request needs to change.
+```
+
+The stapler was in the jaws and the run gave up. Three separate defects, in
+causal order.
+
+**1. "aruco" was treated as a noun to go find.** `unmatched_nouns` built its
+vocabulary from entity *labels* plus the literal kind names, and a marker's label
+is `marker 2 (free)` — so "aruco" matched nothing, the pre-pass spent a grounding
+call on it, and registered `obj_1` at (180, −142): **19.6 mm from `marker_2` at
+(162, −150)**, the very marker meant. An ArUco tag *is* what a `marker_N` is —
+the repo says so from `detect_markers` to the "ArUco tag did not decode" refusal
+— so the word cannot name anything else on this desk.
+
+Fixed with `_KIND_SYNONYMS`, credited only for kinds the snapshot actually holds:
+with no marker listed, "the aruco tag" stays unmatched and reaches the grounder,
+which is the honest answer. Deliberately **not** extended to "block"/"brick" for
+cubes: a wooden block the HSV detector never saw is a thing the grounder should
+still be sent after, and crediting the word would turn that into a silent pick of
+the nearest coloured cube.
+
+**2. A destination id that is not an id aborted the task.** With `obj_1` a
+*duplicate object* rather than the marker, no legal `TRANSFER` destination existed
+— a transfer's destination must be a `marker_N` or `slot_N` — so the one-step move
+degraded into PICK then PLACE, and the extra step is where it died. At step 2 the
+model answered `PLACE_ENTITY` with `entity_id: "stapler"`, the label of the thing
+in its own jaws, which the prompt explicitly says is never a destination. The
+existence check refused before the accompanying point was ever read.
+
+That check is right for a **pick** and wrong for a **destination**, and the
+difference is not a matter of strictness. Destinations are enumerated
+exhaustively — markers from ArUco detection, slots from fixed geometry — so an id
+not in the list cannot mean "the desk does not have it"; it can only mean the
+model wrote a string that is not an id. A pick id is the opposite: absent really
+can mean the detector never found the thing, and substituting the nearest cube is
+the one outcome nothing downstream can detect. So free text is now discarded and
+the point decides; the pick gate is untouched.
+
+**An id-*shaped* string is still refused.** `marker_9` is not a mislabelled
+field, it is a claim about the desk, and "a number is an identity, not a hint"
+(§2s) applies to the model's reply exactly as it does to the instruction. Quietly
+placing on `marker_2` instead is the failure that gate exists for.
+`_looks_like_entity_id` draws the line, and the existing
+`test_a_transfer_refusal_says_which_end_failed` caught the first version of this
+fix for being too broad.
+
+The discarded string is still reported as `model_entity_id`, printed as
+`[model said stapler]`, so a reply resolved this way is never silent about it.
+
+**3. A refusal ended the run while the gripper was full.** `run_instruction`
+broke out of the loop on any `ok=False`, which strands whatever is held. With the
+jaws full the step is now retried instead: the next one is a fresh park, a fresh
+frame and a fresh decision, and a refusal caused by the frame rather than the
+request goes away on its own. This run is the case in point — step 1 saw
+`unknown=1`, a marker whose tag had not decoded, and step 2 saw `unknown=0`; the
+desk had not changed, only the exposure. Bounded by `max_steps`, arm parked
+between tries.
+
+**Measured after the fixes, same instruction, same desk.** No phantom was
+registered for "aruco". The model still answered `PLACE_ENTITY` with
+`entity_id: "stapler"` — twice, in two separate runs — and both times the point
+resolved it to `marker_3` and the run continued to `DONE`, exit 0, where before
+it exited 2 with the stapler held.
+
+**What the fixes do not touch, and should not be read as fixing.**
+
+- The model still chose `PICK_ENTITY` over `TRANSFER` for a plainly two-ended
+  task, with three free markers listed. Removing the phantom made a transfer
+  *available*; it did not make a 4B model choose it.
+- **"center" is not a checkable attribute.** It is in `_FILLER`, so nothing
+  constrains which marker gets used, and the destination was whichever marker the
+  model's point landed on (`marker_3` at (154, 157)) — not the most central one
+  (`marker_4` at (211, 7)). The reply's own prose said "slot_2" while its point
+  said `marker_3`; the point is the only channel carrying coordinates, so the
+  point won.
+- **The physical outcome was not confirmed.** Inspected by camera afterwards, the
+  stapler lies across `marker_1` in the top right, not on `marker_3` where the
+  place was commanded. Its two grounded measurements a full task apart —
+  (133, 233) and (119, 229) — agree with each other and with neither the
+  commanded destination nor a successful move. Mask size over the same object
+  ranged 68×38, 82×28 and 111×65 mm across three measurements, so its centre is
+  not reliable to better than a few centimetres, which is consistent with a
+  marginal grasp. `(commanded, not checked)` means what it says.
+- **A marker resting under the stapler stays `unknown`.** That is why
+  `unknown=1` persists across runs, and it permanently removes one destination.
+
+**7 regression tests** in `tests/test_instruct.py`: the label-as-destination
+fallback, the `marker_9`/`marker 9`/`marker-9` refusals, a junk id with no usable
+point, the untouched pick gate, the kind synonyms, the presence gating, and
+"block" still reaching the grounder.
+
+---
+
+### 2u. The checks that double-guessed Qwen were removed — owner's decision
+
+> "let's get the code working and introduce checks if things fail, rather than
+> have the implementation fail because we don't trust what qwen is telling us."
+
+Three consecutive live runs were abandoned by validation rather than by the arm
+(§2t, and the statue run below). The gates were each defensible on their own and
+collectively made the loop unusable, so the policy changed: **once the model has
+named a target, that is the target.**
+
+**The run that settled it.** `move green statue to center aruco marker`:
+
+```
+    registered obj_1: statue at (186, -230) 156x14mm
+    STOP  [model said obj_1]
+    reason: the task says ['green', 'statue'] but obj_1 is 'blue statue'
+            -- the detector's own label contradicts the choice
+```
+
+The figurine is teal. Measured over its saturated mask pixels, the hue histogram
+peaks at 90-95 with a **median of 94**; the green band ends at 88 and the blue
+band starts at 90, adjacent with no neutral zone, so 3307 pixels landed in blue
+against 108 in green — share 0.466 vs 0.015, far outside `COLOR_MARGIN`, so the
+"not clearly any named colour" abstention could not fire. **No phrasing of
+"green" could ever have passed.** The refusal was also unfalsifiable in the other
+direction: "green" is only a checkable attribute because some *other* entity's
+label carries it, so removing the green cube from the desk made the same
+instruction succeed.
+
+**What was removed from `_resolve_target` and `decide`:**
+
+| Gate | What it refused |
+|---|---|
+| unknown `entity_id` | any id not in the snapshot — now falls back to the point |
+| `unmatched_nouns` | a pick whose task named a word no label carried |
+| `wrong_kind_block_reason` | a pick of a marker/slot, a place onto a cube |
+| attribute contradiction (×2) | colour or noun disagreeing with the label, on `named` and on `hit` |
+| rival ambiguity | two entities matching the words, point not singling one out |
+| named-vs-pointed | id and point resolving to different entities |
+| coordinate-space disagreement | the two readings landing on different entities |
+| `excluded_destination_kind` | "not on a marker" violated by the reply |
+| `missing_place_target_reason` | the instruction naming `marker 0` on a desk of 1-4 |
+| `named_destination_block_reason` | a pick whose named destination was unavailable |
+| DONE audit | the model reporting success on such a task |
+| LOCATE_AT_PIXEL duplicate | a point already covered by an entity |
+
+**What remains**, and why the removals are safe:
+
+* **The physical envelope.** `Entity.pickable` / `Entity.placeable` carry reach,
+  the J1 keep-out, ground Z, finger clearance and the desk polygon;
+  `Entity.reason` names the one that failed. Verified live after the refactor:
+  `put the red cube on marker 3` → `cube_2 (red cube) cannot be picked up:
+  r=364mm is beyond the 350mm max reach`. Nothing in the policy layer can
+  command a pose the envelope would have rejected.
+* **Gripper state** — no transfer with full jaws, no place with empty ones.
+* **Parse failures** — no JSON object, or an action outside `ACTIONS`.
+* **A reply that identifies nothing** — neither a known id nor a point that
+  binds. An absence, not a judgement.
+* **`is_question`** — kept deliberately when everything around it went, because
+  it reads the *instruction*, not the model's judgement, and no phrasing of a
+  real pick-and-place trips it. Without it, "is there anything on the desk that
+  is not a cube" moves the arm.
+
+**The costs, stated plainly.** A red statue is now picked for "the green
+statue" when it is the only statue. A green cube is picked for "the red cube"
+when the reply names it — colour was the only thing telling two cubes apart. And
+a reply whose id and point disagree resolves to the id with no warning beyond the
+transcript's `[model said ...]`. Measured after the refactor against a frame
+whose markers had not decoded, `put it on marker 4` (holding) resolved to
+`slot_2`: the model named marker_4, no marker was placeable, and the point bound
+to the nearest usable destination instead. Under the old code that was a refusal.
+
+**Refusals no longer end a run while the gripper is full** (§2t item 3), so a
+transient refusal costs a retry rather than a stranded object.
+
+**Also in this pass.** The gates' helper functions were deleted rather than left
+uncalled (384 lines), along with the tests that pinned them; 11 tests now assert
+the new behaviour instead. Inline comments were rewritten to describe current
+behaviour rather than the history of changes — that history lives in this
+document and in git. Every file on the Qwen path is now under 1000 lines:
+`instruct.py` 900 (was 1611, with `instruct_reply.py` split off),
+`ask_qwen.py` 761 (was 1774, split into `qwen_panel`, `qwen_worker`,
+`qwen_watch`, `qwen_prompts`), `run_instruction.py` 429 (was 1488, split into
+`instruct_view` and `instruct_worker`). `locate.py` (1139) and `stack_cubes.py`
+(1075) are still over and are not Qwen-specific.
+
+---
 
 ---
 
