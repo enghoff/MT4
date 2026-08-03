@@ -53,7 +53,8 @@ import numpy as np
 from mt4_vision.calib import Calibration, load_calibration
 from mt4_vision.camera import capture_frame
 from mt4_vision.entities import Entity, Snapshot, build_snapshot
-from mt4_vision.preview import annotate_for_pointing
+from mt4_vision.discover import MERGE_MM
+from mt4_vision.preview import BIG_BOX_SHARE, annotate_for_pointing
 from mt4_vision.qwen import DEFAULT_URL, QwenError, ask
 from mt4_vision.scene import capture_scene
 from mt4_vision.workspace import PICK_CLEARANCE_MM
@@ -72,10 +73,11 @@ BIND_RADIUS_MM = PICK_CLEARANCE_MM
 # 1664-token static cache holds one image plus this comfortably, and anything
 # longer means the model started narrating.
 MAX_NEW_TOKENS = 220
-# Two grounded measurements this close describe one physical thing. Sized to
-# match discover.MERGE_MM, so the two paths that can add an object to the world
-# agree about when two hits are one object.
-DUPLICATE_MM = 12.0
+# Two grounded measurements this close describe one physical thing. THE same
+# constant discover uses, not a copy of it: these are the two paths that can add
+# an object to the world, and they have to agree about when two hits are one
+# object or the same stone becomes obj_3 and obj_4.
+DUPLICATE_MM = MERGE_MM
 
 # TRANSFER leads because it is the shape of nearly every real task here: move
 # a named thing to a named place. Splitting that into PICK then PLACE cost a
@@ -105,11 +107,36 @@ class Observation:
     # because every fresh observation showed an empty gripper, a green cube on
     # the desk, and that same instruction. The model was right every time.
     history: tuple[str, ...] = ()
+    # The detections this snapshot was built from, kept so the entity list can
+    # be rebuilt without going back to the camera -- see :meth:`relisted`.
+    scene: Any = None
 
     @property
     def size(self) -> tuple[int, int]:
         h, w = self.frame.shape[:2]
         return w, h
+
+    def relisted(self, *, objects: Any = (), token: str = "s1") -> "Observation":
+        """This same frame, re-listed with a newly registered object in it.
+
+        Registering an object has to get it into the entity list before the
+        decision, and the obvious way to do that is to observe again. But
+        ``capture_frame`` reopens the camera and burns 20 warm-up reads --
+        2-3 SECONDS -- and it does it once per unmatched noun, while the arm is
+        parked and nothing on the desk has moved. The frame that would be
+        thrown away is the one already in hand.
+
+        Rebuilding the snapshot and the overlay from it instead costs about
+        5ms. Same pixels, so the ids the model is about to answer with still
+        describe the frame it is looking at, which is the property the whole
+        one-snapshot-one-id-space rule depends on.
+        """
+        snapshot = build_snapshot(self.scene, token=token, objects=objects)
+        return replace(
+            self,
+            snapshot=snapshot,
+            annotated=annotate_for_pointing(self.frame, snapshot.entities),
+        )
 
 
 @dataclass(frozen=True)
@@ -196,7 +223,7 @@ def observe(
     annotated = annotate_for_pointing(frame, snapshot.entities)
     return Observation(
         frame=frame, annotated=annotated, snapshot=snapshot, calib=calib,
-        held=held, history=tuple(history),
+        held=held, history=tuple(history), scene=scene,
     )
 
 
@@ -789,7 +816,9 @@ def locate_target(
 # The threshold has room. The largest thing the stack will measure is
 # ``MAX_PLAUSIBLE_LONG_MM`` = 200mm; at this mounting that is roughly a third of
 # the frame's width, so well under a tenth of its area.
-MAX_BOX_FRAME_SHARE = 0.55
+# THE threshold the overlay calls out at, not a copy: the picture and the
+# refusal have to agree about what counts as "the model declined to answer".
+MAX_BOX_FRAME_SHARE = BIG_BOX_SHARE
 
 
 def _grounding(
@@ -1175,7 +1204,6 @@ def _resolve_target(
             f"{said!r} and {point!r}) -- nothing identifies a target",
             model_entity_id=said, raw=raw,
         )
-    px, py = pt if pt is not None else (float("nan"), float("nan"))
 
     if kind == "LOCATE_AT_PIXEL":
         if pt is None:
@@ -1186,17 +1214,17 @@ def _resolve_target(
                 model_entity_id=said, raw=raw,
             )
         label = said_label.strip() or "object"
-        hit, _err = bind(obs, (px, py))
+        hit, _err = bind(obs, pt)
         if hit is not None:
             return Action(
                 "STOP", False,
                 f"asked to register a new object, but that point is already "
                 f"{hit.id} ({hit.label}) -- use it instead of registering a duplicate",
-                entity_id=hit.id, point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+                entity_id=hit.id, point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
             )
         return Action(
             kind, True, why or f"register {label}", label=label,
-            point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+            point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
         )
 
     if kind == "PICK_ENTITY":
@@ -1219,7 +1247,7 @@ def _resolve_target(
     # both within 87px", on "place it on a non-marker location".
     banned = excluded_destination_kind(instruction) if kind == "PLACE_ENTITY" else None
     if banned is not None:
-        kinds = tuple(k for k in kinds if k != banned) or kinds
+        kinds = tuple(k for k in kinds if k != banned)
     # Resolve the coordinate space against the snapshot. A reading only wins by
     # landing on something that is actually there, and if both readings land on
     # *different* entities the reply does not identify one -- refuse rather than
@@ -1230,7 +1258,7 @@ def _resolve_target(
         hit_e, err = bind(obs, cand, kinds=kinds)
         if hit_e is not None:
             landed.append((cand, hit_e))
-        elif point_err == "no usable point in the reply" or cand == pt:
+        elif point_err == "no usable point in the reply":
             point_err = err
     if len({e.id for _c, e in landed}) > 1:
         both = ", ".join(f"{c[0]:.0f},{c[1]:.0f} -> {e.id}" for c, e in landed)
@@ -1243,7 +1271,6 @@ def _resolve_target(
     if landed:
         pt, pointed = landed[0]
         alt_pt = next((c for c in readings if c != pt), None)
-        px, py = pt
     named = obs.snapshot.get(said) if said else None
 
     # A target needs at least one channel that holds up, and no channel that
@@ -1276,7 +1303,7 @@ def _resolve_target(
             "STOP", False,
             f"the task says {sorted(attrs)} but {named.id} is {named.label!r} "
             "-- the detector's own label contradicts the choice",
-            point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+            point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
         )
 
     if verified:
@@ -1294,14 +1321,14 @@ def _resolve_target(
                 "STOP", False,
                 f"{sorted(attrs)} matches {ids} and the point does not single "
                 "one out -- say which",
-                point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+                point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
             )
         hit = named
     elif pointed is not None and (named is None or pointed.id == named.id):
         hit = pointed
     elif (
         named is not None and pointed is not None
-        and banned is not None and named.kind == banned and pointed.kind != banned
+        and banned is not None and named.kind == banned
     ):
         # There IS something in the task to settle it: the name is of the kind
         # the task excluded and the point is not. Measured live, this is the
@@ -1313,7 +1340,7 @@ def _resolve_target(
             "STOP", False,
             f"named {named.id} ({named.label}) but pointed at {pointed.id} "
             f"({pointed.label}), with nothing in the task to settle which",
-            point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+            point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
         )
     else:
         why_not = point_err or "could not resolve a target"
@@ -1343,7 +1370,7 @@ def _resolve_target(
             )
         return Action(
             "STOP", False, why_not,
-            point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+            point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
         )
 
     if banned is not None and hit.kind == banned:
@@ -1359,7 +1386,7 @@ def _resolve_target(
                 f" -- {', '.join(alts[:6])} are not"
                 if alts else " -- and nothing else here can be placed on"
             ),
-            entity_id=None, point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+            entity_id=None, point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
         )
 
     capable = hit.pickable if kind == "PICK_ENTITY" else hit.placeable
@@ -1368,12 +1395,12 @@ def _resolve_target(
         return Action(
             "STOP", False,
             f"{hit.id} ({hit.label}) cannot be {verb}: {hit.reason}",
-            entity_id=hit.id, point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+            entity_id=hit.id, point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
         )
 
     return Action(
         kind, True, why or f"{kind.lower()} {hit.id}", entity_id=hit.id,
-        label=hit.label, point_px=(px, py), alt_point_px=alt_pt, model_entity_id=said, raw=raw,
+        label=hit.label, point_px=pt, alt_point_px=alt_pt, model_entity_id=said, raw=raw,
     )
 
 

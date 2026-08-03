@@ -49,11 +49,7 @@ import numpy as np
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import classify_color
 from mt4_vision.wrist import j4_for_long_axis
-from mt4_vision.workspace import (
-    MAX_REACH_MM,
-    work_region_block_reason,
-    is_mp_reachable_xy,
-)
+from mt4_vision.workspace import work_region_block_reason
 
 # Crop side (px) segmented around a hint. At this mount (~0.5mm/px) 280px spans
 # ~150mm, enough for a pen end to end.
@@ -560,6 +556,66 @@ def _median_width_px(mask: np.ndarray, long_axis_deg_px: float) -> float:
     return float(np.median(nz)) if nz.size else 0.0
 
 
+def _check_plausible(long_mm: float, short_mm: float, what: str) -> None:
+    """Refuse an implausible extent rather than picking at it.
+
+    A mask that has flooded the desk yields a huge "object" whose centroid is
+    meaningless, and the arm acts on whatever comes back. ``what`` names the
+    path that produced the measurement, because which segmenter flooded is the
+    first thing worth knowing.
+    """
+    if MIN_PLAUSIBLE_LONG_MM <= long_mm <= MAX_PLAUSIBLE_LONG_MM:
+        return
+    raise LocateError(
+        f"{what} measured {long_mm:.0f}x{short_mm:.0f}mm, outside the plausible "
+        f"{MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm range -- the "
+        "mask has most likely flooded the desk, so its centroid means nothing"
+    )
+
+
+def _height_corrected(
+    calib: Calibration,
+    centroid_px: tuple[float, float],
+    cx: float,
+    cy: float,
+    axis_yaw: float,
+    short_mm: float,
+    object_height_mm: float | None,
+) -> tuple[float, float, float, float]:
+    """Apply the object's own height to its centre and width. (cx, cy, short, h).
+
+    One copy, because both segmentation paths need it and they had it written
+    out identically. See the module docstring for why height cannot be ignored:
+    this camera is steeply oblique, so the flat table inverse puts a silhouette
+    centroid ~1.5x its height away from the thing itself -- past what the jaws
+    tolerate for a 12mm pen.
+
+    ``cos_radial`` is how much of the object's short axis points along the
+    camera azimuth. Only that component is inflated by height, so a pen lying
+    across the view direction needs no de-inflation and one lying along it
+    needs all of it.
+    """
+    gain = _parallax_gain(calib, cx, cy)
+    cos_radial = 1.0
+    cam = calib.cam_xy_robot
+    if cam:
+        d = math.hypot(cam[0] - cx, cam[1] - cy)
+        if d > 1e-6:
+            ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
+            cos_radial = abs(ax * (cam[0] - cx) + ay * (cam[1] - cy)) / d
+    height = (
+        _assumed_height_mm(short_mm, gain, cos_radial)
+        if object_height_mm is None
+        else max(0.0, float(object_height_mm))
+    )
+    if height > 0.0:
+        short_mm = max(1.0, short_mm - height * gain * cos_radial)
+        # The silhouette's centroid lies midway between the footprint and the
+        # top outline, so it unprojects at half the object's height.
+        cx, cy = _unproject(calib, centroid_px[0], centroid_px[1], height / 2.0)
+    return cx, cy, short_mm, height
+
+
 def _object_from_mask(
     frame: np.ndarray,
     mask: np.ndarray,
@@ -602,24 +658,9 @@ def _object_from_mask(
     # Undo the object's own height. Both the grasp point and the width need it:
     # the centroid of a silhouette sits half the object's height up, and the
     # width is inflated by the whole of it.
-    gain = _parallax_gain(calib, cx, cy)
-    cam = calib.cam_xy_robot
-    cos_radial = 1.0
-    if cam:
-        d = math.hypot(cam[0] - cx, cam[1] - cy)
-        if d > 1e-6:
-            ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
-            cos_radial = abs(ax * (cam[0] - cx) + ay * (cam[1] - cy)) / d
-    height = (
-        _assumed_height_mm(short_mm, gain, cos_radial)
-        if object_height_mm is None
-        else max(0.0, float(object_height_mm))
+    cx, cy, short_mm, height = _height_corrected(
+        calib, centroid, cx, cy, axis_yaw, short_mm, object_height_mm
     )
-    if height > 0.0:
-        short_mm = max(1.0, short_mm - height * gain * cos_radial)
-        # The silhouette's centroid lies midway between the footprint and the
-        # top outline, so it unprojects at half the object's height.
-        cx, cy = _unproject(calib, centroid[0], centroid[1], height / 2.0)
 
     th, tw = mask.shape[:2]
     return LocatedObject(
@@ -708,14 +749,7 @@ def measure(
         )
     obj, _mask = primary
 
-    if not MIN_PLAUSIBLE_LONG_MM <= obj.long_mm <= MAX_PLAUSIBLE_LONG_MM:
-        raise LocateError(
-            f"measured {obj.long_mm:.0f}x{obj.short_mm:.0f}mm at "
-            f"({px:.0f}, {py:.0f}), outside the plausible "
-            f"{MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm range -- "
-            "the mask has most likely flooded the desk, so its centroid means "
-            "nothing"
-        )
+    _check_plausible(obj.long_mm, obj.short_mm, f"the window at ({px:.0f}, {py:.0f})")
 
     second_win = max(BG_MEDIAN_KERNEL_PX, int(win * STABILITY_WINDOW_RATIO))
     if second_win != win:
@@ -813,29 +847,12 @@ def measure_box(
         long_v, long_mm, short_mm = e1, len1, len0
     if long_mm < 1e-6:
         raise LocateError("detector box projects to a degenerate rect")
-    if not MIN_PLAUSIBLE_LONG_MM <= long_mm <= MAX_PLAUSIBLE_LONG_MM:
-        raise LocateError(
-            f"box measures {long_mm:.0f}x{short_mm:.0f}mm, outside the plausible "
-            f"{MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm range"
-        )
+    _check_plausible(long_mm, short_mm, "the box")
     axis_yaw = math.degrees(math.atan2(long_v[1], long_v[0]))
 
-    gain = _parallax_gain(calib, cx, cy)
-    cam = calib.cam_xy_robot
-    cos_radial = 1.0
-    if cam:
-        d = math.hypot(cam[0] - cx, cam[1] - cy)
-        if d > 1e-6:
-            ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
-            cos_radial = abs(ax * (cam[0] - cx) + ay * (cam[1] - cy)) / d
-    height = (
-        _assumed_height_mm(short_mm, gain, cos_radial)
-        if object_height_mm is None
-        else max(0.0, float(object_height_mm))
+    cx, cy, short_mm, height = _height_corrected(
+        calib, centroid, cx, cy, axis_yaw, short_mm, object_height_mm
     )
-    if height > 0.0:
-        short_mm = max(1.0, short_mm - height * gain * cos_radial)
-        cx, cy = _unproject(calib, centroid[0], centroid[1], height / 2.0)
 
     ix0, iy0 = int(math.floor(xa)), int(math.floor(ya))
     ix1, iy1 = int(math.ceil(xb)), int(math.ceil(yb))
@@ -888,12 +905,7 @@ def measure_grabcut(
     obj = _object_from_mask(frame, mask, (ox, oy), calib, object_height_mm)
     if obj is None:
         raise LocateError("GrabCut mask produced a degenerate silhouette")
-    if not MIN_PLAUSIBLE_LONG_MM <= obj.long_mm <= MAX_PLAUSIBLE_LONG_MM:
-        raise LocateError(
-            f"GrabCut measured {obj.long_mm:.0f}x{obj.short_mm:.0f}mm, outside "
-            f"the plausible {MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm "
-            "range -- the mask has most likely flooded the desk"
-        )
+    _check_plausible(obj.long_mm, obj.short_mm, "GrabCut")
     return replace(obj, label=label, confidence=float(confidence))
 
 
@@ -1041,7 +1053,6 @@ def grasp_feasibility(
     two checks specific to a non-cube: the jaws must be able to span its short
     axis, and a wrist angle must exist that closes across its long axis.
     """
-    r = math.hypot(obj.x, obj.y)
     region = work_region_block_reason(obj.x, obj.y, calib)
     if region is not None:
         return False, region

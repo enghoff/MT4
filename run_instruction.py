@@ -266,10 +266,10 @@ def run(
                 # second word of a two-word target still unmatched, so the task
                 # was refused for naming something already registered.
                 print(f"    the {noun} is {eid} ({objects[eid].label})")
-            obs = I.observe(
-                camera, held=held, history=history, objects=objects,
-                token=f"s{step}b",
-            )
+            # Re-list, do not re-observe. The arm is parked and nothing on
+            # the desk moved, so the frame in hand is still current -- and a
+            # fresh capture reopens the camera for 2-3s, once per noun.
+            obs = obs.relisted(objects=objects, token=f"s{step}b")
 
         action = I.decide(obs, instruction)
         print(f"    {_describe(action)}")

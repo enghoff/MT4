@@ -572,9 +572,11 @@ PANEL_ALPHA = 0.6
 # Bottom strip the caption stays out of, so it does not sit on the pointing
 # overlay's own size/grid footer or run its descenders off the frame.
 CAPTION_BOTTOM_RESERVE_PX = 20
-# A box at least this share of the frame gets called out in the overlay. Same
-# threshold instruct._grounding rejects at, restated so the picture and the
-# refusal agree -- see MAX_BOX_FRAME_SHARE.
+# A box at least this share of the frame gets called out in the overlay: at
+# that size the model has declined to answer, and a whole-frame box is
+# otherwise indistinguishable from a real one. instruct.MAX_BOX_FRAME_SHARE
+# reads this rather than restating it -- the picture and the refusal have to
+# agree, and a comment asserting two numbers are equal does not make them so.
 BIG_BOX_SHARE = 0.55
 
 
@@ -703,6 +705,25 @@ def draw_caption(
         y += line_h
 
 
+def _draw_alt_reading(
+    img: np.ndarray, point: tuple[float, float], note: str
+) -> None:
+    """The same numbers read in the other coordinate convention.
+
+    Drawn identically wherever it appears -- for the grounding reply and for
+    the decision's point -- because the whole diagnostic is "these two marks
+    are the same answer, and they are 200-280px apart".
+    """
+    cv2.drawMarker(
+        img, (int(point[0]), int(point[1])), QWEN_ALT_BGR,
+        cv2.MARKER_TILTED_CROSS, 16, 1,
+    )
+    draw_outlined_text(
+        img, note, (int(point[0]) + 12, max(12, int(point[1]) - 10)),
+        scale=0.45, color=QWEN_ALT_BGR,
+    )
+
+
 def annotate_qwen(
     base: np.ndarray,
     *,
@@ -786,13 +807,10 @@ def annotate_qwen(
         # The unbelieved reading underneath, so the primary always wins a tie.
         if alt_box is not None:
             draw_dashed_rect(out, *alt_box, QWEN_ALT_BGR)
-        if alt_pt is not None:
-            cv2.drawMarker(
-                out, (int(alt_pt[0]), int(alt_pt[1])), QWEN_ALT_BGR,
-                cv2.MARKER_TILTED_CROSS, 16, 1,
-            )
         anchor = alt_pt or (None if alt_box is None else alt_box[:2])
-        if anchor is not None:
+        if alt_pt is not None:
+            _draw_alt_reading(out, alt_pt, "same numbers, other coord space")
+        elif anchor is not None:
             draw_outlined_text(
                 out, "same numbers, other coord space",
                 (int(anchor[0]) + 12, max(12, int(anchor[1]) - 10)),
@@ -822,15 +840,7 @@ def annotate_qwen(
 
     alt = None if action is None else getattr(action, "alt_point_px", None)
     if alt is not None:
-        cv2.drawMarker(
-            out, (int(alt[0]), int(alt[1])), QWEN_ALT_BGR,
-            cv2.MARKER_TILTED_CROSS, 16, 1,
-        )
-        draw_outlined_text(
-            out, "point, other coord space",
-            (int(alt[0]) + 12, max(12, int(alt[1]) - 10)),
-            scale=0.45, color=QWEN_ALT_BGR,
-        )
+        _draw_alt_reading(out, alt, "point, other coord space")
 
     point = None if action is None else getattr(action, "point_px", None)
     if point is not None:

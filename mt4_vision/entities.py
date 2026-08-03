@@ -32,7 +32,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import cv2
 
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import CubeDetection
@@ -52,7 +51,6 @@ from mt4_vision.workspace import (
     PICK_CLEARANCE_MM,
     MarkerSlot,
     dist_mm,
-    in_work_region,
     is_mp_reachable_xy,
     work_region_block_reason,
 )
@@ -244,17 +242,9 @@ def pick_block_reason(cube: CubeDetection, scene: Scene) -> str | None:
             f"blob is {cube.area:.0f}px2, over the {PICK_MAX_AREA:.0f}px2 pick "
             f"ceiling -- the arm's own body or a smear, not a cube"
         )
-    if scene.calib is not None:
-        region = work_region_block_reason(x, y, scene.calib)
-        if region is not None:
-            return region
-    elif not is_mp_reachable_xy(x, y):
-        return (
-            f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out "
-            f"(firmware mp refuses any target there)"
-        )
-    elif r > MAX_REACH_MM:
-        return f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
+    blocked = _reach_block_reason(x, y, scene.calib)
+    if blocked is not None:
+        return blocked
 
     nearest = None
     for other in scene.cubes:
@@ -271,20 +261,51 @@ def pick_block_reason(cube: CubeDetection, scene: Scene) -> str | None:
     return None
 
 
+def _reach_block_reason(x: float, y: float, calib) -> str | None:
+    """Can the arm hold a pose here at all? The reason it cannot, or None.
+
+    ``work_region_block_reason`` is the whole answer whenever there is a
+    calibration -- it already runs IK, the soft limits, the keep-out, the reach
+    circle, the desk polygon and camera coverage (see CLAUDE.md: one predicate,
+    no fifth gate). The two ``elif`` arms below are the no-calibration fallback,
+    which is the only case where reach has to be tested directly.
+
+    Written out three times before this (cube pick, marker place, object pick),
+    differing only in whether the keep-out message named the firmware. It does
+    now, everywhere.
+    """
+    if calib is not None:
+        return work_region_block_reason(x, y, calib)
+    r = math.hypot(x, y)
+    if not is_mp_reachable_xy(x, y):
+        return (
+            f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out "
+            f"(firmware mp refuses any target there)"
+        )
+    if r > MAX_REACH_MM:
+        return f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
+    return None
+
+
+def _slot_admission(sx: float, sy: float, calib) -> dict[str, object]:
+    """``placeable``/``reason`` for a free slot, from ONE region evaluation.
+
+    ``in_work_region`` is defined as ``work_region_block_reason(...) is None``,
+    so calling both ran the whole predicate twice -- two IK solves, the desk
+    polygon and the camera-coverage test, per slot, and there are 15 of them.
+    """
+    blocked = None if calib is None else work_region_block_reason(sx, sy, calib)
+    return {"placeable": blocked is None, "reason": blocked}
+
+
 def _marker_place_block_reason(
     marker: MarkerSlot, scene: Scene, occupant: str | None
 ) -> str | None:
     if occupant is not None:
         return f"occupied by {occupant}"
-    r = math.hypot(marker.x, marker.y)
-    if scene.calib is not None:
-        region = work_region_block_reason(marker.x, marker.y, scene.calib)
-        if region is not None:
-            return region
-    elif not is_mp_reachable_xy(marker.x, marker.y):
-        return f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out"
-    elif r > MAX_REACH_MM:
-        return f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
+    blocked = _reach_block_reason(marker.x, marker.y, scene.calib)
+    if blocked is not None:
+        return blocked
     if marker.marker_id not in scene.visible_marker_ids:
         return (
             "ArUco tag did not decode in this frame (arm, shadow, or something "
@@ -494,15 +515,7 @@ def build_snapshot(
             x=float(sx),
             y=float(sy),
             pixel=desk_pixel(float(sx), float(sy)),
-            placeable=(
-                scene.calib is None
-                or in_work_region(float(sx), float(sy), scene.calib)
-            ),
-            reason=(
-                None
-                if scene.calib is None
-                else work_region_block_reason(float(sx), float(sy), scene.calib)
-            ),
+            **_slot_admission(float(sx), float(sy), scene.calib),
             source="slot",
         )
         for i, (sx, sy) in enumerate(
@@ -562,14 +575,8 @@ def object_entity(
     from mt4_vision.locate import is_compact, plan_object_grasp
 
     reason: str | None = None
-    r = math.hypot(obj.x, obj.y)
     calib = None if scene is None else scene.calib
-    if calib is not None:
-        reason = work_region_block_reason(obj.x, obj.y, calib)
-    elif not is_mp_reachable_xy(obj.x, obj.y):
-        reason = f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out"
-    elif r > MAX_REACH_MM:
-        reason = f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
+    reason = _reach_block_reason(obj.x, obj.y, calib)
     # Where on it can the jaws close, and at what angle? This is the question
     # that decides a non-cube pick, and the entity layer used to skip it
     # entirely -- it reported "pickable" from the outline's short axis, which

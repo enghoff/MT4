@@ -63,7 +63,6 @@ from mt4_vision.qwen import (
     Region,
     Reply,
     ask,
-    generate,
     health,
     parse_regions,
 )
@@ -1659,7 +1658,7 @@ def main(argv: list[str] | None = None) -> int:
         # model, but an arm parked over the desk is a frame problem that
         # looks exactly like a model problem.
         try:
-            from mt4_jog.client import Mt4Client, Mt4ClientError
+            from mt4_jog.client import Mt4Client
             from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
             from mt4_vision.pickplace import ensure_homed, retreat_for_camera
 

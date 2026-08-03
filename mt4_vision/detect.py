@@ -257,6 +257,28 @@ def _robot_edge_yaw_deg(
     return math.degrees(math.atan2(dy, dx))
 
 
+def color_ranges_for(calibration: Calibration | None) -> dict[str, list]:
+    """The named HSV bands in force, defaults overlaid with the calibration's.
+
+    One place, because ``classify_color`` and ``detect_cubes`` must agree about
+    what "green" is: ``instruct`` refuses a task when a named colour
+    contradicts an entity's, and a colour that meant one thing for a cube and
+    another for a statue would refuse correct answers.
+    """
+    ranges: dict[str, list] = dict(COLOR_RANGES)
+    if calibration is not None:
+        ranges.update(calibration.color_ranges)
+    return ranges
+
+
+def band_mask(hsv: np.ndarray, bands: list) -> np.ndarray:
+    """Union of one colour's HSV bands. Red needs two -- it wraps the hue axis."""
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lo, hi in bands:
+        mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+    return mask
+
+
 # A colour must own this much of the sampled pixels to be claimed, and beat the
 # runner-up by this margin. Both are deliberately blunt: the answer this
 # function must get right is "I don't know", not "which of two greens". A
@@ -290,9 +312,7 @@ def classify_color(
     and anything the desk leaks in matches no band and pushes the answer
     toward None, which is the safe direction.
     """
-    ranges: dict[str, list] = dict(COLOR_RANGES)
-    if calibration is not None:
-        ranges.update(calibration.color_ranges)
+    ranges = color_ranges_for(calibration)
 
     if mask is not None and mask.size:
         h, w = mask.shape[:2]
@@ -311,12 +331,10 @@ def classify_color(
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     total = int(sel.sum())
-    shares: dict[str, float] = {}
-    for color, bands in ranges.items():
-        hit = np.zeros(hsv.shape[:2], dtype=bool)
-        for lo, hi in bands:
-            hit |= cv2.inRange(hsv, np.array(lo), np.array(hi)).astype(bool)
-        shares[color] = float((hit & sel).sum()) / total
+    shares = {
+        color: float((band_mask(hsv, bands).astype(bool) & sel).sum()) / total
+        for color, bands in ranges.items()
+    }
 
     ranked = sorted(shares.items(), key=lambda kv: kv[1], reverse=True)
     if not ranked or ranked[0][1] < COLOR_MIN_SHARE:
@@ -333,9 +351,7 @@ def detect_cubes(
     colors: list[str] | None = None,
 ) -> list[CubeDetection]:
     """Detect colored cubes; robot XY filled in when a calibration is given."""
-    ranges: dict[str, list] = dict(COLOR_RANGES)
-    if calibration is not None:
-        ranges.update(calibration.color_ranges)
+    ranges = color_ranges_for(calibration)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     # Close first to heal ragged threshold edges, then a small open for
     # speckle -- a bigger open kernel eats the ~15-20px cube blobs whole.
@@ -349,9 +365,7 @@ def detect_cubes(
     for color, bands in ranges.items():
         if colors is not None and color not in colors:
             continue
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lo, hi in bands:
-            mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+        mask = band_mask(hsv, bands)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
