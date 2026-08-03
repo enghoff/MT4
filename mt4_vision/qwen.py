@@ -159,6 +159,15 @@ def health(url: str = DEFAULT_URL, timeout: float = 5.0) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise QwenError(f"qwen service unreachable at {url} ({exc}); {_UNREACHABLE_HINT}") from exc
+    except TimeoutError as exc:
+        # See ask(): a read timeout is not a URLError, and an unwrapped one
+        # here kills a caller's startup check with a traceback rather than the
+        # message it was written to print. A /health this slow means the
+        # service is alive but wholly occupied, which is worth saying.
+        raise QwenError(
+            f"qwen service at {url} did not answer /health within {timeout:g}s "
+            "(alive, but busy generating or compiling)"
+        ) from exc
 
 
 def _jpeg(frame: np.ndarray, quality: int) -> bytes:
@@ -264,6 +273,19 @@ def ask(
         raise QwenError(f"generate HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise QwenError(f"qwen service unreachable at {url} ({exc}); {_UNREACHABLE_HINT}") from exc
+    except TimeoutError as exc:
+        # Not a URLError: a socket read that times out AFTER the connection
+        # was accepted raises this bare, so without its own clause it escapes
+        # every `except QwenError` in the repo and surfaces as a traceback
+        # from whatever thread was asking. Observed on a first image request
+        # against a freshly started service.
+        raise QwenError(
+            f"qwen did not answer within {timeout:g}s. The service is up -- it "
+            "is generating, or compiling for a frame size it has not seen "
+            "(the reference build runs with torch.compile enabled, and the "
+            "first request of a new shape pays for it). Retry, or raise the "
+            "timeout."
+        ) from exc
 
     if not payload.get("ok", True):
         raise QwenError(payload.get("error", "generate failed"))
