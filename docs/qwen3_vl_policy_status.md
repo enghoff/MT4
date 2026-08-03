@@ -26,7 +26,7 @@ tree:
 ?? tests/test_instruct.py
 ```
 
-Full suite last run: **387 passed** (2026-08-03).
+Full suite last run: **415 passed** (2026-08-03, after §2v).
 
 `vision_calibration.json` is **not** version-controlled and was written to —
 `grip_span_s_at_zero_mm` and `grip_span_s_per_mm`, see §2f.
@@ -53,19 +53,20 @@ motor.
 
 | Piece | What it does |
 |---|---|
-| `Observation` | `frame`, `annotated`, `snapshot`, `calib`, `held`, `history`. One capture produces both the snapshot and the pointing overlay, so the pixels the model reasons over are the pixels that were measured. |
-| `Action` | `kind`, `ok`, `reason`, `entity_id`, `label`, `point_px`, `model_entity_id`, the `dest_*` mirror of those for a `TRANSFER`'s destination, and `raw`. `ok` means *safe to act on*: every `STOP` is `ok=False`, `DONE` is `ok=True`. `model_entity_id` preserves what the model said when validation redirected it. |
-| `observe()` | Capture → `entities.build_snapshot` → grid overlay, one frame. |
-| `decide()` | One Qwen call. `ACTIONS = (TRANSFER, PICK_ENTITY, PLACE_ENTITY, LOCATE_AT_PIXEL, DONE, STOP)`. Dispatch only: every target is resolved by `_resolve_target`. |
-| `_resolve_target()` | Resolves ONE target, or refuses with prose. `kind` selects the entire rule set — candidate entity kinds, which of the task's attributes may describe this target, whether a "not on a marker" exclusion applies. A `TRANSFER` calls it twice against the same snapshot, `PICK_ENTITY` then `PLACE_ENTITY`, so both halves answer to exactly the rules the two separate actions always did. See §2r. |
-| `locate_target()` | A *separate* single-purpose grounding call for a noun the detector has no word for. Measured: asked to choose an action **and** ground an unknown noun in one call, the model does neither reliably. Asks for `bbox_2d` and returns a `Grounding`. |
-| `to_frame_pixels()` / `alternate_reading()` | The single model-coordinate → pixel conversion, and the sanctioned way to second-guess it. See §2a. |
-| `Grounding` / `measure_grounding()` | A located box plus its centre, and the measurement that prefers GrabCut from the box over the desk-deviation point path. See §2b. |
-| `unmatched_nouns()` | Words in the instruction that name a target nothing in the snapshot could satisfy, filtered through a `_FILLER` stopword set. This is what triggers grounding. |
-| `bind()` | Nearest entity to a model-supplied pixel, thresholded at `BIND_RADIUS_MM = PICK_CLEARANCE_MM` (45 mm) converted to pixels. Refuses on ambiguity rather than picking the closer of two. |
-| `grasp_for()` | The motion-layer pose for an entity, taken **from the snapshot the decision was made against**. Markers and slots → `square_place`; everything else keeps its own measured angle. Replaced `reacquire()` on 2026-08-03 — the fresh-frame re-measure it did was re-measuring an unchanged scene, and the template match it used to do it with tracked an ArUco tag instead of the object. See §2r. |
-| `instruction_attributes()` / `_matches_attributes()` | Guards against "the *red* cube" resolving to a blue one. Kind-generic words are excluded; the remaining attributes must **all** match. Abstains (rather than fails open) when the noun is unknown to the detector. |
-| `build_prompt()` | Includes the progress history, the held object **by label only**, an explicit statement that ids were assigned just now and mean nothing in any earlier step, and a request for pixels read off the drawn grid. |
+> Rewritten 2026-08-03 by §2v. The rows below describe the current code; the
+> pieces §2v deleted are listed there rather than here.
+
+| `Observation` | `frame`, `annotated`, `snapshot`, `calib`, `held`, `history`, `scene`. `snapshot` is the full detection and is **never** shown to the model; `.markers` is the model-facing half, and `build_prompt` and the overlay read only that. |
+| `Action` | `kind`, `ok`, `reason`, `label`, `source` (a `Grounding`), `dest_entity_id`, `dest_point_px`, `dest_alt_point_px`, `raw`. `ok` means *the reply is well formed for the action it chose* — not that anything was measured or is reachable. No `entity_id`: a pick target is a box. |
+| `observe()` | Capture → `capture_scene` → `build_snapshot` → grid overlay drawn with **markers only**. |
+| `decide()` | One Qwen call. `ACTIONS = (TRANSFER, PICK, PLACE, DONE, STOP)`. Reads the reply; resolves nothing physical. |
+| `measure_source()` | GrabCut inside the model's `box_2d` at `object_height_mm=0`, on the frame the box was drawn on. |
+| `source_entity()` | The measurement through `entities.object_entity` — reach, keep-out, ground Z, jaw plan, neighbour clearance, desk polygon. The only thing entitled to override the model. |
+| `destination_grasp()` | A tag id → its calibrated position; a `dest_2d` pixel → the plain table-plane projection of that pixel, **not snapped** to any tag or slot. Both squared to the world axes, both gated by `work_region_block_reason`. |
+| `to_frame_pixels()` / `point_readings()` / `box_readings()` | The single model-coordinate → pixel conversion, and the two readings kept for a point and for a box. Ordered identically, pixels first. See §2a, §2v. |
+| `Grounding` / `measure_grounding()` | A located box plus its centre, and the measurement that prefers GrabCut from the box over the desk-deviation point path. Takes `object_height_mm`. See §2b. |
+| `grasp_for()` | `square_place` for a decoded tag. Objects no longer route through it — they come from `Entity.as_grasp` on the freshly measured object. |
+| `build_prompt()` | Task verbatim, progress history, held object **by label only**, the decoded ArUco ids and their pixels, and the reply schema. Says explicitly that the tag list is *not* a list of what is on the desk. |
 
 Constants: `COORD_SCALE = 1000.0`, `MAX_NEW_TOKENS = 220`, `BIND_RADIUS_MM = 45`.
 (`MOVED_TOLERANCE_MM` went with `reacquire` — nothing re-measures now.)
@@ -1201,78 +1202,344 @@ document and in git. Every file on the Qwen path is now under 1000 lines:
 
 ---
 
-## 3. Are we cube-agnostic? No — in one specific sense
+### 2v. Qwen makes the grounding: the entity list, the text pre-pass and the height estimator all removed — owner's decision
 
-The observed summary line is the evidence:
+**Owner's decision, 2026-08-03**, in three parts:
 
-```
-cubes=2 blockers=1 free_markers=3 occupied=1 unknown=1 free_slots=15 phantoms_dropped=1 off_table_blobs=3
-```
+> we want the qwen to be complete agnostic to cubes, we don't want to feed it a
+> list of identified cubes or do anything that skews it towards cubes
+>
+> we don't want to feed qwen anything pickable, we only feed it aruco marker
+> positions because it cannot decode those otherwise. qwen is our visual and
+> linguistic grounding, don't second guess it. don't preprocess the text input,
+> don't feed it anything we think might be cube locations.
+>
+> grip every object at the table_z height, ie, as low as possible at the point
+> that qwen identifies with an orientation determined by the grabcut mask
 
-Decoded, with the code that produces each field
-(`scene.Scene.summary_line`, `entities.build_snapshot`):
+This is the change §3 said the stack needed, arriving from the policy end
+rather than the enumeration end. §3 is rewritten below.
 
-| Field | Source | Class-agnostic? |
+#### What prompted it
+
+A live transcript. `leave the object you are holding on the table` returned
+`STOP: the gripper is empty and no object is being held`, and the follow-up
+`no the gripper is not empty, please comply` returned `PICK_ENTITY cube_2`.
+
+Three separate defects, in one exchange:
+
+1. **The prompt asserted the gripper state as fact.** `held` is session state
+   set only when the loop itself picks something, and nothing on this rig can
+   sense a grip. The jaws were full; `held` was `None`; the prompt therefore
+   said "The gripper is empty." and the model quoted that sentence back as its
+   reason. Provable rather than inferred: `PICK_ENTITY` while `held` is set was
+   force-converted to `STOP`, and the pick executed.
+2. **The refusal did not say how to fix it.** `/held <thing>` is exactly the
+   correction needed and was never mentioned. Both gripper-state refusals now
+   name it.
+3. **The noun pre-pass grounded parts of speech.** `_FILLER` matched words
+   exactly with no stemming, so `hold` was filler and `holding` was not:
+   "holding" went to the grounder and was **registered as `obj_1`, a
+   169×19 mm object at robot (−456, −178)** — 456 mm behind the base, not on
+   the desk at all, and inside the 4–200 mm plausibility band so nothing caught
+   it. `you` and `comply` were also grounded, returning 15561×10951 mm and
+   15564×9028 mm boxes that the band did catch.
+
+#### What the model is given now
+
+The frame, with a numbered pixel grid and the decoded ArUco ids circled on it.
+The task string, verbatim. What the gripper holds, by label. The history. The
+decoded tag ids and their pixels.
+
+Nothing else. **No cube list, no slot list, no object registry, no
+`pickable`/`placeable` flags, and no circled non-tag entities on the image.** A
+tag is named for one reason: its number is a printed code that no
+vision-language model can read off an image, so the decoder supplies what the
+model physically cannot see. The prompt says out loud that the tag list is
+*not* a list of what is on the desk, because a short list of ids reads as "these
+are the only things here" and the model forces the task onto one of them —
+which is precisely how `PICK_ENTITY cube_2` happened.
+
+The guarantee lives on the type: `Observation.snapshot` is the full detection
+and `Observation.markers` is the model-facing half. Two call sites read the
+second, and a test asserts no cube id, cube label or `obj_`/`slot_` prefix
+survives into the prompt.
+
+#### The protocol: a box, not an id
+
+| Was | Is |
+|---|---|
+| `TRANSFER`, `PICK_ENTITY`, `PLACE_ENTITY`, `LOCATE_AT_PIXEL`, `DONE`, `STOP` | `TRANSFER`, `PICK`, `PLACE`, `DONE`, `STOP` |
+| `entity_id` copied from a printed list, or a point bound to the nearest entity | `box_2d` around the thing to pick up |
+| `dest_entity_id` = `marker_N` or `slot_N` | `dest_marker` (a decoded tag) **or** `dest_2d` (a pixel on bare desk), never both |
+
+`LOCATE_AT_PIXEL` is gone and its absence is the point. It existed to add a
+thing the enumerator had missed to a list the model could then select from.
+There is no list, so **every pick is a locate-at-pixel** — and the extra
+park-capture-decide round trip it cost, one of six steps, went with it.
+
+A `dest_2d` pixel is projected to the table plane and used. It is **not**
+snapped to the nearest tag or slot: "somewhere clear" means the pixel it chose,
+and nudging that onto a calibrated position would be the loop overriding the
+one thing it asked the model to decide.
+
+Asking for a box rather than a point is not a hedge — §2b measured GrabCut from
+a box segmenting **4 of 4** objects on a frame where the bare-point
+desk-deviation path managed **1 of 4**, and the box also bounds the mask so it
+cannot flood the desk and gives an extent to sanity-check.
+
+#### Grip geometry: table height, always
+
+`measure_source` passes `object_height_mm=0`
+(`instruct.PICK_AT_TABLE_HEIGHT_MM`). So a target's XY is the plain table-plane
+projection of the GrabCut mask's centroid, its yaw is that mask's long axis,
+and the jaws close at `calib.table_z` — `Grasp.z is None` already meant exactly
+that.
+
+The height-from-silhouette estimator is therefore **out of the pick path**. The
+Phase 0 gate had it inferring **7.2–32.3 mm for objects that are all 20 mm**,
+its error lands as XY displacement of up to ~28 mm against a ~±10 mm jaw
+tolerance, and the `h ≈ w` cross-section it assumes is false for exactly the
+flat objects a low grip serves best.
+
+**What that costs, stated because nothing downstream will notice it.** A
+silhouette centroid sits *outward* of the real footprint on this oblique mount
+by roughly the object's height times `_parallax_gain` (1.4–2.0 here), so a
+20 mm cube is aimed at up to ~30 mm outward of its true centre. Flat things —
+paper, a key, a card — have almost no such error. This is a choice of which
+error to carry, not a tuning knob. **Unvalidated on hardware.** If tall objects
+start being shoved rather than gripped, this constant is the first thing to
+revisit.
+
+#### Removed, and what each was for
+
+| Removed | What it did | Why it went |
 |---|---|---|
-| `cubes=2` | `len(scene.cubes)` — HSV blobs from `detect_cubes` surviving `filter_phantoms` | **No.** `detect.COLOR_RANGES` |
-| `blockers=1` | cubes not within `MARKER_OCCUPY_RADIUS_MM` (26 mm) of a marker | **No** |
-| `free_markers=3` | ArUco markers, tag decoded, `PLACE_CLEARANCE_MM` (45 mm) clear **of cubes** | **No** |
-| `occupied=1` | marker with a **cube** on it | **No** |
-| `unknown=1` | calibrated marker, tag not decoded this frame | n/a (marker bookkeeping) |
-| `free_slots=15` | `free_placement_slots(calib, markers, cubes)` — clearance **against cubes** | **No** |
-| `phantoms_dropped=1` | a blob rejected by `is_phantom_detection` (area band or work region) | **No** |
-| `off_table_blobs=3` | blobs `detect_cubes` discarded as behind the desk edge | **No** |
-| `objects=N` | appended by `build_snapshot` **only when the registry is non-empty** | Yes — but absent here |
+| `unmatched_nouns()`, `_FILLER` (150 words), `_KIND_SYNONYMS` | Chose which words of the instruction to send to the grounder | Text preprocessing. Exact matching with no stemming; grounded `holding`, `you`, `comply` |
+| `locate_target()` | A second single-purpose "where is the X" Qwen call, run per unmatched word before the decision | Existed to get an unlisted noun *into the list*. There is no list |
+| `bind()`, `BIND_RADIUS_MM`, `_mm_to_px()` | Nearest-entity resolution for a model-supplied pixel, refusing on ambiguity | Nothing to bind to |
+| `_resolve_target()` | Id-or-point resolution with per-kind rule sets | Nothing to resolve |
+| `is_question()`, `_INTERROGATIVE` | Refused to act when the instruction was phrased as a question | Text preprocessing, explicitly removed by the owner. **A question can now move the arm** — measured previously: "is there anything on the desk that is not a cube" returned `PICK_ENTITY` and a cube was picked up |
+| `register_object()`, `DUPLICATE_MM`, the worker's `objects` registry, `Observation.relisted()` | Carried measured non-cube objects across steps as `obj_N` | A target is measured and acted on within one step |
+| `alternate_reading()` | The "other reading" helper | Subsumed by `box_readings` / `point_readings`, which return both |
 
-The missing `objects=` suffix is the tell. At that moment the world model
-contained **zero** non-cube entities, and it will keep containing zero until a
-human or the VLM points at something.
+#### One inconsistency this exposed, and fixed
 
-### Three senses of "cube-agnostic" — we are 2 for 3
+The box path and the point path ordered their two coordinate readings
+*oppositely*. `to_frame_pixels` scales first (it was written for a grounding
+prompt that said nothing about coordinate space); `point_readings` took raw
+pixels first (the decision prompt printed pixels). One prompt now asks for both
+a box and a point, so `box_readings` was written to order them the same way as
+`point_readings` — pixels first, normalized as the retry, and a reading whose
+centre falls outside the frame dropped.
 
-**1. Manipulation — yes.** `locate.measure` → `object_entity` → `pick_at` knows
+The live stapler box `[630, 650, 782, 827]` is the case that matters: read as
+pixels it centres at y = 738 on a 720 px frame, off the bottom, so it is not a
+possible reading at all and the normalized one — right to 4 px — is what is
+left. Pinned as a test.
+
+#### What still refuses, and why none of it is second-guessing
+
+Every remaining refusal is structural (the JSON cannot be acted on) or physical
+(the arm cannot do it). None reads the instruction's words, and none forms an
+opinion about *what* the model boxed.
+
+- the reply is not JSON, or names an action outside `ACTIONS`
+- `box_2d` is absent, is not four numbers, or covers most of the frame — this
+  build returns the whole image rather than declining when asked for something
+  absent, measured on "location": box `(0, 0, 1000, 1000)`
+- `TRANSFER`/`PLACE` with no destination at all
+- `dest_marker` naming a tag that did not decode this frame — the refusal lists
+  the ids that did. This is the one rule derived from the task text, and it
+  concerns the one datum *we* supply rather than anything the model saw
+- gripper state: picking while `held` is set, placing while it is not. Both now
+  name `/held` as the correction
+- the box cannot be segmented, is unstable across window scales, or measures
+  outside the 4–200 mm plausibility band
+- `object_entity` says the arm cannot hold it — reach, J1 keep-out, ground Z,
+  jaw-width plan, neighbour clearance, desk polygon. Quoted verbatim
+- the destination fails `work_region_block_reason`
+
+#### Status
+
+Unit tests rewritten: `tests/test_instruct.py` is 29 tests over the new
+protocol, `tests/test_instruct_reply.py` picks up `box_readings`. **Full suite:
+416 passed.** Dry-run against the live service: works end to end, and surfaced
+§2w on the first frame. Nothing has moved the arm yet.
+
+---
+
+### 2w. Both coordinate readings can hit different real objects — the hole is open, and three attempts to close it failed
+
+Found by dry-running §2v against the live service. It is the **wrong-entity
+rate** row of the metrics table in the design doc — "the silent failure; no
+downstream gate catches it" — reproduced on hardware for the first time.
+
+#### The failure
+
+`build_prompt` asks for pixels and draws a numbered pixel grid. This build
+answers 0-1000 normalized often enough that `box_readings` keeps both readings,
+pixels first, and `measure_grounding` retries with the second **only when the
+first fails to segment**.
+
+On a frame with a stapler, a binder clip, a blue rock and a dragon figurine, the
+reply to "pick up the stapler" was `box_2d: [777, 538, 920, 666]`:
+
+| reading | box centre | measures | what is there |
+|---|---|---|---|
+| pixels (leads) | (848, 602) | 47 × 24 mm | the **binder clip** |
+| 0-1000 (retry) | (1086, 433) | 98 × 38 mm | the **stapler** |
+
+The pixel reading segments cleanly, measures a plausible object, passes reach,
+jaw-width and work-region, and reports `pickable`. The retry never fires. The
+arm closes on the binder clip and every line of the transcript says stapler.
+
+#### Three fixes, all measured, none works
+
+**(a) Ask for `point_2d` beside `box_2d` and believe the box reading nearest
+it.** The premise — that `point_2d` follows the worked examples in the prompt
+while `box_2d` pulls toward normalized (§2p measured 5/5 vs 8/8 on the old
+prompts) — is false for one reply. Over four tasks the point agreed with the
+box's **pixel** reading 4 times out of 4, including on the stapler where that
+reading is 302 px from the object and the other is 89 px. One reply uses one
+space for every field, so a second coordinate carries no new information.
+
+An A/B on the same frame, prompt with and without the field, also showed the
+boxes unchanged (centres within 2-4 px), so the field neither helps nor hurts
+the localisation. It was removed for buying nothing.
+
+**(b) Ask the reply to echo a listed tag's position.** Vacuous: the prompt
+prints every decoded tag's pixel, so the model copies the number rather than
+measuring it. Both replies that gave one reproduced the printed value exactly
+(`['marker_1', 1045, 396]`, `['marker_4', 722, 587]` — both correct to the
+pixel), so the check reported "pixels" regardless of the box's space.
+
+**(c) Withhold the probe tag's position and ask for it.** The echo then has to
+be a measurement, and the truth is known. This **degraded the whole reply**:
+
+| task | result |
+|---|---|
+| stapler | named a *different* tag than the probe — no verdict |
+| binder clip | `box_2d: [0, 0, 0, 0]`, `tag_check: ['marker_4', 0, 0]` |
+| blue rock | `box_2d: [null, null, null, null]` |
+| dragon | probe echoed at (572, 792); true (722, 587). Normalized fits to 22 px, so the echo says **0-1000** — while the box's correct reading is **pixels** |
+
+Two of four replies became unusable where all four had been fine, and the one
+usable echo contradicted its own box. So the fields do not reliably share a
+space either, which kills the premise behind (a) and (b) as well.
+
+All three were backed out. `box_grounding` takes the box and nothing else.
+
+#### The bigger number underneath
+
+Box centres against hand-read truth on one frame, best of the two readings:
+
+| object | truth | best reading | error |
+|---|---|---|---|
+| stapler | (1080, 430) | 0-1000 | **92 px** |
+| binder clip | (880, 570) | pixels | **103 px** |
+| dragon figurine | (515, 600) | pixels | **88 px** |
+| blue rock | (252, 553) | only one in frame | **222 px** |
+
+And on that frame "the stapler" and "the binder clip" returned **the same box**
+to within 2 px. So the coordinate convention is not the whole problem — the
+localisation itself is 88-222 px out at this mount, and the model sometimes
+does not distinguish two objects 200 px apart. A convention fix would sharpen a
+target that is already soft.
+
+`--save-view` writes the exact frame each decision was made from, which is where
+to start on that.
+
+#### Where this leaves the loop
+
+Pixels lead, the other reading is a retry, and a wrong reading that happens to
+segment is not caught. That is the honest state. Closing it needs a signal from
+**outside** the reply — a second call shown both candidate crops, or a
+localisation good enough that the two readings are never both plausible.
+Neither is built.
+
+`tests/test_instruct.py::test_both_readings_of_a_box_can_hit_different_real_objects`
+pins the case with the live numbers so a future fix has something to aim at.
+
+---
+
+## 3. Are we cube-agnostic? The policy layer is; enumeration still is not
+
+Rewritten after §2v. The previous verdict was "2 of 3, and the missing one is
+enumeration". That is still the shape of it, but *which* senses pass has moved
+and the third one now bites differently.
+
+### Three senses — still 2 for 3, and the third is now the only one left
+
+**1. Manipulation — yes.** `measure` → `object_entity` → `pick_at` knows
 nothing about cubes. It measures a silhouette, takes the long axis from
-`minAreaRect`, infers height from silhouette inflation, and applies a 180°
-yaw period for elongated objects versus 90° for compact ones. The stapler was
-gripped on hardware.
+`minAreaRect`, and applies a 180° yaw period for elongated objects versus 90°
+for compact ones. The stapler was gripped on hardware. §2v made this *more*
+general, not less: the height inference that was the one remaining
+shape-dependent step is out of the pick path entirely, and every object is now
+gripped the same way at `table_z`.
 
-**2. Referent resolution — yes.** `unmatched_nouns` + `locate_target` +
-`LOCATE_AT_PIXEL` register anything Qwen can name and point at as `obj_N`,
-after which it is treated exactly like a cube by every downstream gate.
+**2. Referent resolution — yes, and now genuinely so.** It used to pass on a
+technicality: `unmatched_nouns` + `locate_target` + `LOCATE_AT_PIXEL` could get
+a stapler into the list, but the *list itself* was cube-shaped, the ids named
+the class, and the model chose from it. §2v removed the list. The model is given
+the ArUco tags and nothing else, and answers with a box round whatever it sees.
+Nothing in the prompt, the overlay or the resolver mentions a cube.
 
-**3. Enumeration — no.** *Nothing that is not a coloured cube enters the world
-model unprompted.* `observe` → `build_snapshot` → `capture_scene` →
-`detect_cubes` (HSV) + ArUco + fixed slots. That is the whole world.
+**3. Enumeration — no, and this is now the whole of the gap.** *Nothing that is
+not a coloured cube enters the world model.* `observe` → `capture_scene` →
+`detect_cubes` (HSV) + ArUco + fixed slots.
 
-### Why enumeration matters beyond tidy reporting
+The consequence has changed, though, and it is worth being precise about
+because it is no longer the one §3 described.
 
-Three concrete consequences, all in current code:
+**What §2v fixed by accident.** The old failure was "a stapler nobody
+registered is not in the world model, so `pick up the stapler` answers *no such
+entity*". That failure is gone: the model looks at the image and boxes the
+stapler, and the box is measured on demand. The world model no longer needs to
+contain a thing for the arm to pick it up. That is a real capability gain, and
+it came from deleting code.
 
-- **Negative and survey queries are wrong by construction.** "Is there anything
-  else on the desk?" "Put it somewhere clear." The model can only answer from
-  cubes, markers and slots.
+**What is left, and it is all safety-side.** The cube detector's output is now
+used *only* by the internal gates, and those gates only know about cubes:
 
 - **Clearance is asymmetric, and the unsafe direction is unchecked.**
-  `object_entity` (entities.py:499-512) *does* check a registered object
-  against `scene.cubes` and refuses if a cube is inside the jaw span. But
-  `pick_block_reason` (entities.py:238-240) and `Scene.pickable`
-  (scene.py:248-253) iterate `self.cubes` only. **A cube sitting 20 mm from a
-  stapler is still reported pickable**, and the jaws will close through the
-  stapler. An unregistered object is not even a candidate for the check.
-
+  `object_entity` checks the planned grasp point against `scene.cubes` and
+  refuses if a cube is inside the jaw span. It cannot check against a *pen*
+  sitting 20 mm away, because no pen is in `scene`. Two objects the model
+  picks in sequence are each measured, but neither knows the other exists.
 - **Place targets ignore non-cube occupancy.** `free_markers`
-  (workspace.py:484-490) requires `PLACE_CLEARANCE_MM` from every **cube**.
-  A marker with a pen lying on it reads `free`, and the arm will place onto it.
-  `free_placement_slots` has the same signature and the same blind spot.
+  (workspace.py:484-490) requires `PLACE_CLEARANCE_MM` from every **cube**. A
+  marker with a pen on it reads free, and the arm will place onto it.
+  `free_placement_slots` has the same signature and the same blind spot. This
+  matters less than it did — the model now chooses destination pixels by
+  looking, and can see the pen — but the gate behind it is still blind.
+- **`pick_block_reason` and `Scene.pickable` iterate `self.cubes` only.** A
+  cube 20 mm from a stapler is still reported pickable. That path is no longer
+  on the instruction loop's critical path, but the MCP server still uses it.
 
-`discover.py` was written specifically to close sense 3 and is tested, but it
-is not wired in, so none of the above is fixed yet.
+`discover.py` closes exactly this, is tested (16 tests), was measured finding
+**all 9 cubes on a frame where `mt4_scene` reported 6**, and is still not wired
+in. Wiring it into `capture_scene` alongside HSV — deduplicated by the existing
+`is_own_colour_blob` — would make the clearance gates see what the model
+already sees. It is now the highest-value unwired thing in the tree, and it no
+longer has to fight the "a 20-entity list is worse for the VLM than a 6-entity
+one" objection, because **the VLM is not shown the list at all**.
 
 ---
 
 ## 4. Outstanding work, ranked
 
 ### Blocking a trustworthy live run
+
+**0. Close the wrong-reading hole, or accept it knowingly — §2w.** The §2v loop
+has been dry-run against the live service and works end to end on a stapler, a
+binder clip, a rock and a figurine, none of which any detector can see. It also
+reproduced the silent wrong-target failure: both coordinate readings of one box
+landed on different real objects, the leading one measured cleanly, and the arm
+would have gripped the wrong thing with the transcript reporting the right one.
+Three in-reply fixes were measured and none works. **Nothing has moved the arm
+yet.**
 
 **1. ~~No motion verification.~~ Abandoned as unachievable on this rig** — see
 §2r. `verify_pick` / `verify_place` were built (§2e), ran for one day, and were
@@ -1282,10 +1549,13 @@ sensor there is nothing left to build this on, so the loop reports commands and
 says so. Everything that can be checked is now checked *before* the move
 instead, on both ends of a transfer.
 
-**2. Wire `discover` into `build_snapshot` / `mt4_scene`.** Closes sense 3
-above. Needs three decisions (§5) and carries a real risk of over-detection
-noise in the entity list, which is why it was left out pending review. **Now
-the top remaining item.**
+**2. Wire `discover` into `capture_scene` / `mt4_scene`.** Closes sense 3
+above. **Now the top remaining item, and §2v made it cheaper**: two of the three
+open decisions in §5 were about how a longer list would confuse the VLM, and the
+VLM is no longer shown the list. What is left is a purely internal question —
+whether the clearance gates should see every desk-deviating blob, deduplicated
+against HSV by the existing `is_own_colour_blob`. Measured: `discover` found all
+9 cubes on a frame where `mt4_scene` reported 6.
 
 **2a. ~~Choose a grasp point within an object.~~** Done — `mt4_vision/grasp.py`,
 validated on hardware, see §2k and §2m.
@@ -1305,12 +1575,14 @@ doing first, because (2) makes the blind spot much more likely to fire.
 
 **4. ~~`locate_target` should ask for `bbox_2d`~~** — **done**, see §2b.
 
-**5. Unit tests for `instruct.py`** — **started**. `tests/test_instruct.py`
-covers the coordinate convention, the `Grounding` assembly, the
-`measure_grounding` retry, the stopword and noun-phrase rules and the three
-deterministic guards, 50 tests, using the live
-replies verbatim as fixtures. `decide`, `bind` and `_matches_attributes` still
-have none, and that is where the remaining §2 bugs came from.
+**5. Unit tests for `instruct.py`** — **done for the new protocol**, rewritten
+by §2v. `tests/test_instruct.py` is 29 tests over `build_prompt` (that nothing
+pickable leaks), `decide` (that the reply is read faithfully), the refusals that
+are left, `destination_grasp` and the zero-height grip;
+`tests/test_instruct_reply.py` is 23 over the coordinate conventions and the
+`measure_grounding` retry, using the live replies verbatim as fixtures. What has
+no unit coverage is the worker's dispatch — the measure-gate-move sequence in
+`_run_task` — which is where a mistake would now show up.
 
 **5a. Decide what "place on X" means for a non-cube.** See §2c. The grasp point
 and the object centre coincide for a cube and diverge by tens of millimetres
@@ -1321,9 +1593,14 @@ actually built.
 
 ### Needs hardware time
 
-**7. Fix `_assumed_height_mm`'s axis dependence** and re-run the Phase 0 gate.
-Moves the target for every pointed-at object, so it must be measured, not
-reasoned about.
+**7. ~~Fix `_assumed_height_mm`'s axis dependence.~~ Sidestepped for the
+instruction loop by §2v** — every pick now measures at zero assumed height and
+grips at `table_z`, so the estimator is not in that path at all. It is still
+live for `mt4_locate_at_pixel` and `mt4_locate_by_prompt`, which pass
+`object_height_mm=None`. **What replaces this item is validating the trade on
+hardware**: a table-height grip aims up to ~30 mm outward of a 20 mm cube's true
+centre (silhouette centroid times `_parallax_gain` 1.4-2.0) and near-exactly at
+a flat object. Nobody has measured which way that lands in practice.
 
 **8. Re-run `calibrate_table_edge.py`** after reworking the wood colour model
 (hue wraparound plus a saturation floor that matches the measured 15–27 range,
@@ -1454,27 +1731,12 @@ deliberate — §1 records the three decisions wiring it in needs first.
 
 ## 5. Decisions you own
 
-**May the loop choose a destination the task deliberately left open?** This is
-the one thing blocking "place it on a non-marker location", and it is a policy
-question, not a bug. The standing rule is never to substitute a target, because
-nothing downstream can detect that it happened. That rule is about targets the
-*user named*. Here the user named no destination — they stated a constraint, and
-fifteen free slots satisfy it equally. Three options:
-
-- *Refuse, as now.* Safest, and consistent with the rest of the layer. The cost
-  is that a perfectly clear instruction cannot be carried out, and the refusal
-  is about the model's arbitrary point missing an arbitrary lattice point.
-- *Place at the pixel the model pointed at,* gated on `in_work_region`. This
-  honours the model's own answer rather than snapping it to a slot, and it is
-  the semantically correct reading — the model is pointing at bare desk because
-  bare desk is what was asked for. It needs a new action path; `PLACE_ENTITY` is
-  entity-only by design.
-- *Pick any placeable slot when the task names no destination.* Simplest to
-  build, and the weakest guarantee.
-
-Note that widening the bind radius is **not** an option: the slot lattice's
-closest pair is 51 mm apart, so a radius large enough to catch a 91 px miss
-makes neighbouring slots ambiguous instead.
+**~~May the loop choose a destination the task deliberately left open?~~
+Decided 2026-08-03, option two** — see §2v. `dest_2d` is a pixel on bare desk,
+projected to the table plane and used as given, gated only on
+`work_region_block_reason`. It is not snapped to a slot or a tag, and the slot
+lattice is no longer offered to the model at all. "Place it on a non-marker
+location" and "put it down somewhere clear" now have a direct expression.
 
 **Motion verification is closed, not solved — see §2r.** It was built, it
 misread an ArUco tag as the object it was checking for, and it is gone. Nothing
@@ -1492,19 +1754,25 @@ would contribute nothing to the score and a lifted object would score near zero.
 fallback. Two-sided origin testing — a match **and** the spot still looking
 unlike bare desk — is the other half.
 
-**How aggressively should `discover` feed the entity list?** Three sub-choices:
+**How aggressively should `discover` feed the internal gates?** Two of the
+three sub-choices here were about the model's list and §2v dissolved them: there
+is no list, so "does a 20-entity list confuse the VLM" and "does showing
+out-of-region objects help it" no longer arise. What is left is one question,
+and it is purely about safety:
 
-- *All proposals, or only those that survive `in_work_region`?* Showing
-  out-of-region objects tells the model why it cannot act on them; hiding them
-  keeps the list short. The cube path currently hides them and reports a count.
 - *Merge with, or replace, HSV cube detection?* Running both means the same
-  cube can appear as `cube_2` and `obj_5`. `is_own_colour_blob` already exists
-  to suppress that for registered objects and would need extending.
-- *What happens to over-detection?* Cables, tape and the arm's body all deviate
-  from the desk. They survive `measure` sometimes. A 20-entity list is worse
-  for the VLM than a 6-entity one even when every entry is real.
+  cube can be proposed twice. `is_own_colour_blob` already suppresses that for
+  registered objects and would need extending. The payoff is that
+  `object_entity`'s clearance check, `free_markers` and `free_placement_slots`
+  would finally see a pen as an obstacle rather than as empty desk.
 
-**Is the ~±10 mm pick accuracy acceptable for the benchmark**, or does the
-height estimator get fixed first? Cubes are forgiving because they are wide;
-a pen at 8 mm wide is not. If the benchmark includes narrow objects, item 7
-moves above item 4.
+**Does the table-height grip hold up on hardware?** §2v traded a height
+estimator that was measurably wrong (7.2-32.3 mm inferred for 20 mm objects) for
+a fixed assumption that is wrong in a known direction: a silhouette centroid
+sits outward of the true footprint by roughly height × 1.4-2.0, so a 20 mm cube
+is aimed up to ~30 mm outward and a flat object is aimed almost exactly. Against
+a ~±10 mm jaw tolerance, that predicts cubes getting *worse* and flat things
+getting better. Nobody has measured it. If cubes start being shoved, the choice
+is between reinstating height inference for compact objects only — a cube
+special case in the geometry layer, invisible to the model — and fixing the
+estimator's axis dependence properly.

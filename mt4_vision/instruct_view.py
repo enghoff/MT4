@@ -123,39 +123,40 @@ def decision_view(
     grounding=None,
     obj=None,
     action: I.Action | None = None,
-    objects: dict | None = None,
     caption: list[tuple[str, tuple[int, int, int]]] | None = None,
 ) -> np.ndarray:
     """What the model just answered, drawn on the frame it answered about.
 
-    ``obs.annotated`` and not a fresh capture: the grid and the entity circles
-    are what the model was looking at when it produced these coordinates, so
-    they are the only backdrop against which the answer means anything.
+    ``obs.annotated`` and not a fresh capture: the grid and the tag circles are
+    what the model was looking at when it produced these coordinates, so they
+    are the only backdrop against which the answer means anything.
 
-    The bound entity's pixel comes from the snapshot, which is why markers and
-    slots can be drawn here at all -- they had no pixel until
-    ``entities._desk_pixel_projector``.
+    ``obj`` is the measurement taken from the model's box, when there is one.
+    Its mask is the last look anyone gets at what is about to be grasped:
+    nothing downstream re-measures, and nothing after the move checks the desk
+    again. Its centroid is drawn as the *bound* point, joined to the box centre
+    the model gave, so the pixel gap between "where it pointed" and "where the
+    jaws will actually go" is a glance rather than an investigation.
 
-    ``objects`` lets a decision that targets a registered object show the mask
-    the object's geometry was measured from, which is what its size, yaw and
-    ``grip_mm`` all came from. That mask is one capture old by then -- the loop
-    re-observes after registering -- so it is drawn on a frame it was not cut
-    from. With the arm parked between two captures seconds apart nothing has
-    moved, and seeing which silhouette is about to be grasped is worth more than
-    the strictness. It is also the last look anyone gets: nothing downstream
-    re-measures, and nothing after the move checks the desk again.
+    Only a *tag* destination has a calibrated pixel to draw. A destination pixel
+    the model chose on bare desk is drawn from the reply itself, because there
+    is no entity behind it -- which is the point of it.
     """
-    bound = dest_bound = None
-    if action is not None and action.entity_id:
-        entity = obs.snapshot.get(action.entity_id)
-        if entity is not None:
-            bound = entity.pixel
-        if obj is None and objects:
-            obj = objects.get(action.entity_id)
+    grounding = grounding if grounding is not None else (
+        None if action is None else action.source
+    )
+    bound = None
+    if obj is not None:
+        px, py = getattr(obj, "px", None), getattr(obj, "py", None)
+        if px is not None and py is not None:
+            bound = (float(px), float(py))
+    dest_bound = None
     if action is not None and action.dest_entity_id:
-        dest = obs.snapshot.get(action.dest_entity_id)
+        dest = obs.marker(action.dest_entity_id)
         if dest is not None:
-            dest_bound = dest.pixel
+            dest_bound = dest.pixel or obs.calib.robot_to_pixel(dest.x, dest.y)
+    elif action is not None and action.dest_point_px:
+        dest_bound = action.dest_point_px
     return annotate_qwen(
         obs.annotated,
         grounding=grounding,

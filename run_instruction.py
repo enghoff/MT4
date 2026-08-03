@@ -29,15 +29,34 @@ run; the arm is still parked on the way out.
 Each step is one capture, one decision, one motion:
 
     park clear of the camera
-        -> one frame -> snapshot + pointing overlay (the same pixels)
-        -> Qwen3-VL picks an action and names a target
-        -> validated against the snapshot (mt4_vision.instruct)
-        -> motion.transfer / pick_at / place_at, off that same snapshot
+        -> one frame -> pixel grid + the decoded ArUco ids drawn on it
+        -> Qwen3-VL picks an action and draws a box round what it means
+        -> GrabCut inside that box -> position, size and angle in millimetres
+        -> the physical gates: reach, keep-out, ground, jaw clearance, desk
+        -> motion.transfer / pick_at / place_at, off that same frame
         -> park clear of the camera again
 
-then round again, until the model says DONE or anything refuses. Ids belong to
-the snapshot that produced them, so the loop never carries one across a move --
-the only thing that persists is what the gripper is holding.
+then round again, until the model says DONE or anything refuses.
+
+**Qwen is the eyes.** It is handed the frame and the ArUco tag numbers, and
+nothing else. Not a list of cubes, not a list of objects, not a list of free
+slots -- a tag is named only because its printed number is a code no
+vision-language model can read off an image, and everything else on the desk is
+the model's job to see. Nor is the instruction preprocessed: no noun
+extraction, no stopword list, no question detection. What you type is what it
+reads.
+
+That is why a target is a **box** rather than an id. There is no list to hold
+ids, so there is nothing to bind a point to, nothing to disagree about and
+nothing to refuse over a name. The box goes straight to the segmenter that
+turns pixels into millimetres.
+
+**Every object is gripped at table height.** The jaws close at ``table_z``, as
+low as they go, at the table-plane projection of the GrabCut mask's centroid,
+oriented by that mask's long axis. Nothing infers how tall the thing is;
+inferring it from the silhouette reads 7.2-32.3mm for objects that are all
+20mm. See ``instruct.PICK_AT_TABLE_HEIGHT_MM`` for which error that trades away
+and which it accepts.
 
 **Moving something somewhere is ONE step.** ``TRANSFER`` names the object and
 its destination together and the arm carries out both halves without stopping,
@@ -50,11 +69,12 @@ failure. So nothing here is verified after the fact; outcome lines say
 before the move: reach, keep-out, ground, finger clearance, the desk polygon,
 and both ends of a transfer, all before the gripper opens.
 
-**One snapshot, one id space.** The script owns the snapshot it decides over
-and executes against, rather than deciding over its own and then calling the
-MCP server's ``mt4_pick``, which would resolve the id in a *different* capture.
-Ids are assigned by spatial order, so those two usually agree -- and "usually"
-is the wrong guarantee when the failure is picking the wrong cube in silence.
+**One frame, one decision, one motion.** The script owns the frame it decides
+over and executes against, rather than deciding over its own and then calling
+the MCP server's ``mt4_pick``, which would resolve a target in a *different*
+capture. The arm is parked while the model thinks and nothing else on this desk
+moves, so the measurement taken from the box is still true when the jaws
+arrive.
 
 **What the gripper holds outlives an instruction.** The jaws are physical and
 one line of typing does not empty them, so ``held`` is session state, not

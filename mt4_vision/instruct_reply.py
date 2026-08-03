@@ -1,16 +1,23 @@
-"""Reading Qwen's replies: coordinate conventions and grounding.
+"""Reading Qwen's replies: coordinate conventions and measurement.
 
 Split from :mod:`mt4_vision.instruct`, which imports everything here and
 re-exports it, so ``from mt4_vision.instruct import to_frame_pixels`` still
 works. Two jobs live here:
 
-* **Which space a coordinate is in.** A grounding reply is 0-1000 normalized; a
-  decision reply is pixels, because the decision prompt prints every entity's
-  own pixel. :func:`to_frame_pixels` and :func:`point_readings` are the only
-  places either convention is applied.
-* **Turning "where is the X" into something measurable.** :func:`locate_target`
-  asks for one box, :func:`measure_grounding` segments it into a
-  ``LocatedObject`` with real millimetres.
+* **Which space a coordinate is in.** The decision prompt asks for pixels and
+  draws the grid to read them off, but this build answers 0-1000 normalized
+  often enough that both readings have to be kept. :func:`to_frame_pixels`,
+  :func:`point_readings` and :func:`box_readings` are the only places either
+  convention is applied, and they order their two readings identically.
+* **Turning the box the model drew into something measurable.**
+  :func:`box_grounding` validates it, :func:`measure_grounding` segments it
+  into a ``LocatedObject`` with real millimetres.
+
+There is **one** grounding call per decision, and it is the decision itself:
+the reply carries a box, and that box is what gets measured. No separate
+"where is the X" pass runs first, because there is no entity list for an
+unlisted noun to be grounded into. See the :mod:`mt4_vision.instruct` module
+docstring.
 
 ``obs`` parameters are ``instruct.Observation``, kept untyped at runtime so this
 module does not import back into the one that imports it.
@@ -23,7 +30,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from mt4_vision.preview import BIG_BOX_SHARE
-from mt4_vision.qwen import DEFAULT_URL, QwenError, ask
 
 if TYPE_CHECKING:
     from mt4_vision.instruct import Observation
@@ -42,18 +48,17 @@ def to_frame_pixels(
     x, odd are y -- and returns the same shape.
 
     **An unanchored coordinate from this build is 0-1000 normalized**, whatever
-    the prompt asks for, so that is what this scales. Use it for
-    :func:`locate_target`'s grounding replies. A *decision* reply is different:
-    ``build_prompt`` prints every entity's own pixel, and with that example in
-    front of it the model answers in pixels, so ``decide`` reads its point
-    through :func:`point_readings` instead.
+    the prompt asks for, so that is what this scales. ``build_prompt`` draws a
+    numbered pixel grid on the frame and asks for pixels, which pulls the reply
+    towards pixels but does not settle it -- so neither reading is discarded.
+    :func:`point_readings` and :func:`box_grounding` keep both, pixels leading.
 
     The only reading the numbers alone can rule out is normalized, since nothing
     normalized exceeds ``COORD_SCALE``. A coordinate above it is therefore
     pixels and is passed through; everything else is scaled. That leaves a blind
-    spot -- a true pixel answer whose coordinates all fall under 1000 -- so
-    callers that can afford a retry should offer :func:`alternate_reading` when
-    the first reading fails to measure.
+    spot -- a true pixel answer whose coordinates all fall under 1000 -- which
+    is why :func:`point_readings` and :func:`box_readings` return both and let
+    a failed measurement retry with the other.
     """
     values = [float(c) for c in coords]
     if any(abs(v) > COORD_SCALE for v in values):
@@ -68,11 +73,10 @@ def point_readings(
 ) -> tuple[tuple[float, float], ...]:
     """Both in-frame readings of a **decision** reply's point, pixels first.
 
-    The convention is a property of the prompt, and this module's two prompts
-    differ: :func:`locate_target` says nothing about coordinate space and gets
-    0-1000 normalized back, while :func:`build_prompt` prints every entity's own
-    pixel and gets pixels back. Pixels therefore lead here, but only lead -- both
-    readings are returned and the caller resolves them against the snapshot.
+    Used for ``dest_2d``, the one bare point left in the protocol. Pixels lead
+    because ``build_prompt`` draws the grid in that space and says so, but only
+    lead: both readings come back, and the caller tries the second when the
+    first fails its own physical test rather than choosing between them here.
 
     Readings outside the frame are dropped, and a coordinate above
     ``COORD_SCALE`` rules normalized out, leaving a single reading.
@@ -98,31 +102,6 @@ def point_readings(
     return tuple(out)
 
 
-def alternate_reading(
-    coords: Sequence[float], size: tuple[int, int]
-) -> tuple[float, ...] | None:
-    """The other possible reading of the same numbers, or None if there is none.
-
-    Only ever raw-as-pixels, and only when that lands inside the frame:
-    :func:`to_frame_pixels` already returns raw pixels whenever a coordinate
-    rules normalized out, so in that case there is nothing else to try.
-
-    This exists so a failed measurement can be retried rather than reported,
-    without ever *silently* choosing between the two -- the retry still has to
-    survive segmentation, the two-window stability check and the work-region
-    gate before it becomes a target.
-    """
-    values = [float(c) for c in coords]
-    if any(abs(v) > COORD_SCALE for v in values):
-        return None
-    w, h = size
-    if all(0 <= v <= w for v in values[0::2]) and all(
-        0 <= v <= h for v in values[1::2]
-    ):
-        return tuple(values)
-    return None
-
-
 @dataclass(frozen=True)
 class Grounding:
     """Where the model says a named thing is, in frame pixels.
@@ -142,8 +121,8 @@ class Grounding:
       extent and cannot be sanity-checked at all.
 
     ``alt_point_px`` / ``alt_box_px`` are the same reply under the other
-    coordinate convention -- see :func:`alternate_reading`. They are a retry,
-    never a silent second choice.
+    coordinate convention -- see :func:`box_readings`. They are a retry, never
+    a silent second choice.
     """
 
     label: str
@@ -153,48 +132,93 @@ class Grounding:
     alt_box_px: tuple[float, float, float, float] | None = None
 
 
-def locate_target(
-    obs: Observation, noun: str, *, url: str = DEFAULT_URL
-) -> tuple[Grounding | None, str]:
-    """Ask only "where is the <noun>", and return a :class:`Grounding` or why not.
+def box_readings(
+    coords: Sequence[float], size: tuple[int, int]
+) -> tuple[tuple[float, ...], ...]:
+    """Both in-frame readings of a **decision** reply's box, pixels first.
 
-    A separate, single-purpose call rather than another field on the decision
-    prompt. Asked to choose an action *and* ground an unknown noun, this build
-    reliably does neither -- it forces the task onto whatever cube it can see
-    and explains in its reason why that is wrong. Asked nothing but "locate
-    the stapler", with the keys spelled out, it is the grounding prompt that
-    measured 10/10 (docs/QWEN3-VL.md).
+    The box counterpart of :func:`point_readings`, ordered the same way on
+    purpose: one prompt asks for both a box and a point, so one convention has
+    to answer for both, and a reader should not have to remember which field
+    follows which rule.
 
-    **The prompt deliberately says nothing about the coordinate space.** The
-    model ignores that instruction either way (see :func:`to_frame_pixels`),
-    and a stated convention it does not follow is worse than no statement at
-    all -- it invites the reader to trust the wrong reading.
+    Pixels lead because ``build_prompt`` draws a numbered pixel grid and asks
+    for pixels. They only lead: ``measure_grounding`` tries the normalized
+    reading when the first fails to segment, and that retry is what a run
+    depends on when the reply comes back normalized -- measured at 8 of 8 on
+    one sweep, 206-285px from truth if read as pixels.
+
+    A reading whose centre falls outside the frame is dropped, and a coordinate
+    above ``COORD_SCALE`` rules normalized out, leaving a single reading.
     """
-    prompt = (
-        f"Locate the {noun} in this image. If there is no {noun} visible, "
-        'reply with an empty list [].\n'
-        "Reply with ONLY JSON, no prose, no markdown fence:\n"
-        f'[{{"bbox_2d": [x1, y1, x2, y2], "label": "{noun}"}}]\n'
-        "One tight box around the whole object."
-    )
+    w, h = size
+    out: list[tuple[float, ...]] = []
+
+    def keep(candidate: Sequence[float] | None) -> None:
+        if candidate is None:
+            return
+        vals = tuple(float(v) for v in candidate)
+        cx = (vals[0] + vals[2]) / 2.0
+        cy = (vals[1] + vals[3]) / 2.0
+        if not (0 <= cx <= w and 0 <= cy <= h):
+            return
+        if vals not in out:
+            out.append(vals)
+
+    values = [float(c) for c in coords]
+    if not any(abs(v) > COORD_SCALE for v in values):
+        # Nothing normalized exceeds COORD_SCALE, so above it the raw reading is
+        # the only possible one and to_frame_pixels passes it through unscaled.
+        keep(values)
+    keep(to_frame_pixels(values, size))
+    return tuple(out)
+
+
+def box_grounding(
+    box: Any,
+    size: tuple[int, int],
+    *,
+    label: str = "object",
+) -> tuple[Grounding | None, str]:
+    """The decision reply's ``box_2d`` as a :class:`Grounding`, or (None, why).
+
+    Two rejections, and neither is about whether the model boxed the *right*
+    thing. A box must be four numbers, and it must not cover most of the frame
+    -- asked to locate something absent, this build returns the whole image
+    instead of declining (see :data:`MAX_BOX_FRAME_SHARE`).
+    """
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None, (
+            f"the reply needs box_2d as four pixel numbers [x1, y1, x2, y2] "
+            f"around the thing to pick up, and gave {box!r}"
+        )
     try:
-        reply = ask(prompt, obs.annotated, url=url, max_new_tokens=120, do_sample=False)
-    except QwenError as exc:
-        return None, f"grounding call failed: {exc}"
+        coords = [float(v) for v in box]
+    except (TypeError, ValueError):
+        return None, f"box_2d is not four numbers: {box!r}"
 
-    from mt4_vision.qwen import parse_regions
+    readings = box_readings(coords, size)
+    w, h = size
+    if not readings:
+        cx, cy = (coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2
+        return None, (
+            f"box_2d centres at ({cx:.0f}, {cy:.0f}) read as pixels, and "
+            f"nowhere inside this {w}x{h} image under either reading"
+        )
 
-    regions = parse_regions(reply.text)
-    # Boxes first: a point reply is still accepted, because the model
-    # occasionally answers with one anyway, but it loses everything in the
-    # Grounding docstring and is the weaker input.
-    for r in sorted(regions, key=lambda g: 0 if g.kind == "box" else 1):
-        prim = to_frame_pixels(r.coords, obs.size)
-        alt = alternate_reading(r.coords, obs.size)
-        g = _grounding(noun, r.kind, prim, alt, obs.size)
-        if g is not None:
-            return g, ""
-    return None, f"no usable {noun} location in {reply.text.strip()[:120]!r}"
+    g = _grounding(
+        label, "box", readings[0], readings[1] if len(readings) > 1 else None, size
+    )
+    if g is not None:
+        return g, ""
+
+    x1, y1, x2, y2 = readings[0]
+    area = abs(x2 - x1) * abs(y2 - y1)
+    return None, (
+        f"box_2d covers {100.0 * area / max(1, w * h):.0f}% of the frame, "
+        "which is the model declining to answer rather than an object -- "
+        "nothing on this desk is that big"
+    )
 
 
 # A box larger than this share of the frame is the model declining to answer,
@@ -258,7 +282,11 @@ def _grounding(
 
 
 def measure_grounding(
-    obs: Observation, g: Grounding, *, label: str | None = None
+    obs: Observation,
+    g: Grounding,
+    *,
+    label: str | None = None,
+    object_height_mm: float | None = None,
 ) -> tuple[Any | None, str]:
     """Turn a :class:`Grounding` into a measured object, or say why not.
 
@@ -268,6 +296,13 @@ def measure_grounding(
     reporting -- the retry still has to survive segmentation, the two-window
     stability check and the work-region gate, so a wrong reading cannot buy
     itself a target by being tried twice.
+
+    ``object_height_mm=0`` measures the object as if it were flat: the returned
+    XY is the plain table-plane projection of the mask centroid, with no
+    height-from-silhouette inference and no parallax de-inflation. That is what
+    the instruction loop passes -- see ``instruct.PICK_AT_TABLE_HEIGHT_MM`` for
+    which error that trades for which. ``None`` keeps the inferring behaviour,
+    for callers that want it.
     """
     from mt4_vision.locate import LocateError, measure_with_box_fallback
 
@@ -286,6 +321,7 @@ def measure_grounding(
                 obs.frame, point[0], point[1], obs.calib, name,
                 box=None if bx is None else (bx[0], bx[1], bx[2], bx[3]),
                 marker_xy=marker_xy,
+                object_height_mm=object_height_mm,
             )
         except LocateError as exc:
             why = why or f"{prefix}{exc}"

@@ -35,7 +35,7 @@ from mt4_vision.instruct import (
     COORD_SCALE,
     Grounding,
     Observation,
-    alternate_reading,
+    box_readings,
     measure_grounding,
     point_readings,
     to_frame_pixels,
@@ -144,17 +144,25 @@ def test_stapler_point_reply_is_not_taken_literally():
     assert err < 30.0, f"{err:.0f}px from the stapler"
 
 
-def test_alternate_is_the_raw_numbers_when_they_fit_the_frame():
-    assert alternate_reading(STAPLER_POINT, SIZE) == (700.0, 700.0)
+def test_box_readings_keep_pixels_first_when_both_are_possible():
+    """Ordered like point_readings, deliberately: one prompt now asks for both
+    a box and a point, so one convention answers for both fields."""
+    got = box_readings((100, 200, 160, 260), SIZE)
+    assert got[0] == (100.0, 200.0, 160.0, 260.0)
+    assert got[1] == to_frame_pixels((100, 200, 160, 260), SIZE)
 
 
-def test_alternate_is_none_when_the_raw_numbers_leave_the_frame():
-    # y2 = 827 > 720, so raw-as-pixels is not a possible reading at all.
-    assert alternate_reading((630, 650, 782, 827), SIZE) is None
+def test_box_readings_drop_a_pixel_reading_that_centres_off_frame():
+    """The live stapler box. Centre y as pixels is 738 on a 720px frame, so
+    only the normalized reading survives -- which was the correct one."""
+    got = box_readings((630, 650, 782, 827), SIZE)
+    assert len(got) == 1
+    assert got[0] == to_frame_pixels((630, 650, 782, 827), SIZE)
 
 
-def test_alternate_is_none_when_pixels_were_already_forced():
-    assert alternate_reading((1014, 364, 1066, 407), SIZE) is None
+def test_box_readings_leave_one_reading_when_a_coordinate_rules_normalized_out():
+    got = box_readings((1014, 364, 1066, 407), SIZE)
+    assert got == ((1014.0, 364.0, 1066.0, 407.0),)
 
 
 def test_a_decision_point_is_read_as_pixels_first():

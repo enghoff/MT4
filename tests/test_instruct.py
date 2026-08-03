@@ -1,4 +1,4 @@
-"""Tests for the policy layer's coordinate handling (no hardware, no service).
+"""Tests for the policy layer (no hardware, no service).
 
 Every bug this file pins was found by driving the arm, which is an expensive
 way to discover an arithmetic error. The one that motivated the file:
@@ -15,8 +15,14 @@ measures it confidently, which nothing downstream can detect.
 
 Measured 2026-08-02 on the live rig, four objects x two prompt forms x two
 frame variants: 8 of 8 replies normalized, 1-10px from truth as normalized,
-206-285px from truth as pixels. So normalized is the default and a coordinate
-above 1000 is the only thing that can rule it out.
+206-285px from truth as pixels. So both readings are kept, and neither is
+discarded on the strength of the prompt alone.
+
+The protocol these cover: the model is given the ArUco tags and nothing else,
+answers with a box rather than an id, and is not second-guessed about what it
+boxed. So the three things worth pinning are that nothing pickable reaches the
+prompt, that the reply is read faithfully, and that every refusal is structural
+or physical.
 
 Run: python tests/test_instruct.py  (or pytest)
 """
@@ -32,29 +38,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mt4_vision.instruct as instruct
 from mt4_vision.calib import Calibration
-from mt4_vision.entities import Snapshot
-from mt4_vision.instruct import (
-    Observation,
-    is_question,
-    register_object,
-    unmatched_nouns,
-)
+from mt4_vision.entities import Entity, Snapshot
+from mt4_vision.instruct import Action, Observation
 
 FRAME_W, FRAME_H = 1280, 720
 SIZE = (FRAME_W, FRAME_H)
-
-# The live replies, verbatim, from the 2026-08-02 grounding run. Truth pixels
-# for the cubes come from the HSV detector on the same frame; the stapler was
-# read off the drawn grid by hand.
-LIVE = {
-    #  label        normalized box            truth pixel
-    "stapler": ((630, 650, 782, 827), (900, 530)),
-    "red cube": ((557, 606, 605, 693), (749, 464)),
-    "green cube": ((300, 653, 343, 731), (411, 497)),
-    "blue cube": ((792, 506, 833, 565), (1043, 386)),
-}
-# The point reply that broke the live run.
-STAPLER_POINT = (700, 700)
 
 MM_PER_PX = 0.5
 CALIB = Calibration(
@@ -64,771 +52,466 @@ CALIB = Calibration(
 )
 
 
-def _obs() -> Observation:
-    frame = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
-    return Observation(
-        frame=frame, annotated=frame, snapshot=Snapshot(token="t"), calib=CALIB
-    )
-
-
-# --------------------------------------------------------------- conversion
-
-
-# ---------------------------------------------------------------- alternate
-
-
-# ------------------------------------------------------------ point_readings
-
-
-# --------------------------------------------------------------- Grounding
-
-
-# --------------------------------------------------------- measure_grounding
-
-
-# ------------------------------------------------------- unmatched_nouns
-
-
-def _snap_with(*labels: str) -> Snapshot:
-    from mt4_vision.entities import Entity
-
-    return Snapshot(
-        token="t",
-        entities=[
-            Entity(id=f"e{i}", kind="cube", label=lab, x=0.0, y=0.0)
-            for i, lab in enumerate(labels)
-        ],
-    )
-
-
-def test_an_unknown_noun_is_reported():
-    got = unmatched_nouns("pick up the stapler", _snap_with("red cube"))
-    assert got == {"stapler"}
-
-
-def test_a_held_object_is_no_longer_unmatched():
-    """The step-2 regression.
-
-    Live: "pick up the stapler and place it on marker 0" picked the stapler at
-    step 1, then step 2 searched for a stapler again -- it was in the gripper,
-    so the model pointed at the gripper and the loop registered a phantom at
-    robot (-50, -97), inside the J1 keep-out.
-    """
-    snap = _snap_with("red cube")
-    assert unmatched_nouns("pick up the stapler", snap) == {"stapler"}
-    assert unmatched_nouns("pick up the stapler", snap, held="stapler") == set()
-
-
-def test_held_matching_is_per_word():
-    snap = _snap_with("red cube")
-    got = unmatched_nouns(
-        "put the desk stapler on marker 0", snap, held="desk stapler"
-    )
-    assert got == set()
-
-
-def test_held_does_not_mask_a_different_noun():
-    snap = _snap_with("red cube")
-    got = unmatched_nouns(
-        "pick up the stapler then the screwdriver", snap, held="stapler"
-    )
-    assert got == {"screwdriver"}
-
-
-def test_abstract_words_never_reach_the_grounder():
-    """The 28-prompt sweep's biggest finding.
-
-    Qwen answers a grounding request for an abstract noun instead of declining
-    it, so anything that gets through here becomes a model call and possibly a
-    registered entity. Measured: "clear" was registered at robot (24, -335)
-    83x50mm and "there" at (-293, 6) 55x33mm, both as pickable objects.
-    """
-    snap = _snap_with("red cube", "blue cube")
-    leaked = [
-        "move the blue cube somewhere clear",
-        "tidy up the desk",
-        "pick up everything",
-        "is there anything on the desk that is not a cube",
-        "put it down over there",
-        "clean up all of this",
-    ]
-    for text in leaked:
-        assert unmatched_nouns(text, snap) == set(), f"{text!r} leaked"
-
-
-def test_place_holder_nouns_for_a_position_never_reach_the_grounder():
-    """A destination described rather than named.
-
-    Measured live 2026-08-02: "pick up the green cube and place it on a
-    non-marker location" grounded the word "location", got a whole-frame box,
-    projected it to 315037x312990mm, and refused the entire task -- while the
-    same snapshot was offering 14 free slots as destinations.
-    """
-    snap = _snap_with("green cube", "blue cube")
-    leaked = [
-        "pick up the green cube and place it on a non-marker location",
-        "put the blue cube in a free spot",
-        "move the green cube to an empty position",
-        "place it on any open space",
-        "put it down on a clear patch of desk",
-        "set the blue cube on an unoccupied square",
-    ]
-    for text in leaked:
-        assert unmatched_nouns(text, snap) == set(), f"{text!r} leaked"
-
-
-def test_a_real_object_noun_still_gets_through():
-    snap = _snap_with("red cube")
-    assert unmatched_nouns("pick up the stapler", snap) == {"stapler"}
-    assert unmatched_nouns("move the screwdriver here", snap) == {"screwdriver"}
-
-
-# ------------------------------------------------- excluded_destination_kind
-
-
-# ------------------------------------------------------------ noun_phrase
-
-
-# -------------------------------------------------- register / guards
-
-
-class _Obj:
-    def __init__(self, x, y, label="thing"):
-        self.x, self.y, self.label = x, y, label
-
-
-def test_register_object_merges_two_hits_on_one_thing():
-    objects: dict = {}
-    eid, new = register_object(objects, _Obj(109.0, 179.0, "grey"), seq=1)
-    assert new and eid == "obj_1"
-    eid2, new2 = register_object(objects, _Obj(108.0, 179.0, "rock"), seq=2)
-    assert not new2 and eid2 == "obj_1"
-    assert len(objects) == 1
-
-
-def test_register_object_keeps_two_distinct_things():
-    objects: dict = {}
-    register_object(objects, _Obj(109.0, 179.0, "rock"), seq=1)
-    eid, new = register_object(objects, _Obj(109.0, 220.0, "pen"), seq=2)
-    assert new and eid == "obj_2" and len(objects) == 2
-
-
-def test_register_object_folds_the_new_word_into_the_label():
-    """Both words described the same thing, so the entity answers to both.
-
-    Without this the second word stays "unmatched" and the task is refused for
-    naming something that is in fact registered -- measured on "the grey rock",
-    where "grey" registered obj_1 and "rock" then had nothing to match.
-    """
-    from mt4_vision.locate import LocatedObject
-
-    def obj(x, y, label):
-        return LocatedObject(
-            label=label, px=1.0, py=1.0, x=x, y=y,
-            axis_yaw_deg=0.0, long_mm=60.0, short_mm=40.0, confidence=0.9,
-        )
-
-    objects: dict = {}
-    register_object(objects, obj(109.0, 179.0, "grey"), seq=1)
-    eid, new = register_object(objects, obj(108.0, 179.0, "rock"), seq=2)
-    assert not new and eid == "obj_1"
-    assert objects["obj_1"].label == "grey rock"
-
-
-def test_questions_are_recognised():
-    for text in (
-        "is there anything on the desk that is not a cube",
-        "what is on marker 3",
-        "how many cubes are there?",
-        "Where is the stapler?",
-    ):
-        assert is_question(text), text
-    for text in ("pick up the blue cube", "put it on marker 3", "tidy up"):
-        assert not is_question(text), text
-
-
-# ------------------------------------------------------------------ TRANSFER
-#
-# One decision names both ends of the move and the arm carries it out without
-# stopping, so this is the last place either end can be caught. Nothing after
-# the decision looks at the desk again -- the after-the-fact vision check was
-# removed 2026-08-03 for reporting a completed pick as a failure, having
-# template-matched the ArUco tag lying under the stapler rather than the
-# stapler. These tests are what stands in for it.
-
-
-def _transfer_snapshot(**over):
-    """A stapler, a free marker, and an occupied one, spaced so points bind.
-
-    x pixels are above ``COORD_SCALE`` on purpose: that is the one thing that
-    rules the normalized reading out, so each point has a single unambiguous
-    interpretation and these tests are about the transfer logic rather than
-    about coordinate spaces (which the top half of this file already covers).
-    """
-    from mt4_vision.entities import Entity
-
-    ents = [
-        Entity(
-            id="obj_1", kind="object", label="stapler", x=100.0, y=50.0,
-            pixel=(1100.0, 150.0), pickable=True, source="vlm",
-            yaw_deg=30.0, yaw_period_deg=180.0,
-        ),
-        Entity(
-            id="marker_3", kind="marker", label="marker 3 (free)",
-            x=150.0, y=250.0, pixel=(1100.0, 620.0), placeable=True,
-            source="aruco",
-        ),
-        Entity(
-            id="marker_2", kind="marker", label="marker 2 (occupied)",
-            x=40.0, y=250.0, pixel=(1030.0, 400.0), placeable=False,
-            reason="occupied by cube_5", source="aruco",
-        ),
-    ]
+def _obs(*, entities=(), **over) -> Observation:
     frame = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
     return Observation(
         frame=frame, annotated=frame, calib=CALIB,
-        snapshot=Snapshot(token="t", entities=ents), **over,
+        snapshot=Snapshot(token="t", entities=list(entities), summary="cubes=2"),
+        **over,
     )
 
 
-def _decide_on(reply_json: str, obs, instruction: str):
+def _marker(n: int, x: float, y: float, px: float, py: float, **over) -> Entity:
+    return Entity(
+        id=f"marker_{n}", kind="marker", label=f"marker {n} (free)",
+        x=x, y=y, pixel=(px, py), placeable=True, source="aruco", **over,
+    )
+
+
+def _cube(n: int, x: float, y: float, px: float, py: float) -> Entity:
+    return Entity(
+        id=f"cube_{n}", kind="cube", label="blue cube", x=x, y=y,
+        pixel=(px, py), pickable=True, source="hsv",
+    )
+
+
+def _desk(**over) -> Observation:
+    """Two cubes and two decoded tags. The cubes must never reach the model.
+
+    Pixels and robot millimetres agree under CALIB (pixel = robot / 0.5), so a
+    destination pixel in these tests projects where the fixture says it does
+    and the work-region gate sees a reachable point.
+    """
+    return _obs(
+        entities=[
+            _cube(1, 100.0, 50.0, 200.0, 100.0),
+            _cube(2, 40.0, 90.0, 80.0, 180.0),
+            _marker(3, 150.0, 250.0, 300.0, 500.0),
+            _marker(2, 40.0, 250.0, 80.0, 500.0),
+        ],
+        **over,
+    )
+
+
+def _decide_on(reply_json: str, obs, instruction: str) -> Action:
     """Run the real ``decide`` against a canned model reply."""
-    import mt4_vision.instruct as instruct_mod
 
     class _Reply:
         text = reply_json
 
-    saved = instruct_mod.ask
-    instruct_mod.ask = lambda *a, **k: _Reply()
+    saved = instruct.ask
+    instruct.ask = lambda *a, **k: _Reply()
     try:
-        return instruct_mod.decide(obs, instruction)
+        return instruct.decide(obs, instruction)
     finally:
-        instruct_mod.ask = saved
+        instruct.ask = saved
 
 
-def test_a_transfer_resolves_both_ends_against_one_snapshot():
+# -- nothing pickable reaches the model ------------------------------------ #
+#
+# The whole point of the 2026-08-03 rewrite. Qwen is the visual grounding, so it
+# is told what it cannot see (a tag's printed number) and nothing else. A
+# regression here is silent and expensive: the model starts answering from a
+# list again, and the list is cube-complete and object-sparse.
+
+
+def test_the_prompt_names_the_tags_and_nothing_else():
+    # An instruction that names no object, so anything cube-shaped in the
+    # prompt got there from the detector rather than from the user.
+    prompt = instruct.build_prompt(_desk(), "pick up the thing on the left")
+    assert "marker_3" in prompt
+    assert "marker_2" in prompt
+    for banned in ("cube_1", "cube_2", "blue cube", "cube", "slot_", "obj_"):
+        assert banned not in prompt, f"{banned!r} leaked into the prompt"
+
+
+def test_the_prompt_advertises_no_capabilities():
+    """A capability flag invites the model to treat the list as the set of
+    legal answers, which is the opposite of what the list is for."""
+    prompt = instruct.build_prompt(_desk(), "tidy the desk")
+    for banned in ("can be picked up", "can be placed on", "not available"):
+        assert banned not in prompt
+
+
+def test_the_prompt_says_the_tag_list_is_not_the_desk():
+    """Without this the model reads a short list as "these are the only things
+    here" and forces the task onto one of them."""
+    prompt = instruct.build_prompt(_desk(), "pick up the pen")
+    assert "NOT a list of what is on the desk" in prompt
+
+
+def test_the_instruction_is_passed_through_verbatim():
+    """No noun extraction, no stopword filter, no rewriting.
+
+    A word list that decides which parts of a sentence name objects fails on
+    ordinary English: matching words exactly, ``holding`` is a thing to go and
+    find, and grounding it registers a 169x19mm object at robot (-456, -178).
+    """
+    text = "leave the object you are holding on the table, please comply"
+    prompt = instruct.build_prompt(_desk(held="blue cube"), text)
+    assert f'Task: "{text}"' in prompt
+
+
+def test_markers_are_the_only_model_facing_entities():
+    obs = _desk()
+    assert [e.id for e in obs.markers] == ["marker_3", "marker_2"]
+    # The full snapshot still has the cubes -- the internal gates need them.
+    assert len(obs.snapshot.entities) == 4
+    assert obs.marker("cube_1") is None
+    assert obs.marker("marker_3") is not None
+
+
+def test_the_overlay_circles_only_tags(monkeypatch):
+    """A circled cube is the picture-shaped version of a cube list."""
+    drawn: list[list[str]] = []
+
+    def _fake_annotate(frame, entities=None, **kw):
+        drawn.append([e.id for e in (entities or ())])
+        return frame
+
+    snap = _desk().snapshot
+    monkeypatch.setattr(instruct, "annotate_for_pointing", _fake_annotate)
+    monkeypatch.setattr(instruct, "load_calibration", lambda: CALIB)
+    monkeypatch.setattr(instruct, "capture_scene", lambda calib, frame: object())
+    monkeypatch.setattr(instruct, "build_snapshot", lambda sc, token: snap)
+    instruct.observe(frame=np.zeros((FRAME_H, FRAME_W, 3), np.uint8))
+    assert drawn == [["marker_3", "marker_2"]]
+
+
+# -- the reply is read faithfully ------------------------------------------ #
+
+
+def test_a_transfer_carries_a_box_and_a_tag():
     act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_3", '
-        '"dest_2d": [1100, 620], "reason": "the stapler goes on marker 3"}',
-        _transfer_snapshot(),
-        "put the stapler on marker 3",
+        '{"action": "TRANSFER", "box_2d": [180, 80, 220, 120], '
+        '"label": "blue cube", "dest_marker": "marker_3", '
+        '"reason": "the cube goes on marker 3"}',
+        _desk(),
+        "put the blue cube on marker 3",
     )
     assert act.ok, act.reason
     assert act.kind == "TRANSFER"
-    assert (act.entity_id, act.label) == ("obj_1", "stapler")
-    assert (act.dest_entity_id, act.dest_label) == ("marker_3", "marker 3 (free)")
-    # Both ends survive into as_dict, which is what the MCP layer and the
-    # transcripts read.
-    assert act.as_dict()["dest_entity_id"] == "marker_3"
-    assert act.as_dict()["dest_agreed"] is True
-
-
-def test_a_transfer_onto_an_occupied_marker_is_refused_before_the_grasp():
-    """Refused while the stapler is still on the desk, not after it is held."""
-    act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_2", '
-        '"dest_2d": [1030, 400], "reason": "put it there"}',
-        _transfer_snapshot(),
-        "put the stapler on marker 2",
-    )
-    assert not act.ok
-    assert "occupied by cube_5" in act.reason
-
-
-def test_a_transfer_needs_an_empty_gripper():
-    act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_3", '
-        '"dest_2d": [1100, 620], "reason": "move it"}',
-        _transfer_snapshot(held="red cube"),
-        "put the stapler on marker 3",
-    )
-    assert not act.ok
-    assert "red cube" in act.reason and "PLACE_ENTITY" in act.reason
-
-
-def test_a_transfer_cannot_name_a_cube_as_its_destination():
-    """The source half's rules and the destination half's rules are the ones
-    the two separate actions always used, so this refuses for the same reason
-    ``PLACE_ENTITY cube_2`` always did."""
-    act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "obj_1", '
-        '"dest_2d": [1100, 150], "reason": "move it"}',
-        _transfer_snapshot(),
-        "put the stapler somewhere",
-    )
-    assert not act.ok
-    assert "the destination will not do:" in act.reason
-
-
-def test_the_single_target_actions_still_resolve_after_the_split():
-    """``_resolve_target`` is the old tail of ``decide`` lifted out whole; these
-    two pin that lifting it out changed nothing for the callers that existed."""
-    pick = _decide_on(
-        '{"action": "PICK_ENTITY", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "reason": "pick it"}',
-        _transfer_snapshot(),
-        "pick up the stapler",
-    )
-    assert pick.ok and pick.kind == "PICK_ENTITY" and pick.entity_id == "obj_1"
-    assert pick.dest_entity_id is None
-
-    place = _decide_on(
-        '{"action": "PLACE_ENTITY", "entity_id": "marker_3", '
-        '"point_2d": [1100, 620], "reason": "put it down"}',
-        _transfer_snapshot(held="stapler"),
-        "put it on marker 3",
-    )
-    assert place.ok and place.entity_id == "marker_3"
-
-    # And the gripper-state rules survived being moved out of the resolver.
-    assert not _decide_on(
-        '{"action": "PLACE_ENTITY", "entity_id": "marker_3", '
-        '"point_2d": [1100, 620], "reason": "put it down"}',
-        _transfer_snapshot(),
-        "put it on marker 3",
-    ).ok
-
-
-def test_grasp_for_squares_a_destination_and_keeps_an_object_angle():
-    """What the arm is actually handed, now that nothing re-measures first."""
-    from mt4_vision.instruct import grasp_for
-
-    snap = _transfer_snapshot().snapshot
-    obj = grasp_for(snap.get("obj_1"), CALIB)
-    assert (obj.x, obj.y) == (100.0, 50.0)
-    # The object's own angle, on the 180 lattice: the jaws close ACROSS a
-    # stapler's long axis, and the pick is the only thing that knows which way
-    # that runs.
-    assert obj.yaw_deg == 30.0 and obj.yaw_period_deg == 180.0
-
-    dest = grasp_for(snap.get("marker_3"), CALIB)
-    assert (dest.x, dest.y) == (150.0, 250.0)
-    # A destination has no angle of its own, so the held thing lands squared to
-    # the world axes rather than at whatever angle the pick left the wrist.
-    assert dest.yaw_deg == 0.0 and dest.yaw_period_deg == 90.0
-
-
-if __name__ == "__main__":
-    import traceback
-
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    bad = 0
-    for fn in fns:
-        try:
-            fn()
-            print(f"  ok   {fn.__name__}")
-        except Exception:
-            bad += 1
-            print(f"  FAIL {fn.__name__}")
-            traceback.print_exc()
-    print(f"\n{len(fns) - bad}/{len(fns)} passed")
-    sys.exit(1 if bad else 0)
-
-
-# --------------------------------------------------- attributes vs. identity
-#
-# "pick up the green statue and place it on marker 0", 2026-08-03, with a green
-# statue plainly on the desk:
-#
-#   registered obj_1: statue at (180, -77) 136x15mm
-#   STOP  reason: the task says ['green', 'statue'] but obj_1 is 'statue'
-#
-# Not bad luck -- a closed loop. `instruction_attributes` pools its vocabulary
-# from every entity's LABEL, so "green" was required because a green *cube* was
-# on the desk. `unmatched_nouns` grounds only words no label contains, so
-# "green" was never grounded and could never enter the statue's label. The two
-# rules are exact complements: a shared adjective is required by construction
-# and absent by construction. Every "green statue" fails, forever.
-
-
-def _labelled(colour_of_obj, *, obj_label="statue"):
-    from mt4_vision.entities import Entity
-
-    frame = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
-    label = f"{colour_of_obj} {obj_label}" if colour_of_obj else obj_label
-    ents = [
-        Entity(
-            id="obj_1", kind="object", label=label, color=colour_of_obj,
-            x=100.0, y=50.0, pixel=(1100.0, 150.0), pickable=True, source="vlm",
-        ),
-        Entity(
-            id="cube_1", kind="cube", label="green cube", color="green",
-            x=-20.0, y=-90.0, pixel=(1100.0, 650.0), pickable=True,
-        ),
-    ]
-    return Observation(
-        frame=frame, annotated=frame, calib=CALIB,
-        snapshot=Snapshot(token="t", entities=ents),
-    )
-
-
-def test_a_measured_colour_on_an_object_satisfies_the_attribute_check():
-    """The reported bug. A green statue and a green cube in one snapshot."""
-    act = _decide_on(
-        '{"action": "PICK_ENTITY", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "reason": "the statue"}',
-        _labelled("green"),
-        "pick up the green statue",
-    )
-    assert act.ok, act.reason
-    assert act.entity_id == "obj_1"
-
-
-def test_an_unmeasured_colour_abstains_rather_than_refusing():
-    """A grey stapler matches no HSV band, so classify_color returns None.
-
-    That is "nobody established a colour", not "it is not green", and the
-    difference decides whether a correct answer is refused.
-    """
-    act = _decide_on(
-        '{"action": "PICK_ENTITY", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "reason": "the statue"}',
-        _labelled(None),
-        "pick up the green statue",
-    )
-    assert act.ok, act.reason
-
-
-# ------------------------------------------------- a number the desk lacks
-#
-# "pick up the clamp and place it on marker 0", 2026-08-03, on a desk whose
-# calibration carries markers 1, 2, 3 and 4 and no marker 0:
-#
-#   [1] TRANSFER obj_1 (clamp) -> marker_3   reason: clamp is on marker_3
-#       -> moved the clamp onto marker 3 (free)
-#   [2] TRANSFER obj_2 (clamp) -> marker_1   reason: clamp is on marker_1 as per task
-#       -> moved the clamp onto marker 1 (free)
-#   [3] DONE                                 reason: task already completed
-#
-# Three ok=True decisions and two real arm moves, none of them touching
-# anything the instruction named. The cause was a direction: every number check
-# derived its requirement by walking the SNAPSHOT's markers and asking whether
-# the text mentioned each one. A number the desk does not have therefore
-# produced no requirement at all, so the destination attribute set was empty and
-# every marker satisfied it vacuously -- the guard was a no-op in exactly the
-# case where the model has no correct answer available to give.
-
-
-def _clamp_desk(**over):
-    """The live desk shape: one graspable object and two free markers, 1 and 3.
-
-    x pixels are above ``COORD_SCALE`` so each point has a single unambiguous
-    reading, as in ``_transfer_snapshot``.
-    """
-    from mt4_vision.entities import Entity
-
-    ents = [
-        Entity(
-            id="obj_1", kind="object", label="clamp", x=100.0, y=50.0,
-            pixel=(1100.0, 150.0), pickable=True, source="vlm",
-            yaw_deg=30.0, yaw_period_deg=180.0,
-        ),
-        Entity(
-            id="marker_3", kind="marker", label="marker 3 (free)",
-            x=150.0, y=250.0, pixel=(1100.0, 620.0), placeable=True,
-            source="aruco",
-        ),
-        Entity(
-            id="marker_1", kind="marker", label="marker 1 (free)",
-            x=40.0, y=250.0, pixel=(1030.0, 400.0), placeable=True,
-            source="aruco",
-        ),
-    ]
-    frame = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
-    return Observation(
-        frame=frame, annotated=frame, calib=CALIB,
-        snapshot=Snapshot(token="t", entities=ents), **over,
-    )
-
-
-def test_the_correct_transfer_is_still_carried_out():
-    """The whole point of refusing the rest: this one has to go through."""
-    act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_3", '
-        '"dest_2d": [1100, 620], "reason": "onto marker 3"}',
-        _clamp_desk(),
-        "pick up the clamp and place it on marker 3",
-    )
-    assert act.ok, act.reason
-    assert (act.entity_id, act.dest_entity_id) == ("obj_1", "marker_3")
-
-
-def test_an_unnumbered_destination_is_still_the_models_to_choose():
-    """The guard reads numbers, so a task that names none constrains nothing."""
-    act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_1", '
-        '"dest_2d": [1030, 400], "reason": "a free marker"}',
-        _clamp_desk(),
-        "put the clamp on a free marker",
-    )
-    assert act.ok, act.reason
-    assert act.dest_entity_id == "marker_1"
-
-
-# --------------------------------------------- pointing alone was unchecked
-#
-# The module docstring says neither naming nor pointing is trusted alone. It was
-# not holding. ``_matches_attributes`` ran against the id the model WROTE, so
-# every branch that settles on the point instead -- a reply with
-# ``entity_id: null``, or one whose name and point the task's own wording
-# resolves -- reached the arm with no attribute check at all. Reproduced offline
-# on the live snapshot shape, at both ends of a move.
-
-
-def test_a_point_only_reply_that_lands_on_the_right_thing_still_works():
-    """The gate is about contradiction, not about demanding an id."""
-    act = _decide_on(
-        '{"action": "PICK_ENTITY", "entity_id": null, '
-        '"point_2d": [1100, 150], "reason": "the statue"}',
-        _labelled("green"),
-        "pick up the green statue",
-    )
-    assert act.ok, act.reason
-    assert act.entity_id == "obj_1"
-
-
-# -- a destination id that is not an id ------------------------------------- #
-#
-# Measured live 2026-08-03 on "move stapler to center aruco marker": step 1
-# picked the stapler, step 2 answered PLACE_ENTITY with entity_id "stapler" --
-# the label of the thing in the jaws, which the prompt says is never a
-# destination -- and the run was abandoned with the stapler still held. The
-# distinction these pin: a destination that is not in the snapshot cannot mean
-# "the desk does not have it" the way a pick target can, because markers and
-# slots are enumerated exhaustively. So free text is discarded and the point
-# decides, while an id-SHAPED string is still a claim about the desk and is
-# still refused.
-
-
-def test_a_place_whose_id_is_a_label_falls_back_to_the_point():
-    act = _decide_on(
-        '{"action": "PLACE_ENTITY", "entity_id": "stapler", '
-        '"point_2d": [1100, 620], "reason": "put it down there"}',
-        _transfer_snapshot(held="stapler"),
-        "move the stapler to the marker",
-    )
-    assert act.ok, act.reason
-    assert act.entity_id == "marker_3"
-    # The junk the model wrote is still reported, so the transcript's
-    # "[model said stapler]" makes the fallback visible rather than silent.
-    assert act.model_entity_id == "stapler"
-
-
-# -- words that name a kind already in the snapshot ------------------------- #
-
-
-def test_a_kind_synonym_is_only_credited_when_that_kind_is_present():
-    """With no marker there is nothing for "the aruco tag" to already be."""
-    from mt4_vision.entities import Entity
-
-    obs = _transfer_snapshot()
-    only_object = Snapshot(
-        token="t",
-        entities=[
-            Entity(id="obj_1", kind="object", label="stapler", x=100.0, y=50.0,
-                   pixel=(1100.0, 150.0), pickable=True, source="vlm"),
-        ],
-    )
-    assert "aruco" in instruct.unmatched_nouns("put it on the aruco", only_object)
-    assert "aruco" not in instruct.unmatched_nouns("put it on the aruco", obs.snapshot)
-
-
-def test_block_is_not_credited_as_a_cube():
-    """A wooden block the HSV detector never saw must still reach the grounder."""
-    snap = _transfer_snapshot().snapshot
-    assert "block" in instruct.unmatched_nouns("pick up the block", snap)
-
-
-# =========================================================================== #
-# Gates removed 2026-08-03 -- owner's decision
-#
-# "let's get the code working and introduce checks if things fail, rather than
-# have the implementation fail because we don't trust what qwen is telling us."
-#
-# Thirteen tests used to live here asserting that each of these replies was
-# REFUSED. They are now asserted to proceed, which is the honest record of what
-# was traded away: every one of these gates could turn a reply that identified
-# the right thing into an abandoned task, and between them they abandoned three
-# consecutive real runs (docs/qwen3_vl_policy_status.md §2u).
-#
-# What still refuses is tested further down: the physical envelope, a reply that
-# identifies nothing at all, a question, and the gripper-state rules.
-
-
-def test_an_unknown_destination_id_now_resolves_by_the_point():
-    """Was: "the destination will not do: 'marker_9' is not in this snapshot"."""
-    act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_9", '
-        '"dest_2d": [1100, 620], "reason": "put it there"}',
-        _transfer_snapshot(),
-        "put the stapler somewhere",
-    )
-    assert act.ok, act.reason
+    assert act.label == "blue cube"
+    assert act.source is not None
+    assert act.source.box_px == (180.0, 80.0, 220.0, 120.0)
+    assert act.point_px == (200.0, 100.0)
     assert act.dest_entity_id == "marker_3"
-    # The string the model wrote is still carried, so the transcript prints
-    # "[model said dest marker_9]" and the substitution is never silent.
-    assert act.model_dest_entity_id == "marker_9"
 
 
-def test_an_unknown_pick_id_now_resolves_by_the_point():
-    """Was: "'stapler' is not in this snapshot ... never a nearby substitute"."""
+def test_a_pick_needs_only_a_box():
     act = _decide_on(
-        '{"action": "PICK_ENTITY", "entity_id": "stapler", '
-        '"point_2d": [1100, 150], "reason": "the stapler"}',
-        _transfer_snapshot(),
+        '{"action": "PICK", "box_2d": [180, 80, 220, 120], '
+        '"label": "pen", "dest_marker": null, "dest_2d": null, '
+        '"reason": "no destination named"}',
+        _desk(),
+        "pick up the pen",
+    )
+    assert act.ok, act.reason
+    assert (act.kind, act.label) == ("PICK", "pen")
+    assert act.dest_entity_id is None and act.dest_point_px is None
+
+
+def test_a_place_takes_a_bare_pixel_destination():
+    """"Somewhere clear" is a pixel, not a slot id. There are no slot ids."""
+    act = _decide_on(
+        '{"action": "PLACE", "dest_2d": [80, 500], '
+        '"reason": "an empty patch of desk"}',
+        _desk(held="pen"),
+        "put it down somewhere clear",
+    )
+    assert act.ok, act.reason
+    assert act.kind == "PLACE"
+    assert act.dest_point_px == (80.0, 500.0)
+    assert act.dest_entity_id is None
+
+
+def test_a_tag_destination_wins_when_both_are_given():
+    act = _decide_on(
+        '{"action": "PLACE", "dest_marker": "marker_2", "dest_2d": [10, 10], '
+        '"reason": "on the tag"}',
+        _desk(held="pen"),
+        "put it on marker 2",
+    )
+    assert act.ok, act.reason
+    assert act.dest_entity_id == "marker_2"
+    assert act.dest_point_px is None
+
+
+def test_pixels_lead_when_both_readings_are_possible():
+    """Both survive, pixels first, because the prompt draws the grid in that
+    space. The other is carried for ``measure_grounding`` to retry with."""
+    act = _decide_on(
+        '{"action": "PICK", "box_2d": [200, 300, 260, 360], "label": "pen", '
+        '"reason": "the pen"}',
+        _desk(),
+        "pick up the pen",
+    )
+    assert act.ok, act.reason
+    assert act.source.box_px == (200.0, 300.0, 260.0, 360.0)
+    assert act.source.alt_box_px is not None
+    ax0, ay0, _ax1, _ay1 = act.source.alt_box_px
+    assert abs(ax0 - 200 * FRAME_W / 1000.0) < 0.5
+    assert abs(ay0 - 300 * FRAME_H / 1000.0) < 0.5
+
+
+def test_the_live_stapler_box_reads_as_normalized_only():
+    """The failure this file was opened for. Read as pixels, that box centres
+    at y=738 on a 720px frame -- off the bottom, so not a possible reading at
+    all, and the normalized one (which was right to 4px) is what is left."""
+    act = _decide_on(
+        '{"action": "PICK", "box_2d": [630, 650, 782, 827], "label": "stapler", '
+        '"reason": "the stapler"}',
+        _desk(),
         "pick up the stapler",
     )
     assert act.ok, act.reason
-    assert act.entity_id == "obj_1"
-    assert act.model_entity_id == "stapler"
+    x0, y0, _x1, _y1 = act.source.box_px
+    assert abs(x0 - 630 * FRAME_W / 1000.0) < 0.5
+    assert abs(y0 - 650 * FRAME_H / 1000.0) < 0.5
+    assert act.source.alt_box_px is None
 
 
-def test_a_colour_that_disagrees_no_longer_refuses_anything():
-    """Was two separate refusals, for cubes and for grounded objects alike.
+def test_both_readings_of_a_box_can_hit_different_real_objects():
+    """The known hole, pinned so a future fix has a failing case to aim at.
 
-    The cost, stated: a green cube is now picked for "the red cube" when the
-    reply names it. Colour was the only thing telling two cubes apart.
-    """
-    for reply_id, px in (("cube_1", 650), ("obj_1", 150)):
-        act = _decide_on(
-            '{"action": "PICK_ENTITY", "entity_id": "%s", '
-            '"point_2d": [1100, %d], "reason": "that one"}' % (reply_id, px),
-            _labelled("green"),
-            "pick up the red cube",
-        )
-        assert act.ok, act.reason
-        assert act.entity_id == reply_id
+    On a 1280x720 frame the box `[777, 538, 920, 666]` centres at (848, 602)
+    read as pixels and (1086, 433) read as 0-1000. On the live desk those are a
+    binder clip and a stapler. Both segment, so the measure-then-retry chain
+    never rejects the first, and the loop grips whichever reading leads.
 
-
-def test_a_noun_that_names_a_different_object_no_longer_refuses():
-    """Was: "obj_1 is 'green stone'" for a task naming a rock."""
-    act = _decide_on(
-        '{"action": "PICK_ENTITY", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "reason": "close enough"}',
-        _labelled("green", obj_label="stone"),
-        "pick up the green rock",
-    )
-    assert act.ok, act.reason
-    assert act.entity_id == "obj_1"
-
-
-def test_a_destination_the_instruction_never_had_no_longer_refuses():
-    """Was the clamp run: "marker 0 is not on this desk" (§2s).
-
-    The arm now goes to whichever marker the reply names. Deliberate: the
-    refusal was measured blocking tasks whose destination the snapshot listed.
+    Three ways of asking the reply which space it meant were measured and none
+    works -- see the module docstring in ``mt4_vision.instruct``. Until
+    something outside the reply supplies that signal, pixels lead and the other
+    reading is only a retry.
     """
     act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_3", '
-        '"dest_2d": [1100, 620], "reason": "clamp is on marker_3"}',
-        _clamp_desk(),
-        "pick up the clamp and place it on marker 0",
+        '{"action": "PICK", "box_2d": [777, 538, 920, 666], '
+        '"label": "stapler", "reason": "the stapler"}',
+        _desk(),
+        "pick up the stapler",
     )
     assert act.ok, act.reason
-    assert act.dest_entity_id == "marker_3"
+    assert act.source.point_px == (848.5, 602.0)
+    assert act.source.alt_point_px is not None
+    ax, ay = act.source.alt_point_px
+    assert abs(ax - 1086) < 2 and abs(ay - 433) < 2, (ax, ay)
 
 
 def test_done_is_taken_at_face_value():
-    """Was: "reported the task complete, but marker 0 is not on this desk"."""
     act = _decide_on(
-        '{"action": "DONE", "reason": "task already completed"}',
-        _clamp_desk(),
-        "pick up the clamp and place it on marker 0",
+        '{"action": "DONE", "reason": "the cube is on marker 3"}',
+        _desk(),
+        "put the blue cube on marker 3",
     )
     assert act.kind == "DONE" and act.ok
 
 
-def test_a_named_marker_no_longer_has_to_be_the_one_acted_on():
-    """Was: the task said marker 3, the reply said marker_1, refused."""
+def test_a_question_now_moves_the_arm():
+    """The text is not preprocessed, and that includes not deciding on the
+    operator's behalf that a question was not an order. Deliberate: a phrasing
+    rule cannot tell a survey question from a politely-worded instruction."""
     act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_1", '
-        '"dest_2d": [1030, 400], "reason": "over here"}',
-        _clamp_desk(),
-        "pick up the clamp and place it on marker 3",
+        '{"action": "PICK", "box_2d": [180, 80, 220, 120], '
+        '"label": "cube", "reason": "the only thing not a marker"}',
+        _desk(),
+        "is there anything on the desk that is not a cube?",
     )
-    assert act.ok, act.reason
-    assert act.dest_entity_id == "marker_1"
+    assert act.ok and act.kind == "PICK"
 
 
-def test_a_point_only_reply_is_no_longer_held_to_the_tasks_words():
-    """Was: pointed at cube_1 for "the green statue", refused."""
+# -- what still refuses, and all of it is structural or physical ----------- #
+
+
+def test_a_missing_box_is_refused():
     act = _decide_on(
-        '{"action": "PICK_ENTITY", "entity_id": null, '
-        '"point_2d": [1100, 650], "reason": "that one"}',
-        _labelled("green"),          # obj_1 green statue, cube_1 green cube
-        "pick up the green statue",
-    )
-    assert act.ok, act.reason
-    assert act.entity_id == "cube_1"
-
-
-def test_the_id_wins_over_a_point_that_disagrees():
-    """Was: "named obj_1 but pointed at cube_1, with nothing to settle which".
-
-    The id is the model's explicit answer, so it leads and the point is only a
-    fallback. No cross-examination either way.
-    """
-    act = _decide_on(
-        '{"action": "PICK_ENTITY", "entity_id": "obj_1", '
-        '"point_2d": [1100, 650], "reason": "that one"}',
-        _labelled("green"),
-        "pick up something",
-    )
-    assert act.ok, act.reason
-    assert act.entity_id == "obj_1"
-
-
-# -- what still refuses ----------------------------------------------------- #
-
-
-def test_the_physical_envelope_still_refuses():
-    """The one gate left, and the reason the rest are safe to drop.
-
-    Entity.placeable / pickable carry reach, the J1 keep-out, ground Z, finger
-    clearance and the desk polygon. Nothing above can command a pose the
-    envelope would have rejected anyway.
-    """
-    act = _decide_on(
-        '{"action": "TRANSFER", "entity_id": "obj_1", '
-        '"point_2d": [1100, 150], "dest_entity_id": "marker_2", '
-        '"dest_2d": [1030, 400], "reason": "put it there"}',
-        _transfer_snapshot(),
-        "put the stapler on marker 2",
+        '{"action": "PICK", "box_2d": null, "reason": "the cube"}',
+        _desk(),
+        "pick up the cube",
     )
     assert not act.ok
-    assert "occupied by cube_5" in act.reason
+    assert "box_2d" in act.reason
 
 
-def test_a_reply_identifying_nothing_still_refuses():
-    """Not a judgement about the reply -- the absence of one."""
+def test_a_whole_frame_box_is_refused_as_a_non_answer():
+    """Asked to locate something absent, this build returns the whole image
+    rather than declining. Measured on "location": box (0, 0, 1000, 1000)."""
     act = _decide_on(
-        '{"action": "PLACE_ENTITY", "entity_id": "stapler", '
-        '"point_2d": [5, 5], "reason": "there"}',
-        _transfer_snapshot(held="stapler"),
-        "move the stapler to the marker",
+        f'{{"action": "PICK", "box_2d": [0, 0, {FRAME_W}, {FRAME_H}], '
+        '"label": "location", "reason": "everything"}',
+        _desk(),
+        "pick up the location",
     )
     assert not act.ok
-    assert "identifies a target" in act.reason
+    assert "% of the frame" in act.reason
 
 
-def test_aruco_and_tag_name_the_marker_kind_rather_than_a_new_object():
-    """Grounding "aruco" registered obj_1 19.6mm from the marker it meant."""
-    snap = _transfer_snapshot().snapshot          # holds a marker, labelled "stapler"
-    for word in ("aruco", "tag", "fiducial", "markers"):
-        # Nothing unmatched: "stapler" is a label in this snapshot and the
-        # synonym now resolves to the marker kind that is in it.
-        assert instruct.unmatched_nouns(f"move stapler to the {word}", snap) == set(), word
-        # ...while a genuinely unknown noun in the same sentence still surfaces,
-        # so this is a narrower vocabulary, not a disabled check.
-        assert instruct.unmatched_nouns(f"move the pliers to the {word}", snap) == {
-            "pliers"
-        }, word
+def test_a_tag_that_did_not_decode_is_named_in_the_refusal():
+    """The one text-derived rule, and it concerns the datum we supply rather
+    than the model's grounding. Measured on a desk of markers 1-4: "place it on
+    marker 0" answers marker_3, then marker_1, then "task already completed",
+    never once that the number is not there."""
+    act = _decide_on(
+        '{"action": "PLACE", "dest_marker": "marker_0", "reason": "marker 0"}',
+        _desk(held="pen"),
+        "put it on marker 0",
+    )
+    assert not act.ok
+    assert "marker_0" in act.reason
+    assert "marker_3" in act.reason and "marker_2" in act.reason
+
+
+def test_a_place_with_no_destination_is_refused():
+    act = _decide_on(
+        '{"action": "PLACE", "dest_marker": null, "dest_2d": null, '
+        '"reason": "put it down"}',
+        _desk(held="pen"),
+        "put it down",
+    )
+    assert not act.ok
+    assert "destination" in act.reason
+
+
+def test_picking_while_holding_is_refused_and_names_the_correction():
+    act = _decide_on(
+        '{"action": "PICK", "box_2d": [180, 80, 220, 120], '
+        '"label": "cube", "reason": "the cube"}',
+        _desk(held="stapler"),
+        "pick up the cube",
+    )
+    assert not act.ok
+    assert "stapler" in act.reason and "/held" in act.reason
+
+
+def test_placing_with_an_empty_gripper_is_refused_and_names_the_correction():
+    """Nothing on this rig can sense a grip, so ``held`` is session state that
+    only the operator can correct. A refusal that does not name ``/held`` leaves
+    them re-wording the task instead of fixing the state it was judged against.
+    """
+    act = _decide_on(
+        '{"action": "PLACE", "dest_2d": [80, 500], "reason": "on the desk"}',
+        _desk(),
+        "leave the object you are holding on the table",
+    )
+    assert not act.ok
+    assert "/held" in act.reason
+
+
+def test_an_unknown_action_is_refused():
+    act = _decide_on('{"action": "LOCATE_AT_PIXEL", "point_2d": [1, 2]}', _desk(), "x")
+    assert not act.ok
+    assert "LOCATE_AT_PIXEL" in act.reason
+
+
+def test_a_reply_that_is_not_json_is_refused():
+    act = _decide_on("I would pick up the blue cube.", _desk(), "pick a cube")
+    assert not act.ok
+    assert "no JSON object" in act.reason
+
+
+# -- destinations resolve to poses, and the pixel is not snapped ----------- #
+
+
+def test_a_tag_destination_uses_its_calibrated_position():
+    obs = _desk(held="pen")
+    act = Action("PLACE", True, "on the tag", dest_entity_id="marker_3")
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert (grasp.x, grasp.y) == (150.0, 250.0)
+
+
+def test_a_destination_pixel_is_projected_not_snapped_to_a_tag():
+    """A pixel 4px from marker_2 still means that pixel. Snapping it would be
+    the loop overriding the one thing it asked the model to decide."""
+    obs = _desk(held="pen")
+    act = Action("PLACE", True, "just beside it", dest_point_px=(304.0, 500.0))
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert (grasp.x, grasp.y) == (152.0, 250.0)
+    assert (grasp.x, grasp.y) != (150.0, 250.0)
+
+
+def test_an_unreachable_destination_pixel_is_refused():
+    obs = _desk(held="pen")
+    act = Action("PLACE", True, "over there", dest_point_px=(5.0, 5.0))
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is None
+    assert "destination pixel" in why
+
+
+def test_a_destination_naming_an_undecoded_tag_is_refused():
+    obs = _desk(held="pen")
+    act = Action("PLACE", True, "on it", dest_entity_id="marker_9")
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is None
+    assert "marker_9" in why
+
+
+# -- grip geometry --------------------------------------------------------- #
+
+
+def test_a_pick_measures_at_zero_assumed_height():
+    """Grip as low as possible, at the point the model identified, oriented by
+    the GrabCut mask. That is exactly ``object_height_mm=0`` -- no height
+    inference and no parallax de-inflation anywhere in the pick path."""
+    seen: dict[str, object] = {}
+
+    def _fake_measure(obs, g, *, label=None, object_height_mm=None):
+        seen["height"] = object_height_mm
+        seen["box"] = g.box_px
+        return object(), ""
+
+    act = _decide_on(
+        '{"action": "PICK", "box_2d": [180, 80, 220, 120], '
+        '"label": "cube", "reason": "the cube"}',
+        _desk(),
+        "pick up the cube",
+    )
+    saved = instruct.measure_grounding
+    instruct.measure_grounding = _fake_measure
+    try:
+        obj, why = instruct.measure_source(_desk(), act)
+    finally:
+        instruct.measure_grounding = saved
+
+    assert obj is not None, why
+    assert seen["height"] == 0.0 == instruct.PICK_AT_TABLE_HEIGHT_MM
+    assert seen["box"] == (180.0, 80.0, 220.0, 120.0)
+
+
+def test_a_grasp_defaults_to_table_z():
+    """``Grasp.z is None`` means ``calib.table_z``, which is the low grip."""
+    from mt4_vision.motion import square_place
+
+    assert square_place(100.0, 50.0).grasp_z(CALIB) == CALIB.table_z
+
+
+def test_grasp_for_squares_a_tag_destination():
+    grasp = instruct.grasp_for(_marker(3, 150.0, 250.0, 1100.0, 620.0), CALIB)
+    assert (grasp.x, grasp.y) == (150.0, 250.0)
+    assert grasp.yaw_deg == 0.0
+    assert grasp.yaw_period_deg == 90.0
+
+
+# -- the transcript record ------------------------------------------------- #
+
+
+def test_as_dict_carries_the_box_and_the_destination():
+    act = _decide_on(
+        '{"action": "TRANSFER", "box_2d": [180, 80, 220, 120], '
+        '"label": "cube", "dest_marker": "marker_3", "reason": "move it"}',
+        _desk(),
+        "put the cube on marker 3",
+    )
+    d = act.as_dict()
+    assert d["action"] == "TRANSFER"
+    assert d["box_px"] == [180.0, 80.0, 220.0, 120.0]
+    assert d["point_px"] == [200.0, 100.0]
+    assert d["dest_entity_id"] == "marker_3"
+    # No entity_id and no agreement flags: there is no id to agree about.
+    assert "entity_id" not in d and "agreed" not in d
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__, "-q"]))
