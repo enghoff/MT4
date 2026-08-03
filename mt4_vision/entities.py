@@ -75,14 +75,28 @@ class Entity:
     label: str  # "red cube", "marker 3", "open slot", "pen"
     x: float  # robot frame, mm
     y: float
-    # Pixel position in the frame this snapshot was built from; None for slots,
-    # which are nominal coordinates rather than detections.
+    # Pixel position in the frame this snapshot was built from. For cubes and
+    # objects it is where the detector saw them; for markers and slots it is
+    # their calibrated robot position projected back onto the desk plane, which
+    # is exact -- both are flat on the table, so there is no height to correct
+    # for. None only when there is no calibration to project through.
     pixel: tuple[float, float] | None = None
     # The OBJECT's own robot-frame angle, not a wrist angle: a cube-face edge
     # for a square, the long axis for something elongated. yaw_period_deg says
     # which -- see mt4_vision.wrist.
     yaw_deg: float | None = None
     yaw_period_deg: float = YAW_PERIOD_SQUARE
+    # Measured colour, or None when nothing measured one. Cubes get theirs from
+    # the HSV detector that found them; registered objects from
+    # ``detect.classify_color`` over the same named bands; markers and slots
+    # have none and never will.
+    #
+    # It is in the label too, but the label cannot answer the question that
+    # matters. "green" missing from a label means either "this thing is not
+    # green" or "nobody looked", and a check that treats those alike refuses
+    # correct answers -- which is exactly what happened to "the green statue".
+    # None here means *unknown*, and unknown must abstain rather than refuse.
+    color: str | None = None
     pickable: bool = False
     placeable: bool = False
     # Why not pickable/placeable, in prose. None when it is.
@@ -90,6 +104,11 @@ class Entity:
     source: str = "hsv"  # hsv | aruco | slot | vlm
     area_px: float | None = None
     extent_mm: tuple[float, float] | None = None  # (long, short)
+    # Width the jaws will actually close across at the planned grasp point.
+    # Distinct from extent_mm[1]: that is the narrowest the *whole outline*
+    # gets, which for a stapler is the rail and for a mug is the handle --
+    # neither of which is necessarily where the fingers end up.
+    grip_mm: float | None = None
     confidence: float | None = None
     # Cross-references, e.g. an occupied marker naming its occupant.
     holds: str | None = None
@@ -120,6 +139,8 @@ class Entity:
                 round(self.extent_mm[0], 1),
                 round(self.extent_mm[1], 1),
             ]
+        if self.grip_mm is not None:
+            out["grip_mm"] = round(self.grip_mm, 1)
         if self.confidence is not None:
             out["confidence"] = round(self.confidence, 2)
         if self.holds is not None:
@@ -292,6 +313,54 @@ def _spatial_order(cubes: Sequence[CubeDetection]) -> list[CubeDetection]:
     )
 
 
+def _desk_pixel_projector(calib):
+    """``(x_mm, y_mm) -> (px, py)`` for things lying flat on the desk, or None.
+
+    Markers and slots had no pixel at all, and that was not a cosmetic gap. Two
+    things consume ``Entity.pixel``, and both silently dropped them:
+
+    * ``preview.annotate_for_pointing`` skips any entity without one, so the
+      overlay handed to the model circled the cubes and nothing else;
+    * ``instruct._entity_lines`` appends "at image point (x, y)" only when there
+      is one, so the text list gave coordinates for cubes and nothing else.
+
+    The decision prompt meanwhile asserts "Each is circled in the image with its
+    id written beside it" and asks for the target's centre in pixels. For every
+    marker and every slot that sentence was false, and the model was being asked
+    to point at something it had never been shown. Measured live 2026-08-02 on
+    "place it on a non-marker location", four runs: it named ``marker_0`` every
+    time -- the first destination in the list -- and pointed at (1255, 402),
+    (1261, 403), (1258, 402): the far right edge of the frame, nowhere near any
+    destination, the same wrong answer each time.
+
+    Projection is exact here rather than approximate. Both kinds are flat on the
+    table, so the desk-plane homography is the whole story and none of the
+    height correction that cubes need applies.
+
+    Returns a function yielding None when there is no calibration (unit tests
+    build scenes without one) or the point falls outside the frame.
+    """
+    if calib is None:
+        return lambda _x, _y: None
+    size = getattr(calib, "frame_size_px", None)
+
+    def project(x: float, y: float) -> tuple[float, float] | None:
+        try:
+            px, py = calib.robot_to_pixel(x, y)
+        except Exception:
+            return None
+        px, py = float(px), float(py)
+        if not (math.isfinite(px) and math.isfinite(py)):
+            return None
+        if size and not (0 <= px < float(size[0]) and 0 <= py < float(size[1])):
+            # Off-frame is not a pixel the model can point at, and quoting one
+            # would invite it to.
+            return None
+        return px, py
+
+    return project
+
+
 def build_snapshot(
     scene: Scene,
     *,
@@ -338,6 +407,8 @@ def build_snapshot(
     }
     placeable_marker_ids = {m.marker_id for m in scene.placeable_markers()}
 
+    desk_pixel = _desk_pixel_projector(scene.calib)
+
     cube_entities: list[Entity] = []
     cube_id_of: dict[int, str] = {}
     for i, cube in enumerate(_spatial_order(raw), start=1):
@@ -360,6 +431,7 @@ def build_snapshot(
                 id=eid,
                 kind=KIND_CUBE,
                 label=f"{cube.color} cube",
+                color=cube.color,
                 x=float(cube.x or 0.0),
                 y=float(cube.y or 0.0),
                 pixel=(float(cube.px), float(cube.py)),
@@ -394,6 +466,7 @@ def build_snapshot(
                 label=f"marker {marker.marker_id} ({state})",
                 x=float(marker.x),
                 y=float(marker.y),
+                pixel=desk_pixel(float(marker.x), float(marker.y)),
                 pickable=False,
                 placeable=placeable,
                 reason=(
@@ -420,6 +493,7 @@ def build_snapshot(
             label="open slot",
             x=float(sx),
             y=float(sy),
+            pixel=desk_pixel(float(sx), float(sy)),
             placeable=(
                 scene.calib is None
                 or in_work_region(float(sx), float(sy), scene.calib)
@@ -485,7 +559,7 @@ def object_entity(
     axis). Compact / near-square extents use the 90° square period instead --
     grip orientation is not critical when there is no obvious shaft.
     """
-    from mt4_vision.locate import is_compact
+    from mt4_vision.locate import is_compact, plan_object_grasp
 
     reason: str | None = None
     r = math.hypot(obj.x, obj.y)
@@ -496,33 +570,74 @@ def object_entity(
         reason = f"r={r:.0f}mm is inside the {KEEPOUT_RADIUS_MM:.0f}mm J1 keep-out"
     elif r > MAX_REACH_MM:
         reason = f"r={r:.0f}mm is beyond the {MAX_REACH_MM:.0f}mm max reach"
+    # Where on it can the jaws close, and at what angle? This is the question
+    # that decides a non-cube pick, and the entity layer used to skip it
+    # entirely -- it reported "pickable" from the outline's short axis, which
+    # says nothing about the width at the point being gripped. Measured live
+    # 2026-08-02: a stapler picked cleanly when segmentation happened to return
+    # only its 16mm rail, and closed on air when it returned the whole 73mm
+    # body. Same object, same arm, no deliberate choice either time.
+    plan = None
+    if reason is None and calib is not None:
+        plan, why = plan_object_grasp(obj, calib)
+        if plan is None:
+            reason = why
+    # Clearance is judged at the planned grasp point, not the object's centre:
+    # the fingers go where the plan says, and for anything elongated those can
+    # be tens of millimetres apart.
+    gx = obj.x if plan is None else plan.x
+    gy = obj.y if plan is None else plan.y
+    gw = obj.short_mm if plan is None else plan.width_mm
     if reason is None and scene is not None:
-        need = max(obj.short_mm, 20.0) * 0.5 + 12.0
+        need = max(gw, 20.0) * 0.5 + 12.0
         for other in scene.cubes:
             if other.x is None or other.y is None:
                 continue
             if is_own_colour_blob(obj, other):
                 continue
-            d = dist_mm(obj.x, obj.y, float(other.x), float(other.y))
+            d = dist_mm(gx, gy, float(other.x), float(other.y))
             if d < need:
                 reason = (
                     f"a cube sits {d:.0f}mm from the grasp point, inside the "
-                    f"{need:.0f}mm the jaws need across a {obj.short_mm:.0f}mm object"
+                    f"{need:.0f}mm the jaws need across a {gw:.0f}mm grip"
                 )
                 break
+    if reason is None and calib is not None and plan is not None:
+        # The planned point can sit well off the centroid, so it needs the same
+        # region test the centroid got -- an in-region object with an
+        # out-of-region grasp is not pickable.
+        moved = work_region_block_reason(gx, gy, calib)
+        if moved is not None:
+            reason = f"the best grip on it is at ({gx:.0f}, {gy:.0f}), where {moved}"
     period = (
         YAW_PERIOD_SQUARE
         if is_compact(obj.long_mm, obj.short_mm)
         else YAW_PERIOD_LONG_AXIS
     )
+    # Measured colour first, then the noun -- the same shape a cube's label has
+    # ("green cube"), and for the same reason: the first word is something the
+    # detector established and the rest is what the thing is called.
+    #
+    # Before this, an object's label was only the noun(s) a language model had
+    # grounded, and `instruct.instruction_attributes` pools its vocabulary from
+    # every entity's label. Those two rules are exact complements, so any
+    # adjective shared with another entity became a REQUIREMENT this object
+    # could never satisfy: "pick up the green statue" with a green cube on the
+    # desk harvested {green, statue}, and the statue's label was "statue".
+    # Measured live 2026-08-03 -- refused every time, not intermittently.
+    label = f"{obj.color} {obj.label}" if obj.color else obj.label
     return Entity(
         id=ref if isinstance(ref, str) else f"obj_{ref}",
         kind=KIND_OBJECT,
-        label=obj.label,
-        x=float(obj.x),
-        y=float(obj.y),
+        label=label,
+        color=obj.color,
+        # The grasp point, not the silhouette centroid. This is where the arm
+        # goes, so it is what the entity must report -- otherwise the plan and
+        # the motion disagree and only the arm finds out.
+        x=float(gx),
+        y=float(gy),
         pixel=(float(obj.px), float(obj.py)),
-        yaw_deg=float(obj.axis_yaw_deg),
+        yaw_deg=float(obj.axis_yaw_deg if plan is None else plan.yaw_deg),
         yaw_period_deg=period,
         pickable=reason is None,
         placeable=False,
@@ -530,4 +645,5 @@ def object_entity(
         source="vlm",
         extent_mm=(float(obj.long_mm), float(obj.short_mm)),
         confidence=float(obj.confidence),
+        grip_mm=None if plan is None else float(plan.width_mm),
     )

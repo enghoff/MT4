@@ -544,7 +544,11 @@ def test_infeasible_wider_than_the_jaws_open() -> None:
     ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=40.0), calib)
     assert ok
     ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=80.0), calib)
-    assert not ok and "wider than jaws" in reason
+    assert not ok
+    # The wording comes from locate.jaw_span_block_reason, the one place the
+    # width test lives now -- entities.object_entity shares it, so the policy
+    # loop and the MCP server cannot disagree about what the jaws can hold.
+    assert "80mm" in reason and "64mm" in reason
 
 
 def test_too_open_check_is_skipped_when_uncalibrated() -> None:

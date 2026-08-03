@@ -257,6 +257,76 @@ def _robot_edge_yaw_deg(
     return math.degrees(math.atan2(dy, dx))
 
 
+# A colour must own this much of the sampled pixels to be claimed, and beat the
+# runner-up by this margin. Both are deliberately blunt: the answer this
+# function must get right is "I don't know", not "which of two greens". A
+# stapler is grey plastic and chrome and matches nothing; a two-tone toy
+# matches two things weakly; wood desk leaking into a loose mask matches
+# nothing. All three have to come back None, because the caller turns a colour
+# into a word that a task is then *refused* against.
+COLOR_MIN_SHARE = 0.35
+COLOR_MARGIN = 0.15
+
+
+def classify_color(
+    frame: np.ndarray,
+    mask: np.ndarray | None = None,
+    origin: tuple[int, int] = (0, 0),
+    calibration: Calibration | None = None,
+) -> str | None:
+    """Which named colour is this region, or None when it is not clearly one.
+
+    The **same** named HSV bands ``detect_cubes`` uses, including any override
+    in ``Calibration.color_ranges``, so "green" means one measured thing across
+    the whole stack rather than one thing for a cube and another for a statue.
+    That shared meaning is the entire point: ``instruct`` refuses a task when a
+    named colour contradicts an entity's own, and a colour word that meant
+    something slightly different for registered objects would refuse correct
+    answers instead.
+
+    ``mask`` is the object's silhouette (as ``locate`` stores it) with its
+    top-left at ``origin`` in frame pixels. Without one, the middle of ``frame``
+    is sampled instead -- a detector box's centre is overwhelmingly object,
+    and anything the desk leaks in matches no band and pushes the answer
+    toward None, which is the safe direction.
+    """
+    ranges: dict[str, list] = dict(COLOR_RANGES)
+    if calibration is not None:
+        ranges.update(calibration.color_ranges)
+
+    if mask is not None and mask.size:
+        h, w = mask.shape[:2]
+        x0, y0 = int(origin[0]), int(origin[1])
+        crop = frame[y0 : y0 + h, x0 : x0 + w]
+        if crop.shape[:2] != (h, w):  # mask ran off the frame edge
+            mask = mask[: crop.shape[0], : crop.shape[1]]
+        sel = mask.astype(bool)
+    else:
+        h, w = frame.shape[:2]
+        # Central half by each side, i.e. the middle quarter by area.
+        crop = frame[h // 4 : h - h // 4, w // 4 : w - w // 4]
+        sel = np.ones(crop.shape[:2], dtype=bool)
+    if crop.size == 0 or not sel.any():
+        return None
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    total = int(sel.sum())
+    shares: dict[str, float] = {}
+    for color, bands in ranges.items():
+        hit = np.zeros(hsv.shape[:2], dtype=bool)
+        for lo, hi in bands:
+            hit |= cv2.inRange(hsv, np.array(lo), np.array(hi)).astype(bool)
+        shares[color] = float((hit & sel).sum()) / total
+
+    ranked = sorted(shares.items(), key=lambda kv: kv[1], reverse=True)
+    if not ranked or ranked[0][1] < COLOR_MIN_SHARE:
+        return None
+    runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+    if ranked[0][1] - runner_up < COLOR_MARGIN:
+        return None
+    return ranked[0][0]
+
+
 def detect_cubes(
     frame: np.ndarray,
     calibration: Calibration | None = None,

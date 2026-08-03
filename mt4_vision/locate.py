@@ -47,6 +47,7 @@ import cv2
 import numpy as np
 
 from mt4_vision.calib import Calibration
+from mt4_vision.detect import classify_color
 from mt4_vision.wrist import j4_for_long_axis
 from mt4_vision.workspace import (
     MAX_REACH_MM,
@@ -116,6 +117,35 @@ class LocatedObject:
     # BGR crop around the object, for re-acquiring it in a later frame.
     template: np.ndarray = field(repr=False, default_factory=lambda: np.zeros((1, 1, 3), np.uint8))
     mask_area_px: float = 0.0
+    # The silhouette itself, and where its top-left sits in the full frame.
+    # Kept because ``long_mm``/``short_mm`` describe the whole outline and say
+    # nothing about the width at any particular point on it -- which is the
+    # only question that decides whether the jaws can close. See
+    # ``mt4_vision.grasp``. Empty when the measurement predates this field.
+    mask: np.ndarray = field(
+        repr=False, default_factory=lambda: np.zeros((0, 0), np.uint8)
+    )
+    mask_origin_px: tuple[int, int] = (0, 0)
+    # Measured colour, from the same named HSV bands the cube detector uses, or
+    # None when the object is not clearly one of them. Distinct from anything in
+    # ``label``: the label is the noun a language model supplied, this is a
+    # measurement. Keeping them apart is what lets ``instruct`` tell "the task
+    # says green and this thing is red" (a real contradiction, refuse) from
+    # "the task says green and nobody has established what colour this is"
+    # (unknowable, abstain). Conflating those refused "the green statue" on a
+    # desk that had a green statue on it -- see entities.object_entity.
+    color: str | None = None
+
+    def footprint_offset_mm(self, calib) -> tuple[float, float]:
+        """Height correction applied to the centroid, as a plane offset.
+
+        ``x``/``y`` are unprojected at the object's assumed height; the mask is
+        in raw pixels. Grasp planning maps mask pixels through the table plane
+        and then shifts them by this, so a planned point lands in the same
+        frame of reference the rest of the stack uses for this object.
+        """
+        rx, ry = calib.pixel_to_robot(self.px, self.py)
+        return self.x - float(rx), self.y - float(ry)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -179,14 +209,8 @@ def marker_paper_mask(
     return out.astype(bool)
 
 
-def _segment(
-    frame: np.ndarray,
-    px: float,
-    py: float,
-    win: int,
-    exclude: np.ndarray | None,
-) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
-    """Foreground component under the hint, by deviation from the local desk.
+def desk_deviation(crop: np.ndarray, kernel: int = BG_MEDIAN_KERNEL_PX) -> np.ndarray:
+    """Per-pixel distance from the locally-estimated desk, in weighted Lab units.
 
     The desk is estimated *locally*, with a large median filter, rather than as
     one colour with a tolerance. That matters more than any threshold choice:
@@ -196,7 +220,36 @@ def _segment(
     half the desk). A local estimate absorbs the gradient and soft shadows into
     the background, leaving only what is small and high-frequency -- an object.
 
-    The split then comes from Otsu on the deviation map, so there is no tuned
+    Consequently the method is indifferent to what colour the desk is, and to
+    wood grain, gradients and soft shadows. What it *is* sensitive to is scale:
+    anything wider than ``BG_MEDIAN_KERNEL_PX`` survives its own background
+    estimate and disappears. That is the real scope limit, not desk uniformity.
+
+    Shared by :func:`_segment` (one window around a hint) and
+    :mod:`mt4_vision.discover` (the whole desk, no hint), so the two cannot
+    drift into different definitions of "unlike the desk". ``kernel`` is
+    exposed for discover's coarse second pass, which deliberately probes a
+    much larger scale to recognise structures too big for the default one;
+    every other caller should leave it alone.
+    """
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    desk = cv2.medianBlur(lab, int(kernel) | 1)
+    scale = np.array([L_WEIGHT, 1.0, 1.0], np.float32)
+    return np.linalg.norm(
+        (lab.astype(np.float32) - desk.astype(np.float32)) * scale, axis=2
+    )
+
+
+def _segment(
+    frame: np.ndarray,
+    px: float,
+    py: float,
+    win: int,
+    exclude: np.ndarray | None,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """Foreground component under the hint, by deviation from the local desk.
+
+    The split comes from Otsu on :func:`desk_deviation`, so there is no tuned
     colour tolerance to go stale when the lighting changes.
     """
     x0, y0, x1, y1 = _window(frame, px, py, win)
@@ -206,12 +259,7 @@ def _segment(
     hx = max(0, min(int(round(px)) - x0, crop.shape[1] - 1))
     hy = max(0, min(int(round(py)) - y0, crop.shape[0] - 1))
 
-    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-    desk = cv2.medianBlur(lab, BG_MEDIAN_KERNEL_PX)
-    scale = np.array([L_WEIGHT, 1.0, 1.0], np.float32)
-    dev = np.linalg.norm(
-        (lab.astype(np.float32) - desk.astype(np.float32)) * scale, axis=2
-    )
+    dev = desk_deviation(crop)
 
     ex = (
         exclude[y0 : y0 + crop.shape[0], x0 : x0 + crop.shape[1]]
@@ -340,7 +388,33 @@ def _segment_grabcut(
     if exclude is not None:
         ex = exclude[cy0:cy1, cx0:cx1]
         if ex.shape[:2] == gc.shape:
-            gc[ex.astype(bool)] = cv2.GC_BGD
+            paper = ex.astype(bool)
+            inside = np.zeros_like(paper)
+            inside[ly0:ly1, lx0:lx1] = True
+            # Outside the detector box, marker paper is background and that is
+            # the end of it.
+            gc[paper & ~inside] = cv2.GC_BGD
+            # Inside the box it is only a PRIOR. The mask is geometric -- a
+            # quad around each marker's calibrated position -- so it cannot
+            # tell paper from something lying on top of paper, and the box is
+            # a strong statement that the object is right here.
+            #
+            # Measured 2026-08-02: the stapler was resting ON marker 0's paper
+            # (the arm had placed it there). The exclusion covered 53.8% of
+            # Qwen's box, including the stapler itself, so GrabCut found no
+            # foreground at all -- 8 grounding calls out of 8. Every
+            # measurement then fell through to the raw box, reporting the
+            # AABB's dimensions as the object's: 150x74mm for a stapler, with
+            # no silhouette for grasp planning to use.
+            #
+            # GC_PR_BGD lets GrabCut reclaim pixels its colour model says are
+            # not paper, which is exactly the object on top of it, while still
+            # steering it away from the high-contrast black-and-white tag that
+            # made this exclusion necessary in the first place.
+            gc[paper & inside] = cv2.GC_PR_BGD
+            # The sure-FG seed has to survive: it is the only thing telling
+            # GrabCut what the object's colour actually is.
+            cv2.circle(gc, (hx, hy), r, int(cv2.GC_FGD), thickness=-1)
 
     bgd = np.zeros((1, 65), np.float64)
     fgd = np.zeros((1, 65), np.float64)
@@ -561,6 +635,17 @@ def _object_from_mask(
         height_mm=height,
         template=np.ascontiguousarray(frame[y0 : y0 + th, x0 : x0 + tw]),
         mask_area_px=float(mask.sum()),
+        # Carried so grasp planning can ask about the width at a *point* on the
+        # object. long_mm/short_mm describe the whole outline and cannot answer
+        # that -- see mt4_vision.grasp.
+        mask=np.ascontiguousarray(mask.astype(np.uint8)),
+        mask_origin_px=(int(x0), int(y0)),
+        # Through the silhouette, not the bounding box: the box around anything
+        # elongated is mostly desk, and desk matches no band, which would drag
+        # every honest colour under COLOR_MIN_SHARE.
+        color=classify_color(
+            frame, mask.astype(np.uint8), (int(x0), int(y0)), calib
+        ),
     )
 
 
@@ -767,6 +852,10 @@ def measure_box(
         height_mm=height,
         template=np.ascontiguousarray(frame[iy0:iy1, ix0:ix1]),
         mask_area_px=float((xb - xa) * (yb - ya)),
+        # No silhouette on this path, so the box interior stands in -- see
+        # classify_color. Desk showing at the box edges only makes the answer
+        # None, never a wrong colour.
+        color=classify_color(frame[iy0:iy1, ix0:ix1], calibration=calib),
     )
 
 
@@ -874,9 +963,43 @@ def relocate(
     that merely rotated the object returns None too, which reads as success. Ask
     instead whether the place it used to occupy still looks unlike bare desk.
     """
+    again, _why = relocate_detail(
+        frame, obj, calib, search_px=search_px, min_score=min_score,
+        win=win, marker_xy=marker_xy,
+    )
+    return again
+
+
+def relocate_detail(
+    frame: np.ndarray,
+    obj: LocatedObject,
+    calib: Calibration,
+    *,
+    search_px: int = RELOCATE_SEARCH_PX,
+    min_score: float = RELOCATE_MIN_SCORE,
+    win: int = DEFAULT_WINDOW_PX,
+    marker_xy: Sequence[tuple[float, float]] = (),
+) -> tuple[LocatedObject | None, str]:
+    """:func:`relocate`, plus which of its four failures happened.
+
+    The reason matters because they call for opposite responses. "It moved" is
+    a scene problem the caller should report; "found it, could not re-measure
+    it" is ours, and telling a user their stationary stapler moved sends them
+    looking at the desk instead of at the code. Measured 2026-08-02: a stapler
+    that had not moved template-matched at **0.993** on the identical pixel and
+    was still refused, because the re-measure below used to be the plain
+    desk-deviation :func:`measure`, which cannot segment that stapler at all.
+
+    **The re-measure now runs through the matched template's own bounds.**
+    That box is a tight, true outline of the object in this frame -- it is the
+    crop the object was registered from, found again -- so it seeds GrabCut
+    exactly the way a detector box does. Without it, any object that only
+    GrabCut could find in the first place was permanently un-re-acquirable:
+    registration succeeded, and every attempt to act on it was refused.
+    """
     th, tw = obj.template.shape[:2]
     if th < 2 or tw < 2:
-        return None
+        return None, "no usable template was stored for this object"
     h, w = frame.shape[:2]
     x0 = max(0, int(obj.px) - tw // 2 - search_px)
     y0 = max(0, int(obj.py) - th // 2 - search_px)
@@ -884,20 +1007,29 @@ def relocate(
     y1 = min(h, int(obj.py) + th // 2 + search_px)
     region = frame[y0:y1, x0:x1]
     if region.shape[0] < th or region.shape[1] < tw:
-        return None
+        return None, (
+            f"the {tw}x{th}px template does not fit the search area at the "
+            "frame edge"
+        )
     scores = cv2.matchTemplate(region, obj.template, cv2.TM_CCOEFF_NORMED)
     _minv, maxv, _minl, maxl = cv2.minMaxLoc(scores)
     if maxv < min_score:
-        return None
-    hint_x = x0 + maxl[0] + tw / 2.0
-    hint_y = y0 + maxl[1] + th / 2.0
-    try:
-        return measure(
-            frame, hint_x, hint_y, calib, obj.label,
-            win=win, confidence=float(maxv), marker_xy=marker_xy,
+        return None, (
+            f"best template match {maxv:.2f} is under {min_score:.2f} -- it "
+            "moved, rotated, or something is over it"
         )
-    except LocateError:
-        return None
+    bx0, by0 = x0 + maxl[0], y0 + maxl[1]
+    box = (float(bx0), float(by0), float(bx0 + tw), float(by0 + th))
+    hint_x, hint_y = bx0 + tw / 2.0, by0 + th / 2.0
+    try:
+        return measure_with_box_fallback(
+            frame, hint_x, hint_y, calib, obj.label,
+            box=box, win=win, confidence=float(maxv), marker_xy=marker_xy,
+        ), ""
+    except LocateError as exc:
+        return None, (
+            f"matched it at {maxv:.2f} but could not re-measure it: {exc}"
+        )
 
 
 def grasp_feasibility(
@@ -913,17 +1045,78 @@ def grasp_feasibility(
     region = work_region_block_reason(obj.x, obj.y, calib)
     if region is not None:
         return False, region
-    span_open = _span_mm(calib, int(calib.grip_open_s))
-    if span_open is not None and obj.short_mm > span_open:
-        return False, (
-            f"wider than jaws ({obj.short_mm:.0f}>{span_open:.0f}mm)"
-        )
+    span = jaw_span_block_reason(obj.short_mm, calib)
+    if span is not None:
+        return False, span
     if is_compact(obj.long_mm, obj.short_mm):
         # Near-square: jaw orientation is not load-bearing (90° period).
         return True, None
     if j4_for_long_axis(obj.axis_yaw_deg, x=obj.x, y=obj.y) is None:
         return False, "no J4 angle in soft limits"
     return True, None
+
+
+def plan_object_grasp(obj: LocatedObject, calib: Calibration):
+    """Best jaw placement on ``obj``, or (None, why not).
+
+    Falls back to the outline when no silhouette was stored -- ``measure_box``
+    has no mask, and neither do objects measured before the mask was carried --
+    so the answer degrades to the old "close across the short axis at the
+    centroid" rather than to a refusal.
+    """
+    from mt4_vision.grasp import GraspPlan, footprint_mm, plan_grasp
+
+    span = _span_mm(calib, int(calib.grip_open_s))
+    if span is None:
+        # Nothing to plan against. Keep the historical behaviour rather than
+        # inventing a jaw width -- see jaw_span_block_reason.
+        return GraspPlan(
+            x=obj.x, y=obj.y, yaw_deg=obj.axis_yaw_deg,
+            width_mm=obj.short_mm, length_mm=obj.long_mm, offset_mm=0.0,
+        ), ""
+    mask = getattr(obj, "mask", None)
+    if mask is None or getattr(mask, "size", 0) == 0:
+        reason = jaw_span_block_reason(obj.short_mm, calib)
+        if reason is not None:
+            return None, reason
+        return GraspPlan(
+            x=obj.x, y=obj.y, yaw_deg=obj.axis_yaw_deg,
+            width_mm=obj.short_mm, length_mm=obj.long_mm, offset_mm=0.0,
+        ), ""
+    pts = footprint_mm(
+        obj.mask, obj.mask_origin_px, calib,
+        offset_mm=obj.footprint_offset_mm(calib),
+    )
+    return plan_grasp(pts, max_span_mm=span)
+
+
+def jaw_span_block_reason(short_mm: float, calib: Calibration) -> str | None:
+    """"Too wide for the jaws" in prose, or None. The single width test.
+
+    Lives here so ``grasp_feasibility`` (CLI, MCP server) and
+    ``entities.object_entity`` (the policy loop) cannot drift into two
+    different answers about whether the arm can hold something -- which they
+    had, because ``object_entity`` had no width test at all.
+
+    Silent when ``grip_span_s_*`` are unmeasured, which is a deliberate
+    fail-open: inventing a jaw width would refuse real objects on a rig whose
+    gripper nobody has measured. It is not a safe default, only the least
+    wrong one, and it is why measuring the span matters. Measured on this rig
+    2026-08-02 by photographing the jaws at table height across S 140..230:
+    ``span_mm = (205.0 - S) / 1.797``, so 36mm at ``grip_open_s`` = 140.
+
+    Note ``short_mm`` is a *silhouette* width and reads wide for anything with
+    height on this oblique mount, so the comparison already errs toward
+    refusing. That is the right direction: closing on air is the failure with
+    no detector.
+    """
+    span_open = _span_mm(calib, int(calib.grip_open_s))
+    if span_open is None or short_mm <= span_open:
+        return None
+    return (
+        f"it measures {short_mm:.0f}mm across the grasp and the jaws open to "
+        f"{span_open:.0f}mm -- they would close beside it, not on it"
+    )
 
 
 def _span_mm(calib: Calibration, s: int) -> float | None:
