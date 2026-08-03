@@ -646,26 +646,96 @@ def draw_mask(
     return float(on.sum()) / float(on.size)
 
 
-def wrap_text(text: str, *, max_px: int, scale: float) -> list[str]:
+def wrap_text(
+    text: str, *, max_px: int, scale: float, hard_break: bool = False,
+) -> list[str]:
     """Greedy word wrap, measured in the font that will actually draw it.
 
     Wrapping on a character count is wrong here: the reasons this displays are
     model prose of no fixed width, and ``draw_outlined_text``'s Hershey font is
     not monospaced. ``getTextSize`` is the only thing that knows.
+
+    ``hard_break`` additionally splits a single word too long to fit on any
+    line, and keeps blank lines between paragraphs. Off by default because a
+    caption over a camera frame has the whole frame width to work with and
+    never hits either case; a narrow side panel showing ids, file paths and
+    raw model output hits both, and without it an over-long token is drawn
+    straight off the edge of the panel rather than wrapped.
     """
     font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def width(s: str) -> int:
+        return cv2.getTextSize(s, font, scale, 1)[0][0]
+
     lines: list[str] = []
-    current = ""
-    for word in text.split():
-        trial = word if not current else f"{current} {word}"
-        if not current or cv2.getTextSize(trial, font, scale, 1)[0][0] <= max_px:
-            current = trial
-        else:
+    for para in (text.split("\n") if hard_break else [text]):
+        words = para.split()
+        if not words and hard_break:
+            lines.append("")
+            continue
+        current = ""
+        for word in words:
+            if hard_break:
+                # Chop anything that will never fit on a line of its own,
+                # rather than letting cv2 clip it at the edge of the image.
+                # This runs BEFORE the fits-on-this-line test, because the
+                # greedy rule below accepts any word onto an empty line
+                # unconditionally -- so an over-long word arriving first would
+                # otherwise sail straight past the split and off the panel.
+                while width(word) > max_px and len(word) > 1:
+                    if current:
+                        lines.append(current)
+                        current = ""
+                    cut = len(word)
+                    while cut > 1 and width(word[:cut]) > max_px:
+                        cut -= 1
+                    lines.append(word[:cut])
+                    word = word[cut:]
+            trial = word if not current else f"{current} {word}"
+            if not current or width(trial) <= max_px:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+        if current:
             lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
     return lines
+
+
+def draw_inset(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    tag: str,
+    *,
+    width_px: int = 208,
+    margin: int = 12,
+) -> None:
+    """Drop a small labelled thumbnail into ``canvas``' bottom-right corner.
+
+    What it is for: the main pane of an interactive harness shows a *held*
+    frame -- the one a model answered about, seconds ago -- and the question
+    "is the camera still seeing what I think it is" cannot be answered from
+    that picture at all. The inset is the live feed, so the stale main pane
+    and the current scene are on screen together and can never be confused.
+
+    A no-op when the canvas is too small to take the thumbnail, rather than an
+    exception: this draws on a preview, and a preview that raises is worse
+    than one missing a corner.
+    """
+    h, w = frame.shape[:2]
+    if w <= 0 or h <= 0:
+        return
+    tw = width_px
+    th = max(1, int(round(h * tw / w)))
+    ch, cw = canvas.shape[:2]
+    x0, y0 = cw - tw - margin, ch - th - margin
+    if x0 < 0 or y0 < 0:
+        return
+    canvas[y0 : y0 + th, x0 : x0 + tw] = cv2.resize(
+        frame, (tw, th), interpolation=cv2.INTER_AREA
+    )
+    cv2.rectangle(canvas, (x0 - 1, y0 - 1), (x0 + tw, y0 + th), (220, 220, 220), 1)
+    draw_outlined_text(canvas, tag, (x0 + 6, y0 + 18), scale=0.5, color=(220, 220, 220))
 
 
 def draw_caption(
