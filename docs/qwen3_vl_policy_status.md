@@ -1463,6 +1463,118 @@ pins the case with the live numbers so a future fix has something to aim at.
 
 ---
 
+### 2x. The coordinate space was backwards — the model always answers 0-1000, and it is accurate
+
+§2w reported the model's boxes as 88-300px from truth and concluded localisation
+was the deeper problem. **That was wrong, and it was our arithmetic.** Checking
+what Qwen document and what other integrations do settled it in one step.
+
+#### What the vendor and the field actually do
+
+Qwen3-VL emits **0-1000 normalized** coordinates and nothing else. The official
+`cookbooks/spatial_understanding.ipynb` plotting helper is unambiguous:
+
+```python
+abs_x1 = int(point[0])/1000 * width
+abs_y1 = int(point[1])/1000 * height
+```
+
+Scaled **per axis against the original image size** — two different factors on a
+non-square frame. Third-party integrations do the same thing
+([debuggercafe](https://debuggercafe.com/grounding-qwen3-vl-detection-with-sam2/):
+`x1 = int(box[0] / 1000 * w)`), and the DeepWiki reference for the repo states it
+outright. The official prompts say nothing about coordinate spaces at all --
+"Locate the free space on the white table on the right in this image. Output the
+point coordinates in JSON format."
+
+Our prompt did the opposite: it drew a numbered pixel grid, printed every tag's
+position in pixels as a worked example, and said "Do not normalize or rescale."
+None of that changed what came back. It only made us read it wrongly.
+
+#### Measured, 3 targets x 2 prompt styles, one 1280x720 frame
+
+Ours = grid overlay + the decision prompt. Official = raw frame + "Locate X in
+this image. Report bbox coordinates in JSON format." Truth for the tag is exact
+(ArUco decoded it); the other two are hand-read off the grid, so +/-15px.
+
+| target | style | read as pixels | read as 0-1000 |
+|---|---|---|---|
+| blue cube (457, 627) | ours | (359, 872) **264px** | (460, 628) **3px** |
+| blue cube | official | (358, 874) **266px** | (458, 629) **2px** |
+| stapler (1140, 487) | ours | (901, 677) **305px** | (1153, 487) **13px** |
+| stapler | official | (900, 681) **309px** | (1152, 490) **12px** |
+| tag, true (722, 587) | ours | (361, 548) 363px | (462, 395) 323px |
+| tag | official | (564, 812) 276px | (721, 585) **2px** |
+
+**6 of 6 replies are 0-1000.** Read that way the model is 2-13px from truth on
+a task it understands. Read as pixels it is 264-363px out, every time.
+
+The prompt style makes no difference to accuracy (3 vs 2px, 13 vs 12px), so the
+grid overlay is neither helping nor hurting and stays for the human preview. The
+one bad row is ours on "pick up the printed square tag nearest the bottom",
+which is a strange thing to ask a pick-and-place prompt; the minimal prompt
+answered the same question to 2px.
+
+#### What changed
+
+`box_readings` and `point_readings` now lead with the normalized reading and
+keep raw pixels as the retry. `build_prompt` asks for the 0-1000 space and
+prints tag positions in it, so the prompt and the parser finally agree.
+
+Live check afterwards, "put the blue cube on marker 3": box (413, 592)-(509,
+671) against a cube spanning (415, 590)-(500, 665) -- **5px on the centre**, one
+step, correct destination.
+
+#### What this retracts from 2w
+
+The "88-222px localisation error" table and "the model returned the same box for
+two different objects" were both computed from the pixel reading. The wrong-
+target hazard 2w describes is **real** and still open -- both readings can land
+on separate real objects and the retry only fires when the leading one fails --
+but it is now a much smaller target, because the leading reading is the one the
+model means. The three in-reply disambiguation attempts remain failures and
+remain reverted; the fix was to stop misreading, not to add a check.
+
+---
+
+### 2y. Table-height grip: measured, and out of tolerance for cubes
+
+§2v took `object_height_mm=0` on every pick -- grip at `table_z`, at the
+table-plane projection of the mask centroid -- and recorded the trade as
+**unvalidated**, because there was no cube on the desk to validate against.
+There is now.
+
+Six HSV cube detections, each measured through the pick path and compared with
+`cube_top_homography`, which is empirically fitted against the arm:
+
+| colour | HSV truth (mm) | `h=0` gap | `h` inferred gap |
+|---|---|---|---|
+| blue | (254.7, -94.7) | **20.6** | 6.8 |
+| blue | (177.1, -303.9) | **15.8** | 7.7 |
+| red | (22.6, -419.0) | **18.4** | 43.2 |
+| red | (171.2, -204.5) | 9.0 | 2.7 |
+| blue | (75.4, -302.1) | **13.9** | 5.9 |
+| blue | (162.6, -10.4) | **24.5** | 14.1 |
+
+Jaw tolerance is about **±10 mm**. The table-height grip is outside it on 5 of
+6, mean ~17 mm, worst 24.5 mm, and always in the predicted direction -- the
+silhouette centroid sits outward of the footprint by roughly the object's height
+times `_parallax_gain` (1.4-2.0 here). The prediction written into
+`PICK_AT_TABLE_HEIGHT_MM` ("up to ~30 mm outward for a 20 mm cube") holds.
+
+The height-inferring path is better on 5 of 6 (2.7-14.1 mm) and catastrophically
+worse on one (43.2 mm), which is the axis-dependence the Phase 0 gate found.
+
+So neither path is reliable for a 20 mm cube, and the table-height grip is the
+more consistently wrong of the two *for tall compact objects specifically*. It
+should still be the better choice for something flat, which is what it was
+chosen for, but that has not been measured -- there is no flat object with an
+independent ground truth on this desk.
+
+**This is a live decision, not a settled one.** See §5.
+
+---
+
 ## 3. Are we cube-agnostic? The policy layer is; enumeration still is not
 
 Rewritten after §2v. The previous verdict was "2 of 3, and the missing one is
@@ -1766,13 +1878,16 @@ and it is purely about safety:
   `object_entity`'s clearance check, `free_markers` and `free_placement_slots`
   would finally see a pen as an obstacle rather than as empty desk.
 
-**Does the table-height grip hold up on hardware?** §2v traded a height
-estimator that was measurably wrong (7.2-32.3 mm inferred for 20 mm objects) for
-a fixed assumption that is wrong in a known direction: a silhouette centroid
-sits outward of the true footprint by roughly height × 1.4-2.0, so a 20 mm cube
-is aimed up to ~30 mm outward and a flat object is aimed almost exactly. Against
-a ~±10 mm jaw tolerance, that predicts cubes getting *worse* and flat things
-getting better. Nobody has measured it. If cubes start being shoved, the choice
-is between reinstating height inference for compact objects only — a cube
-special case in the geometry layer, invisible to the model — and fixing the
-estimator's axis dependence properly.
+**Does the table-height grip hold up on hardware? Measured in §2y: not for
+cubes.** Against `cube_top_homography` on six detections it is 9.0-24.5 mm out,
+mean ~17, outside the ~±10 mm jaw tolerance on 5 of 6, always outward as
+predicted. The height-inferring path is better on 5 of 6 (2.7-14.1 mm) and 43.2
+mm out on the sixth. So the choice is now between three things, and it is yours:
+
+- *Keep it.* Simple, one path, and it is the right call for flat objects — which
+  is what it was chosen for, and which nothing has measured yet.
+- *Route compact objects to `cube_top_homography` after measuring.* A cube
+  special case living in the geometry layer, invisible to the model, worth ~14 mm
+  on the numbers above.
+- *Fix `_assumed_height_mm`'s axis dependence* and use one general path. The
+  most work, and the only option that ends with a single answer.

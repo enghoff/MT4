@@ -47,18 +47,18 @@ def to_frame_pixels(
     Takes a point ``(x, y)`` or a box ``(x1, y1, x2, y2)`` -- even indices are
     x, odd are y -- and returns the same shape.
 
-    **An unanchored coordinate from this build is 0-1000 normalized**, whatever
-    the prompt asks for, so that is what this scales. ``build_prompt`` draws a
-    numbered pixel grid on the frame and asks for pixels, which pulls the reply
-    towards pixels but does not settle it -- so neither reading is discarded.
-    :func:`point_readings` and :func:`box_grounding` keep both, pixels leading.
+    **A coordinate from this model is 0-1000 normalized**, scaled per axis
+    against the ORIGINAL frame size -- ``x * w / 1000``, ``y * h / 1000``, which
+    for a non-square frame is two different factors. That is what Qwen document
+    (``cookbooks/spatial_understanding.ipynb``) and what every third-party
+    write-up does, and it is what this measures: over 3 targets x 2 prompt
+    styles on one 1280x720 frame, the normalized reading lands 2-13px from truth
+    and the raw-pixel reading 264-363px away, 6 times out of 6.
 
     The only reading the numbers alone can rule out is normalized, since nothing
     normalized exceeds ``COORD_SCALE``. A coordinate above it is therefore
-    pixels and is passed through; everything else is scaled. That leaves a blind
-    spot -- a true pixel answer whose coordinates all fall under 1000 -- which
-    is why :func:`point_readings` and :func:`box_readings` return both and let
-    a failed measurement retry with the other.
+    pixels and is passed through; everything else is scaled. Raw pixels survive
+    as a retry, not a default -- see :func:`point_readings`.
     """
     values = [float(c) for c in coords]
     if any(abs(v) > COORD_SCALE for v in values):
@@ -73,10 +73,11 @@ def point_readings(
 ) -> tuple[tuple[float, float], ...]:
     """Both in-frame readings of a **decision** reply's point, pixels first.
 
-    Used for ``dest_2d``, the one bare point left in the protocol. Pixels lead
-    because ``build_prompt`` draws the grid in that space and says so, but only
-    lead: both readings come back, and the caller tries the second when the
-    first fails its own physical test rather than choosing between them here.
+    Used for ``dest_2d``, the one bare point left in the protocol. The
+    normalized reading leads because that is the space this model answers in --
+    see :func:`to_frame_pixels` for the measurement. Raw pixels are kept as a
+    retry rather than dropped: a coordinate is only *probably* normalized, and
+    the retry costs a segmentation attempt where being wrong costs a grasp.
 
     Readings outside the frame are dropped, and a coordinate above
     ``COORD_SCALE`` rules normalized out, leaving a single reading.
@@ -96,9 +97,9 @@ def point_readings(
         if candidate not in out:
             out.append(candidate)
 
-    keep((values[0], values[1]))
     scaled = to_frame_pixels(values, size)
     keep((float(scaled[0]), float(scaled[1])))
+    keep((values[0], values[1]))
     return tuple(out)
 
 
@@ -135,18 +136,17 @@ class Grounding:
 def box_readings(
     coords: Sequence[float], size: tuple[int, int]
 ) -> tuple[tuple[float, ...], ...]:
-    """Both in-frame readings of a **decision** reply's box, pixels first.
+    """Both in-frame readings of a **decision** reply's box, normalized first.
 
     The box counterpart of :func:`point_readings`, ordered the same way on
     purpose: one prompt asks for both a box and a point, so one convention has
     to answer for both, and a reader should not have to remember which field
     follows which rule.
 
-    Pixels lead because ``build_prompt`` draws a numbered pixel grid and asks
-    for pixels. They only lead: ``measure_grounding`` tries the normalized
-    reading when the first fails to segment, and that retry is what a run
-    depends on when the reply comes back normalized -- measured at 8 of 8 on
-    one sweep, 206-285px from truth if read as pixels.
+    The 0-1000 reading leads because that is the space this model answers in
+    whatever the prompt asks -- measured at 2-13px from truth against 264-363px
+    for the raw-pixel reading, 6 of 6. Raw pixels stay as the retry that
+    ``measure_grounding`` tries when the first reading will not segment.
 
     A reading whose centre falls outside the frame is dropped, and a coordinate
     above ``COORD_SCALE`` rules normalized out, leaving a single reading.
@@ -166,11 +166,11 @@ def box_readings(
             out.append(vals)
 
     values = [float(c) for c in coords]
-    if not any(abs(v) > COORD_SCALE for v in values):
-        # Nothing normalized exceeds COORD_SCALE, so above it the raw reading is
-        # the only possible one and to_frame_pixels passes it through unscaled.
-        keep(values)
     keep(to_frame_pixels(values, size))
+    if not any(abs(v) > COORD_SCALE for v in values):
+        # Above COORD_SCALE the raw reading is the only possible one, and
+        # to_frame_pixels has already passed it through unscaled.
+        keep(values)
     return tuple(out)
 
 

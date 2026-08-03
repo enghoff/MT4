@@ -44,33 +44,25 @@ the yaw of that mask's long axis. So ``object_height_mm=0`` on every
 measurement, and no step of a pick depends on how tall the thing is. What that
 trades is stated where it is paid: :data:`PICK_AT_TABLE_HEIGHT_MM`.
 
-**Coordinates.** ``build_prompt`` asks for pixels and draws the grid the model
-reads them off, but this build answers 0-1000 normalized often enough that both
-readings are kept. :func:`point_readings` and :func:`box_readings` return both,
-pixels first; a measurement that fails under the first is retried under the
-second, never silently preferred.
+**Coordinates are 0-1000, everywhere.** That is the space this model answers
+in, whatever a prompt asks for -- it is what Qwen document in
+``cookbooks/spatial_understanding.ipynb`` and what every third-party integration
+does -- so it is the space the prompt asks for and the space the tag positions
+are printed in. :func:`to_frame_pixels` scales per axis against the original
+frame, ``x * w / 1000`` and ``y * h / 1000``, two different factors on a
+non-square frame.
 
-**A reading that measures is not a reading that is right. This is the known
-hole in the loop and nothing here closes it.** Both conventions can land on
-real, separately measurable objects in the same frame, and the retry only fires
-when the first fails to segment -- so a box meant as 0-1000 that also resolves
-as pixels grips whatever is at those pixels. Measured on one frame: the box for
-"the stapler" resolves as pixels to the binder clip 250px away, 47x24mm, and
-passes every gate. Nothing downstream can detect it.
+Measured over 3 targets x 2 prompt styles on one 1280x720 frame: read as
+0-1000, box centres land **2-13px** from truth, 6 of 6; read as raw pixels,
+**264-363px** away. Asking for pixels does not change what comes back, so the
+loop reads what the model actually emits.
 
-Three ways of asking the reply to disambiguate itself were measured and none
-works. A ``point_2d`` beside the box agrees with the box's *pixel* reading 4
-times out of 4, including where that reading is 302px from the object and the
-other 89px, so it carries no information the box does not. Echoing a listed
-tag's position is a copy of a number the prompt prints -- 2 of 2 replies
-reproduced it exactly. Withholding that tag's position so the echo has to be
-measured degrades the whole reply: 2 of 4 boxes came back ``null`` or all
-zeroes, and the one usable echo was written 0-1000 while its box was written in
-pixels, so the fields do not even share a space reliably.
-
-What is left is the retry chain, which catches a wrong reading only when the
-wrong reading fails to segment. Anything better needs a signal from outside the
-reply.
+A raw-pixel reading is still kept and retried when the first will not segment,
+because a coordinate under 1000 is only *probably* normalized. That retry is
+also the loop's one soft spot: both readings can land on real, separately
+measurable objects, and the retry fires only when the leading one fails, so a
+reading that is wrong *and* segments is not caught. It is a much smaller target
+now that the leading reading is the one the model means.
 
 One capture per decision: :func:`observe` takes the frame, the overlay and the
 marker positions from the same exposure.
@@ -127,14 +119,19 @@ MAX_NEW_TOKENS = 220
 # section as tall as it is wide (false for anything flat), and its error lands
 # as XY displacement of up to ~28mm against the ~10mm the jaws tolerate.
 #
-# The cost, stated plainly because nothing downstream will notice it: a
-# silhouette centroid sits *outward* of the real footprint on this oblique
-# mount, by roughly the object's height times ``_parallax_gain`` (1.4-2.0 here).
-# A 20mm cube is therefore aimed at up to ~30mm outward of its true centre. A
-# flat object -- paper, a key, a card -- has almost no such error, which is the
-# case a table-height grip serves best. This is a choice of which error to
-# carry, not a tuning knob. If tall objects are shoved rather than gripped, it
-# is the first thing to revisit. Unvalidated on hardware.
+# The cost, and it is measured: a silhouette centroid sits *outward* of the real
+# footprint on this oblique mount, by roughly the object's height times
+# ``_parallax_gain`` (1.4-2.0 here). Against ``cube_top_homography`` on six cube
+# detections this path lands 9.0-24.5mm out, mean ~17, always outward -- outside
+# the ~10mm the jaws tolerate on 5 of the 6. The height-inferring path is better
+# on 5 of 6 (2.7-14.1mm) and 43.2mm out on the sixth.
+#
+# So a 20mm cube gets shoved more often than gripped, and this stays because it
+# is the right shape of error for something FLAT -- paper, a key, a card, where
+# there is no height to mis-attribute and no independent ground truth on this
+# desk to check it against. It is a choice of which error to carry, not a tuning
+# knob. Revisit it by routing compact objects to the fitted cube homography
+# after measurement, or by fixing the estimator's axis dependence.
 PICK_AT_TABLE_HEIGHT_MM = 0.0
 
 # TRANSFER leads because it is the shape of nearly every real task here: move a
@@ -331,7 +328,11 @@ def _marker_lines(obs: "Observation") -> str:
         pixel = e.pixel
         if pixel is None:
             pixel = obs.calib.robot_to_pixel(e.x, e.y)
-        rows.append(f"  {e.id} at ({pixel[0]:.0f}, {pixel[1]:.0f})")
+        w, h = obs.size
+        rows.append(
+            f"  {e.id} at ({pixel[0] * COORD_SCALE / w:.0f}, "
+            f"{pixel[1] * COORD_SCALE / h:.0f})"
+        )
     return "\n".join(rows) or "  (no tags decoded in this frame)"
 
 
@@ -395,8 +396,9 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         '{"action": "...", "box_2d": [x1, y1, x2, y2], "label": "...", '
         '"dest_marker": "marker_N", "dest_2d": [x, y], '
         '"reason": "<one short clause>"}\n\n'
-        f"Every coordinate is in PIXELS of this {w}x{h} image -- read them off "
-        "the numbered grid drawn on it. Do not normalize or rescale.\n"
+        "Every coordinate you give is on a 0-1000 scale across the image: 0 is "
+        "the left edge, 1000 the right edge, and the same top to bottom. The "
+        "tag positions above are written that way too.\n"
         "box_2d is a tight box around the WHOLE of the object to pick up. The "
         "jaws are aimed using that box, so it must contain that object and as "
         "little else as possible -- not the desk around it, and not a "

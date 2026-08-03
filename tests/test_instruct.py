@@ -93,6 +93,21 @@ def _desk(**over) -> Observation:
     )
 
 
+# Model coordinates are 0-1000 across the frame, so a fixture that wants a box
+# round a known pixel has to say so in that space.
+def _norm(px: float, py: float) -> tuple[float, float]:
+    return px * 1000.0 / FRAME_W, py * 1000.0 / FRAME_H
+
+
+def _norm_box(x1: float, y1: float, x2: float, y2: float) -> str:
+    a, b = _norm(x1, y1)
+    c, d = _norm(x2, y2)
+    return f"[{a:.4f}, {b:.4f}, {c:.4f}, {d:.4f}]"
+
+
+def _close(got, want, tol: float = 0.5) -> bool:
+    return all(abs(g - w) <= tol for g, w in zip(got, want))
+
 def _decide_on(reply_json: str, obs, instruction: str) -> Action:
     """Run the real ``decide`` against a canned model reply."""
 
@@ -183,7 +198,7 @@ def test_the_overlay_circles_only_tags(monkeypatch):
 
 def test_a_transfer_carries_a_box_and_a_tag():
     act = _decide_on(
-        '{"action": "TRANSFER", "box_2d": [180, 80, 220, 120], '
+        '{"action": "TRANSFER", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
         '"label": "blue cube", "dest_marker": "marker_3", '
         '"reason": "the cube goes on marker 3"}',
         _desk(),
@@ -193,14 +208,14 @@ def test_a_transfer_carries_a_box_and_a_tag():
     assert act.kind == "TRANSFER"
     assert act.label == "blue cube"
     assert act.source is not None
-    assert act.source.box_px == (180.0, 80.0, 220.0, 120.0)
-    assert act.point_px == (200.0, 100.0)
+    assert _close(act.source.box_px, (180.0, 80.0, 220.0, 120.0))
+    assert _close(act.point_px, (200.0, 100.0))
     assert act.dest_entity_id == "marker_3"
 
 
 def test_a_pick_needs_only_a_box():
     act = _decide_on(
-        '{"action": "PICK", "box_2d": [180, 80, 220, 120], '
+        '{"action": "PICK", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
         '"label": "pen", "dest_marker": null, "dest_2d": null, '
         '"reason": "no destination named"}',
         _desk(),
@@ -214,14 +229,14 @@ def test_a_pick_needs_only_a_box():
 def test_a_place_takes_a_bare_pixel_destination():
     """"Somewhere clear" is a pixel, not a slot id. There are no slot ids."""
     act = _decide_on(
-        '{"action": "PLACE", "dest_2d": [80, 500], '
+        '{"action": "PLACE", "dest_2d": [62.5, 694.4444], '
         '"reason": "an empty patch of desk"}',
         _desk(held="pen"),
         "put it down somewhere clear",
     )
     assert act.ok, act.reason
     assert act.kind == "PLACE"
-    assert act.dest_point_px == (80.0, 500.0)
+    assert _close(act.dest_point_px, (80.0, 500.0))
     assert act.dest_entity_id is None
 
 
@@ -237,9 +252,13 @@ def test_a_tag_destination_wins_when_both_are_given():
     assert act.dest_point_px is None
 
 
-def test_pixels_lead_when_both_readings_are_possible():
-    """Both survive, pixels first, because the prompt draws the grid in that
-    space. The other is carried for ``measure_grounding`` to retry with."""
+def test_the_normalized_reading_leads_when_both_are_possible():
+    """0-1000 is the space this model answers in, whatever the prompt asks.
+
+    Measured over 3 targets x 2 prompt styles on one 1280x720 frame: box
+    centres land 2-13px from truth read as 0-1000, and 264-363px away read as
+    raw pixels, 6 of 6. Asking for pixels does not change what comes back.
+    """
     act = _decide_on(
         '{"action": "PICK", "box_2d": [200, 300, 260, 360], "label": "pen", '
         '"reason": "the pen"}',
@@ -247,11 +266,13 @@ def test_pixels_lead_when_both_readings_are_possible():
         "pick up the pen",
     )
     assert act.ok, act.reason
-    assert act.source.box_px == (200.0, 300.0, 260.0, 360.0)
-    assert act.source.alt_box_px is not None
-    ax0, ay0, _ax1, _ay1 = act.source.alt_box_px
-    assert abs(ax0 - 200 * FRAME_W / 1000.0) < 0.5
-    assert abs(ay0 - 300 * FRAME_H / 1000.0) < 0.5
+    assert _close(
+        act.source.box_px,
+        (200 * FRAME_W / 1000, 300 * FRAME_H / 1000,
+         260 * FRAME_W / 1000, 360 * FRAME_H / 1000),
+    )
+    # The raw-pixel reading stays as the retry, never discarded.
+    assert act.source.alt_box_px == (200.0, 300.0, 260.0, 360.0)
 
 
 def test_the_live_stapler_box_reads_as_normalized_only():
@@ -272,17 +293,16 @@ def test_the_live_stapler_box_reads_as_normalized_only():
 
 
 def test_both_readings_of_a_box_can_hit_different_real_objects():
-    """The known hole, pinned so a future fix has a failing case to aim at.
+    """The soft spot that survives reading 0-1000 first.
 
-    On a 1280x720 frame the box `[777, 538, 920, 666]` centres at (848, 602)
-    read as pixels and (1086, 433) read as 0-1000. On the live desk those are a
-    binder clip and a stapler. Both segment, so the measure-then-retry chain
-    never rejects the first, and the loop grips whichever reading leads.
+    A coordinate under 1000 is only *probably* normalized, so the raw-pixel
+    reading is kept and retried -- and the retry fires only when the leading
+    reading fails to segment. Where both readings land on real, separately
+    measurable objects, a wrong leading reading is not caught by anything.
 
-    Three ways of asking the reply which space it meant were measured and none
-    works -- see the module docstring in ``mt4_vision.instruct``. Until
-    something outside the reply supplies that signal, pixels lead and the other
-    reading is only a retry.
+    On a 1280x720 frame `[777, 538, 920, 666]` centres at (1086, 433) read as
+    0-1000 and (848, 602) read as pixels. On the live desk those were a stapler
+    and a binder clip.
     """
     act = _decide_on(
         '{"action": "PICK", "box_2d": [777, 538, 920, 666], '
@@ -291,10 +311,8 @@ def test_both_readings_of_a_box_can_hit_different_real_objects():
         "pick up the stapler",
     )
     assert act.ok, act.reason
-    assert act.source.point_px == (848.5, 602.0)
-    assert act.source.alt_point_px is not None
-    ax, ay = act.source.alt_point_px
-    assert abs(ax - 1086) < 2 and abs(ay - 433) < 2, (ax, ay)
+    assert _close(act.source.point_px, (1086.4, 433.4), tol=1.0)
+    assert act.source.alt_point_px == (848.5, 602.0)
 
 
 def test_done_is_taken_at_face_value():
@@ -373,7 +391,7 @@ def test_a_place_with_no_destination_is_refused():
 
 def test_picking_while_holding_is_refused_and_names_the_correction():
     act = _decide_on(
-        '{"action": "PICK", "box_2d": [180, 80, 220, 120], '
+        '{"action": "PICK", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
         '"label": "cube", "reason": "the cube"}',
         _desk(held="stapler"),
         "pick up the cube",
@@ -461,7 +479,7 @@ def test_a_pick_measures_at_zero_assumed_height():
         return object(), ""
 
     act = _decide_on(
-        '{"action": "PICK", "box_2d": [180, 80, 220, 120], '
+        '{"action": "PICK", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
         '"label": "cube", "reason": "the cube"}',
         _desk(),
         "pick up the cube",
@@ -475,7 +493,7 @@ def test_a_pick_measures_at_zero_assumed_height():
 
     assert obj is not None, why
     assert seen["height"] == 0.0 == instruct.PICK_AT_TABLE_HEIGHT_MM
-    assert seen["box"] == (180.0, 80.0, 220.0, 120.0)
+    assert _close(seen["box"], (180.0, 80.0, 220.0, 120.0))
 
 
 def test_a_grasp_defaults_to_table_z():
@@ -497,15 +515,15 @@ def test_grasp_for_squares_a_tag_destination():
 
 def test_as_dict_carries_the_box_and_the_destination():
     act = _decide_on(
-        '{"action": "TRANSFER", "box_2d": [180, 80, 220, 120], '
+        '{"action": "TRANSFER", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
         '"label": "cube", "dest_marker": "marker_3", "reason": "move it"}',
         _desk(),
         "put the cube on marker 3",
     )
     d = act.as_dict()
     assert d["action"] == "TRANSFER"
-    assert d["box_px"] == [180.0, 80.0, 220.0, 120.0]
-    assert d["point_px"] == [200.0, 100.0]
+    assert _close(d["box_px"], (180.0, 80.0, 220.0, 120.0))
+    assert _close(d["point_px"], (200.0, 100.0))
     assert d["dest_entity_id"] == "marker_3"
     # No entity_id and no agreement flags: there is no id to agree about.
     assert "entity_id" not in d and "agreed" not in d

@@ -144,12 +144,16 @@ def test_stapler_point_reply_is_not_taken_literally():
     assert err < 30.0, f"{err:.0f}px from the stapler"
 
 
-def test_box_readings_keep_pixels_first_when_both_are_possible():
-    """Ordered like point_readings, deliberately: one prompt now asks for both
-    a box and a point, so one convention answers for both fields."""
+def test_box_readings_lead_with_the_normalized_reading():
+    """0-1000 is the space this model answers in, and reading it that way lands
+    2-13px from truth against 264-363px as raw pixels, 6 of 6 on one frame.
+
+    Ordered like point_readings, deliberately: one prompt asks for both a box
+    and a point, so one convention answers for both fields.
+    """
     got = box_readings((100, 200, 160, 260), SIZE)
-    assert got[0] == (100.0, 200.0, 160.0, 260.0)
-    assert got[1] == to_frame_pixels((100, 200, 160, 260), SIZE)
+    assert got[0] == to_frame_pixels((100, 200, 160, 260), SIZE)
+    assert got[1] == (100.0, 200.0, 160.0, 260.0)
 
 
 def test_box_readings_drop_a_pixel_reading_that_centres_off_frame():
@@ -165,17 +169,17 @@ def test_box_readings_leave_one_reading_when_a_coordinate_rules_normalized_out()
     assert got == ((1014.0, 364.0, 1066.0, 407.0),)
 
 
-def test_a_decision_point_is_read_as_pixels_first():
-    """Measured 2026-08-03: the decision reply is pixels, 5/5, to 0.4px.
+def test_a_decision_point_is_read_as_normalized_first():
+    """The reply is 0-1000, whatever the prompt asks for.
 
-    The entity list prints "at image point (x, y)" for every entity, so the
-    prompt shows the model the space it wants. Read as normalized instead, the
-    same five replies land 160px away -- which is the "model point is
-    consistently way off" the preview made visible.
+    Measured over 3 targets x 2 prompt styles on one 1280x720 frame: read as
+    0-1000 the box centres land 2-13px from truth, 6 of 6; read as raw pixels,
+    264-363px away. The raw reading is kept second as a retry, because a
+    coordinate under 1000 is only probably normalized.
     """
     got = point_readings((320, 473), SIZE)
-    assert got[0] == (320.0, 473.0)
-    assert got[1] == (320 * FRAME_W / 1000.0, 473 * FRAME_H / 1000.0)
+    assert got[0] == (320 * FRAME_W / 1000.0, 473 * FRAME_H / 1000.0)
+    assert got[1] == (320.0, 473.0)
 
 
 def test_a_coordinate_over_the_scale_has_only_one_reading():
