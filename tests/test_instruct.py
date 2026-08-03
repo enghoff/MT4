@@ -155,6 +155,29 @@ def test_the_prompt_says_the_tag_list_is_not_the_desk():
     assert "NOT a list of what is on the desk" in prompt
 
 
+def test_the_prompt_offers_no_way_to_name_a_destination():
+    """An id field is an invitation to answer "on the red thing" with a tag
+    number, which reads as exact and cannot be checked against anything."""
+    prompt = instruct.build_prompt(_desk(held="pen"), "put it on marker 3")
+    assert "dest_marker" not in prompt
+    assert "dest_2d" in prompt
+
+
+def test_the_prompt_says_an_object_is_a_legal_destination():
+    """The gap that forced the substitution: with dest_2d described as bare
+    desk only, "on top of that" had no expressible answer but a tag id."""
+    prompt = instruct.build_prompt(_desk(held="pen"), "put it on the red one")
+    assert "on top of something else" in prompt
+
+
+def test_the_prompt_lists_each_tag_position_for_echoing_back():
+    """The listed numbers are the answer for a tag destination, not a hint
+    about one, so they have to be in the 0-1000 space the reply is read in."""
+    prompt = instruct.build_prompt(_desk(), "tidy up")
+    # marker_3 sits at pixel (300, 500) of a 1280x720 frame.
+    assert "marker_3 at (234, 694)" in prompt
+
+
 def test_the_instruction_is_passed_through_verbatim():
     """No noun extraction, no stopword filter, no rewriting.
 
@@ -172,8 +195,7 @@ def test_markers_are_the_only_model_facing_entities():
     assert [e.id for e in obs.markers] == ["marker_3", "marker_2"]
     # The full snapshot still has the cubes -- the internal gates need them.
     assert len(obs.snapshot.entities) == 4
-    assert obs.marker("cube_1") is None
-    assert obs.marker("marker_3") is not None
+    assert [e.kind for e in obs.markers] == ["marker", "marker"]
 
 
 def test_the_overlay_circles_only_tags(monkeypatch):
@@ -196,10 +218,17 @@ def test_the_overlay_circles_only_tags(monkeypatch):
 # -- the reply is read faithfully ------------------------------------------ #
 
 
-def test_a_transfer_carries_a_box_and_a_tag():
+def test_a_transfer_carries_a_box_and_an_echoed_tag_position():
+    """A tag destination is that tag's listed coordinates, copied back.
+
+    marker_3 is printed at the 0-1000 form of pixel (300, 500), so a reply that
+    means "on marker 3" says those two numbers and resolves to the tag's own
+    robot position.
+    """
+    a, b = _norm(300.0, 500.0)
     act = _decide_on(
         '{"action": "TRANSFER", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
-        '"label": "blue cube", "dest_marker": "marker_3", '
+        f'"label": "blue cube", "dest_2d": [{a:.4f}, {b:.4f}], '
         '"reason": "the cube goes on marker 3"}',
         _desk(),
         "put the blue cube on marker 3",
@@ -210,24 +239,23 @@ def test_a_transfer_carries_a_box_and_a_tag():
     assert act.source is not None
     assert _close(act.source.box_px, (180.0, 80.0, 220.0, 120.0))
     assert _close(act.point_px, (200.0, 100.0))
-    assert act.dest_entity_id == "marker_3"
+    assert _close(act.dest_point_px, (300.0, 500.0))
 
 
 def test_a_pick_needs_only_a_box():
     act = _decide_on(
         '{"action": "PICK", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
-        '"label": "pen", "dest_marker": null, "dest_2d": null, '
-        '"reason": "no destination named"}',
+        '"dest_2d": null, "label": "pen", "reason": "no destination named"}',
         _desk(),
         "pick up the pen",
     )
     assert act.ok, act.reason
     assert (act.kind, act.label) == ("PICK", "pen")
-    assert act.dest_entity_id is None and act.dest_point_px is None
+    assert act.dest_point_px is None
 
 
 def test_a_place_takes_a_bare_pixel_destination():
-    """"Somewhere clear" is a pixel, not a slot id. There are no slot ids."""
+    """"Somewhere clear" is a pixel, and so is everywhere else."""
     act = _decide_on(
         '{"action": "PLACE", "dest_2d": [62.5, 694.4444], '
         '"reason": "an empty patch of desk"}',
@@ -237,19 +265,41 @@ def test_a_place_takes_a_bare_pixel_destination():
     assert act.ok, act.reason
     assert act.kind == "PLACE"
     assert _close(act.dest_point_px, (80.0, 500.0))
-    assert act.dest_entity_id is None
 
 
-def test_a_tag_destination_wins_when_both_are_given():
+def test_naming_a_tag_instead_of_pointing_at_it_is_refused():
+    """The destination channel is coordinates only, so an id is not a
+    destination -- and the refusal has to say what to write instead, because
+    the numbers were already in the prompt."""
     act = _decide_on(
-        '{"action": "PLACE", "dest_marker": "marker_2", "dest_2d": [10, 10], '
+        '{"action": "PLACE", "dest_marker": "marker_2", "dest_2d": null, '
         '"reason": "on the tag"}',
         _desk(held="pen"),
         "put it on marker 2",
     )
+    assert not act.ok
+    assert "marker_2" in act.reason and "dest_2d" in act.reason
+
+
+def test_an_object_destination_is_the_object_not_a_tag_beside_it():
+    """The failure this protocol exists to stop: told to place on an object,
+    the model answers with a tag id, which is exact, agrees with nothing and
+    can be 46mm from the thing the task named. With coordinates as the only
+    channel the reply lands where it pointed, and the transcript shows it."""
+    obs = _desk(held="green cube")
+    a, b = _norm(240.0, 460.0)   # on an object, 36mm clear of marker_3
+    act = _decide_on(
+        '{"action": "PLACE", '
+        f'"dest_2d": [{a:.4f}, {b:.4f}], "reason": "onto the other cube"}}',
+        obs,
+        "place it on the red cube",
+    )
     assert act.ok, act.reason
-    assert act.dest_entity_id == "marker_2"
-    assert act.dest_point_px is None
+    assert _close(act.dest_point_px, (240.0, 460.0))
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert _close((grasp.x, grasp.y), (120.0, 230.0))
+    assert instruct.tag_at(obs, grasp.x, grasp.y) is None
 
 
 def test_the_normalized_reading_leads_when_both_are_possible():
@@ -363,11 +413,11 @@ def test_a_whole_frame_box_is_refused_as_a_non_answer():
     assert "% of the frame" in act.reason
 
 
-def test_a_tag_that_did_not_decode_is_named_in_the_refusal():
-    """The one text-derived rule, and it concerns the datum we supply rather
-    than the model's grounding. Measured on a desk of markers 1-4: "place it on
-    marker 0" answers marker_3, then marker_1, then "task already completed",
-    never once that the number is not there."""
+def test_a_tag_the_desk_does_not_have_is_refused_by_name():
+    """A tag with no listed position has no coordinates to echo, so the model
+    can only name it. Measured on a desk of markers 1-4: "place it on marker 0"
+    answers marker_3, then marker_1, then "task already completed", never once
+    that the number is not there."""
     act = _decide_on(
         '{"action": "PLACE", "dest_marker": "marker_0", "reason": "marker 0"}',
         _desk(held="pen"),
@@ -375,18 +425,16 @@ def test_a_tag_that_did_not_decode_is_named_in_the_refusal():
     )
     assert not act.ok
     assert "marker_0" in act.reason
-    assert "marker_3" in act.reason and "marker_2" in act.reason
 
 
 def test_a_place_with_no_destination_is_refused():
     act = _decide_on(
-        '{"action": "PLACE", "dest_marker": null, "dest_2d": null, '
-        '"reason": "put it down"}',
+        '{"action": "PLACE", "dest_2d": null, "reason": "put it down"}',
         _desk(held="pen"),
         "put it down",
     )
     assert not act.ok
-    assert "destination" in act.reason
+    assert "dest_2d" in act.reason
 
 
 def test_picking_while_holding_is_refused_and_names_the_correction():
@@ -429,23 +477,35 @@ def test_a_reply_that_is_not_json_is_refused():
 # -- destinations resolve to poses, and the pixel is not snapped ----------- #
 
 
-def test_a_tag_destination_uses_its_calibrated_position():
+def test_an_echoed_tag_position_lands_on_that_tag_squared():
+    """marker_3's listed pixel, echoed back, resolves to its robot position.
+
+    The round trip is the tag's robot XY through ``robot_to_pixel``, printed as
+    whole 0-1000 units, and back through ``pixel_to_robot`` -- the same
+    homography inverted, so only the rounding survives. Measured across the five
+    tags on the live desk: 0.05-0.48mm.
+    """
     obs = _desk(held="pen")
-    act = Action("PLACE", True, "on the tag", dest_entity_id="marker_3")
+    act = Action("PLACE", True, "on the tag", dest_point_px=(300.0, 500.0))
     grasp, why = instruct.destination_grasp(obs, act)
     assert grasp is not None, why
     assert (grasp.x, grasp.y) == (150.0, 250.0)
+    # A destination has no orientation of its own, so it squares to the axes.
+    assert grasp.yaw_deg == 0.0
+    assert grasp.yaw_period_deg == 90.0
 
 
 def test_a_destination_pixel_is_projected_not_snapped_to_a_tag():
-    """A pixel 4px from marker_2 still means that pixel. Snapping it would be
-    the loop overriding the one thing it asked the model to decide."""
+    """A pixel 4px from marker_3 still means that pixel, even though ``tag_at``
+    reports it as standing on the tag. Snapping it would be the loop overriding
+    the one thing it asked the model to decide."""
     obs = _desk(held="pen")
     act = Action("PLACE", True, "just beside it", dest_point_px=(304.0, 500.0))
     grasp, why = instruct.destination_grasp(obs, act)
     assert grasp is not None, why
     assert (grasp.x, grasp.y) == (152.0, 250.0)
     assert (grasp.x, grasp.y) != (150.0, 250.0)
+    assert instruct.tag_at(obs, grasp.x, grasp.y).id == "marker_3"
 
 
 def test_an_unreachable_destination_pixel_is_refused():
@@ -456,12 +516,13 @@ def test_an_unreachable_destination_pixel_is_refused():
     assert "destination pixel" in why
 
 
-def test_a_destination_naming_an_undecoded_tag_is_refused():
-    obs = _desk(held="pen")
-    act = Action("PLACE", True, "on it", dest_entity_id="marker_9")
-    grasp, why = instruct.destination_grasp(obs, act)
-    assert grasp is None
-    assert "marker_9" in why
+def test_tag_at_names_a_tag_underfoot_and_nothing_further_off():
+    """Reporting only -- it labels a coordinate, it never moves one. The
+    threshold is half a printed tag, which measures 41.2-44.1mm on a side."""
+    obs = _desk()
+    assert instruct.tag_at(obs, 150.0, 250.0).id == "marker_3"
+    assert instruct.tag_at(obs, 150.0, 250.0 + instruct.ON_TAG_MM - 1) is not None
+    assert instruct.tag_at(obs, 150.0, 250.0 + instruct.ON_TAG_MM + 1) is None
 
 
 # -- grip geometry --------------------------------------------------------- #
@@ -506,20 +567,14 @@ def test_a_grasp_defaults_to_table_z():
     assert square_place(100.0, 50.0).grasp_z(CALIB) == CALIB.table_z
 
 
-def test_grasp_for_squares_a_tag_destination():
-    grasp = instruct.grasp_for(_marker(3, 150.0, 250.0, 1100.0, 620.0), CALIB)
-    assert (grasp.x, grasp.y) == (150.0, 250.0)
-    assert grasp.yaw_deg == 0.0
-    assert grasp.yaw_period_deg == 90.0
-
-
 # -- the transcript record ------------------------------------------------- #
 
 
 def test_as_dict_carries_the_box_and_the_destination():
+    a, b = _norm(300.0, 500.0)
     act = _decide_on(
         '{"action": "TRANSFER", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
-        '"label": "cube", "dest_marker": "marker_3", "reason": "move it"}',
+        f'"label": "cube", "dest_2d": [{a:.4f}, {b:.4f}], "reason": "move it"}}',
         _desk(),
         "put the cube on marker 3",
     )
@@ -527,9 +582,9 @@ def test_as_dict_carries_the_box_and_the_destination():
     assert d["action"] == "TRANSFER"
     assert _close(d["box_px"], (180.0, 80.0, 220.0, 120.0))
     assert _close(d["point_px"], (200.0, 100.0))
-    assert d["dest_entity_id"] == "marker_3"
-    # No entity_id and no agreement flags: there is no id to agree about.
-    assert "entity_id" not in d and "agreed" not in d
+    assert _close(d["dest_point_px"], (300.0, 500.0))
+    # No ids at either end: neither a pick target nor a destination is a name.
+    assert "entity_id" not in d and "dest_entity_id" not in d
 
 
 if __name__ == "__main__":

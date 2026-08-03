@@ -138,9 +138,10 @@ def decision_view(
     the model gave, so the pixel gap between "where it pointed" and "where the
     jaws will actually go" is a glance rather than an investigation.
 
-    Only a *tag* destination has a calibrated pixel to draw. A destination pixel
-    the model chose on bare desk is drawn from the reply itself, because there
-    is no entity behind it -- which is the point of it.
+    The destination dot comes from the reply itself, always. There is no entity
+    behind it to draw instead: landing on a tag means the model echoed that
+    tag's coordinates, so the dot sits on the circled tag exactly when the echo
+    was right, and visibly off it when the model pointed somewhere else.
     """
     grounding = grounding if grounding is not None else (
         None if action is None else action.source
@@ -150,13 +151,7 @@ def decision_view(
         px, py = getattr(obj, "px", None), getattr(obj, "py", None)
         if px is not None and py is not None:
             bound = (float(px), float(py))
-    dest_bound = None
-    if action is not None and action.dest_entity_id:
-        dest = obs.marker(action.dest_entity_id)
-        if dest is not None:
-            dest_bound = dest.pixel or obs.calib.robot_to_pixel(dest.x, dest.y)
-    elif action is not None and action.dest_point_px:
-        dest_bound = action.dest_point_px
+    dest_bound = None if action is None else action.dest_point_px
     return annotate_qwen(
         obs.annotated,
         grounding=grounding,

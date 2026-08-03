@@ -39,7 +39,7 @@ stapler. Anything about grip retention is unmeasurable on this rig: there is no
 sensor in the jaws, so a plan that looks good and slips is indistinguishable
 from one that works. Nothing downstream closes that gap either -- the policy
 loop has no after-the-fact vision check, because such a check answers wrongly
-in both directions (see ``instruct.grasp_for``), so this geometric test, run
+in both directions (see ``instruct.decide``), so this geometric test, run
 BEFORE the move, is the last thing that can refuse a bad grasp.
 """
 

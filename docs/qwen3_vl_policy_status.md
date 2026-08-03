@@ -57,15 +57,15 @@ motor.
 > pieces §2v deleted are listed there rather than here.
 
 | `Observation` | `frame`, `annotated`, `snapshot`, `calib`, `held`, `history`, `scene`. `snapshot` is the full detection and is **never** shown to the model; `.markers` is the model-facing half, and `build_prompt` and the overlay read only that. |
-| `Action` | `kind`, `ok`, `reason`, `label`, `source` (a `Grounding`), `dest_entity_id`, `dest_point_px`, `dest_alt_point_px`, `raw`. `ok` means *the reply is well formed for the action it chose* — not that anything was measured or is reachable. No `entity_id`: a pick target is a box. |
+| `Action` | `kind`, `ok`, `reason`, `label`, `source` (a `Grounding`), `dest_point_px`, `dest_alt_point_px`, `raw`. `ok` means *the reply is well formed for the action it chose* — not that anything was measured or is reachable. No ids at either end: a pick target is a box and a destination is a point. |
 | `observe()` | Capture → `capture_scene` → `build_snapshot` → grid overlay drawn with **markers only**. |
 | `decide()` | One Qwen call. `ACTIONS = (TRANSFER, PICK, PLACE, DONE, STOP)`. Reads the reply; resolves nothing physical. |
 | `measure_source()` | GrabCut inside the model's `box_2d`, on the frame the box was drawn on. Height inferred from the silhouette and unprojected to the table plane — see §2z. |
 | `source_entity()` | The measurement through `entities.object_entity` — reach, keep-out, ground Z, jaw plan, neighbour clearance, desk polygon. The only thing entitled to override the model. |
-| `destination_grasp()` | A tag id → its calibrated position; a `dest_2d` pixel → the plain table-plane projection of that pixel, **not snapped** to any tag or slot. Both squared to the world axes, both gated by `work_region_block_reason`. |
+| `destination_grasp()` | The `dest_2d` pixel → the plain table-plane projection of that pixel, squared to the world axes and gated by `work_region_block_reason`. **Not snapped** to any tag or slot, including when it lands on one. See §2aa. |
 | `to_frame_pixels()` / `point_readings()` / `box_readings()` | The single model-coordinate → pixel conversion, and the two readings kept for a point and for a box. Ordered identically, pixels first. See §2a, §2v. |
 | `Grounding` / `measure_grounding()` | A located box plus its centre, and the measurement that prefers GrabCut from the box over the desk-deviation point path. Takes `object_height_mm`. See §2b. |
-| `grasp_for()` | `square_place` for a decoded tag. Objects no longer route through it — they come from `Entity.as_grasp` on the freshly measured object. |
+| `tag_at()` | The tag standing under a robot-frame destination, within `ON_TAG_MM = 22` (half a printed tag). **Reporting only** — it labels the transcript line, and no move routes through it. |
 | `build_prompt()` | Task verbatim, progress history, held object **by label only**, the decoded ArUco ids and their pixels, and the reply schema. Says explicitly that the tag list is *not* a list of what is on the desk. |
 
 Constants: `COORD_SCALE = 1000.0`, `MAX_NEW_TOKENS = 220`, `BIND_RADIUS_MM = 45`.
@@ -79,8 +79,8 @@ python run_instruction.py --dry-run "pick up the stapler"
 ```
 
 Per step: `retreat_for_camera` → `observe` → ground any unmatched noun into
-`obj_N` → `decide` → `grasp_for` off that same snapshot →
-`transfer` / `pick_at` / `place_at` → `retreat_for_camera`. Loops to
+`obj_N` → `decide` → `measure_source` / `destination_grasp` off that same
+snapshot → `transfer` / `pick_at` / `place_at` → `retreat_for_camera`. Loops to
 `--max-steps` (default 6) or until `DONE`/refusal. Moving something somewhere
 is **one** step, and nothing is verified after a motion — see §2r.
 
@@ -1271,7 +1271,7 @@ survives into the prompt.
 |---|---|
 | `TRANSFER`, `PICK_ENTITY`, `PLACE_ENTITY`, `LOCATE_AT_PIXEL`, `DONE`, `STOP` | `TRANSFER`, `PICK`, `PLACE`, `DONE`, `STOP` |
 | `entity_id` copied from a printed list, or a point bound to the nearest entity | `box_2d` around the thing to pick up |
-| `dest_entity_id` = `marker_N` or `slot_N` | `dest_marker` (a decoded tag) **or** `dest_2d` (a pixel on bare desk), never both |
+| `dest_entity_id` = `marker_N` or `slot_N` | `dest_2d`, a point on the image and the only destination form there is — see §2aa |
 
 `LOCATE_AT_PIXEL` is gone and its absence is the point. It existed to add a
 thing the enumerator had missed to a list the model could then select from.
@@ -1354,9 +1354,10 @@ opinion about *what* the model boxed.
   build returns the whole image rather than declining when asked for something
   absent, measured on "location": box `(0, 0, 1000, 1000)`
 - `TRANSFER`/`PLACE` with no destination at all
-- `dest_marker` naming a tag that did not decode this frame — the refusal lists
-  the ids that did. This is the one rule derived from the task text, and it
-  concerns the one datum *we* supply rather than anything the model saw
+- a destination given as a name instead of a point — the refusal quotes the
+  `dest_marker` it wrote and says to copy that tag's listed coordinates into
+  `dest_2d`. This is the one rule derived from the task text, and it concerns
+  the one datum *we* supply rather than anything the model saw
 - gripper state: picking while `held` is set, placing while it is not. Both now
   name `/held` as the correction
 - the box cannot be segmented, is unstable across window scales, or measures
@@ -1718,6 +1719,94 @@ case the gate tested. Backlog item 7 is closed by this rather than sidestepped.
 
 ---
 
+### 2aa. A destination is a point, never a name — `dest_marker` removed
+
+**The failure.** `run_instruction.py "move the green cube and place it on the
+red cube"`, live 2026-08-03. Step 2 answered
+`{"action": "PLACE", "dest_marker": "marker_2", "reason": "green cube is
+already held and must be placed on the red cube which is at marker_2"}`. The
+red cube was not at marker_2. Projecting both through the calibration: the cube
+sat at robot (151, −180) and marker_2 at (159, −134), **46 mm apart**, more than
+two cube widths. The arm placed at (156, −136) — on the tag — and step 3
+returned `DONE`, which `decide` takes at face value.
+
+**Why the loop could not catch it.** Nothing snapped anything; the id came
+verbatim out of the model. `destination_grasp` looked marker_2 up, took its
+calibrated XY and ran one gate — `work_region_block_reason`, pure geometry,
+which marker_2 passes because it is an ordinary reachable spot on the desk.
+There was no check that the object the task named was at that tag, and there
+cannot be one: an id resolves exactly, so a wrong id is indistinguishable from
+a right one.
+
+**Why the model chose an id.** The prompt offered two destination forms and
+neither fitted. `dest_marker` was for "when the task names a tag by its
+number"; `dest_2d` was described as "a pixel on **bare desk**", for "somewhere
+clear", "not on a marker" and "on the table". An object destination matched
+neither, so the only mechanism left that names a specific place was the tag
+list, and the model invented the premise that made picking one coherent.
+
+**The change.** `dest_marker` is deleted. `dest_2d` is the only destination
+form, on the same 0-1000 grid the tag positions are printed in, and the prompt
+now spells out three cases for it: copy a tag's listed numbers, point at
+another object, or point at bare desk. Landing on a tag means echoing that
+tag's coordinates back. `grasp_for`, `_said_id` and `Observation.marker` went
+with the field.
+
+**Accuracy of the round trip — measured.** A tag's listed pixel is its
+calibrated robot position through `robot_to_pixel`, and reading an echo back
+through `pixel_to_robot` inverts the same homography, so the fit residual
+cancels and only the rounding to whole 0-1000 units survives. Across the five
+tags on the live desk:
+
+| tag | robot (mm) | printed 0-1000 | robot after echo | error |
+|---|---|---|---|---|
+| marker_0 | (42.8, −213.1) | (275, 552) | (42.9, −213.0) | 0.16 mm |
+| marker_1 | (33.6, 227.1) | (817, 552) | (34.0, 226.8) | 0.48 mm |
+| marker_2 | (156.3, −136.3) | (326, 717) | (156.4, −136.5) | 0.21 mm |
+| marker_3 | (148.0, 149.8) | (783, 708) | (148.0, 149.8) | 0.05 mm |
+| marker_4 | (198.4, 6.9) | (564, 809) | (198.6, 7.1) | 0.25 mm |
+
+Worst 0.48 mm, so an exact echo costs nothing a place can feel. Decimals were
+tried and rejected: they take the worst case from 0.48 mm to about 0.05 mm
+while pushing the model off the integer convention it is trained on.
+
+What the rounding does *not* bound is the model mistyping a coordinate. One
+unit of the grid is 0.67–1.42 mm depending on where on the desk, so a ten-unit
+slip lands 6.6–14.0 mm out, past what a place tolerates. That is the trade:
+the error becomes visible — a drawn dot in the wrong place — instead of
+arriving as a correct-looking id.
+
+**Behaviour of the new prompt — measured against the live service.**
+Qwen3-VL-4B-Instruct, torchao-int4, greedy, on a synthetic desk built from the
+real calibrated tag positions and the real overlay code:
+
+| task | reply | result |
+|---|---|---|
+| "put it down on marker 3" | `dest_2d: [783, 708]` | exact echo, robot (148, 150), 0.2 mm from the tag |
+| "put it down on marker 0" | `dest_2d: [275, 552]` | exact echo, robot (43, −213) |
+| "put it down on marker 2" | `dest_2d: [326, 717]` | exact echo, robot (156, −136) |
+| "place it on the red block", block clear of every tag | `dest_2d: [475, 475]`, label `red block` | points at the object, `tag_at` None, 3/3 identical |
+| "place it on the red block", block 76 px from marker_0 | `dest_2d: [275, 552]`, reason "…on the red block **at marker_0**" | still snapped to the tag |
+
+So the echo is reliable — 3 of 3 exact — and naming an object destination now
+works when the object is unambiguous. The last row is the residual: with a tag
+close by in the image the model still conflates the two. The protocol does not
+fix that, and was never going to; what it changes is that the answer is now a
+coordinate 79 mm from the object rather than an id that agrees with nothing.
+`tag_at` puts the tag's name back in the transcript for exactly this reason —
+"onto marker_0" against a task that said "the red block" is the tell.
+
+**What is lost.** A tag landing no longer uses the tag's stored robot position
+directly, so it inherits the 0.48 mm round trip. The code-level refusal for a
+reply naming a tag that did not decode is gone; the prompt still instructs
+`STOP` and names the missing number, and a reply that writes `dest_marker`
+anyway is refused with the correction quoted. And a tag destination is now
+exposed to the raw-pixel retry in `point_readings` (§2w) — in practice never
+reached, since the 0-1000 reading of a listed tag always passes the work-region
+gate first.
+
+---
+
 ## 3. Are we cube-agnostic? The policy layer is; enumeration still is not
 
 Rewritten after §2v. The previous verdict was "2 of 3, and the missing one is
@@ -1896,11 +1985,11 @@ discovered by `motion.resolve_yaw_j4` raising mid-move. The two also disagree by
 read `entity.pickable` / `entity.reason`. Behaviour change — some objects that
 are pickable today would start being refused, correctly.
 
-**B. The pick-source / place-destination split is written out nine times in
+**B. The pick-source / place-destination split is written out eight times in
 three modules.** `instruct._NEVER_PICKABLE_KINDS`, `wrong_kind_block_reason`,
-the `kinds = ("cube","object") if ... else ("marker","slot")` tuple,
-`grasp_for`'s `kind in ("marker","slot")`, the "not somewhere to put things"
-branch, the alternatives list, `capable = hit.pickable if ... else placeable`,
+the `kinds = ("cube","object") if ... else ("marker","slot")` tuple, the "not
+somewhere to put things" branch, the alternatives list,
+`capable = hit.pickable if ... else placeable`,
 plus `server.mt4_pick` and `server.mt4_place`. Fix: `PICK_KINDS` / `PLACE_KINDS`
 beside the `KIND_*` constants, and one `Entity.admits(role) -> (bool, reason)`
 returning the category-error sentence when the kind is wrong and `self.reason`

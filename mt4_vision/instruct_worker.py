@@ -91,24 +91,27 @@ class PlainUI:
         pass
 
 
-def _destination_words(action: I.Action) -> str:
+def _destination_words(obs: I.Observation, action: I.Action) -> str:
     """How to say where something is going, in a transcript line.
 
-    A tag has a printed number that survives every snapshot, so it is named. A
-    bare pixel has no name at all -- calling it "slot_4" would invent one, and
-    the number would mean nothing an hour later.
+    The destination is a pixel, so the pixel is what gets said. A tag standing
+    under that pixel is named as well, because that is the check worth making
+    at a glance: told to place on marker 2, the line should read "onto
+    marker_2", and told to place on a cube it should read as the bare pixel it
+    is. The name is a label on the coordinate and never a substitute for it --
+    ``instruct.tag_at`` is reporting only, and the arm goes to the pixel.
     """
-    if action.dest_entity_id:
-        return f"onto {action.dest_entity_id}"
-    if action.dest_point_px:
-        return (
-            f"down at image ({action.dest_point_px[0]:.0f}, "
-            f"{action.dest_point_px[1]:.0f})"
-        )
-    return "down"
+    if not action.dest_point_px:
+        return "down"
+    px, py = action.dest_point_px
+    x, y = obs.calib.pixel_to_robot(px, py, on_cube_top=False)
+    on = I.tag_at(obs, x, y)
+    if on is not None:
+        return f"onto {on.id}"
+    return f"down at image ({px:.0f}, {py:.0f})"
 
 
-def describe(action: I.Action) -> str:
+def describe(obs: I.Observation, action: I.Action) -> str:
     bits = [action.kind]
     if action.label:
         bits.append(action.label)
@@ -116,7 +119,7 @@ def describe(action: I.Action) -> str:
         x1, y1, x2, y2 = action.source.box_px
         bits.append(f"box ({x1:.0f}, {y1:.0f})-({x2:.0f}, {y2:.0f})")
     if action.kind in ("TRANSFER", "PLACE"):
-        bits.append(f"-> {_destination_words(action).removeprefix('down ')}")
+        bits.append(f"-> {_destination_words(obs, action).removeprefix('down ')}")
     return "  ".join(bits)
 
 
@@ -485,14 +488,15 @@ class TaskWorker:
             self._phase("deciding")
             self._ui.set_status(f"step {step}: asking the model what to do")
             action = I.decide(obs, instruction)
-            self._ui.emit(f"    {describe(action)}")
+            said = describe(obs, action)
+            self._ui.emit(f"    {said}")
             self._ui.emit(f"    reason: {action.reason}")
-            self._set(action=describe(action), reason=action.reason)
+            self._set(action=said, reason=action.reason)
             self._show(
                 obs, action=action,
                 caption=[
                     (f"[{step}] {instruction}", CAPTION_BGR),
-                    (describe(action), QWEN_BOUND_BGR if action.ok else QWEN_REFUSED_BGR),
+                    (said, QWEN_BOUND_BGR if action.ok else QWEN_REFUSED_BGR),
                     (action.reason, CAPTION_DIM_BGR),
                 ],
             )
@@ -581,7 +585,7 @@ class TaskWorker:
 
             self._phase("moving")
             try:
-                where_to = _destination_words(action)
+                where_to = _destination_words(obs, action)
                 if action.kind == "TRANSFER":
                     line = (
                         f"pick ({grasp.x:.0f}, {grasp.y:.0f}) {yaw}"

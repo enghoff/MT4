@@ -24,6 +24,13 @@ it.** Three rules follow from that, and every one of them is load-bearing:
   the thing to pick up. With no id to resolve there is no binding, no ambiguity
   refusal and no named-vs-pointed disagreement -- three ways a correct reply
   can be turned into an abandoned task.
+* **A destination is a point, not an id.** ``dest_2d`` is the only destination
+  channel there is, on the same 0-1000 grid the tag positions are printed in.
+  Landing on a tag means echoing that tag's listed coordinates back. An id would
+  let a destination name something the reply never located: "on the red cube"
+  answered as a tag id is exact by construction, agrees with nothing, and can be
+  46mm from the red cube. A coordinate cannot hide that -- it is drawn on the
+  overlay, and it is where the arm goes.
 
 **What refuses, and why that is not second-guessing.** The measurement must
 survive segmentation, the two-window stability check and the plausibility band,
@@ -105,10 +112,10 @@ from mt4_vision.scene import capture_scene
 
 __all__ = [
     "ACTIONS", "COORD_SCALE", "MAX_NEW_TOKENS", "MAX_BOX_FRAME_SHARE",
-    "Action", "Grounding", "Observation",
+    "ON_TAG_MM", "Action", "Grounding", "Observation",
     "box_grounding", "box_readings", "build_prompt", "decide",
-    "destination_grasp", "grasp_for", "measure_grounding", "observe",
-    "point_readings", "to_frame_pixels", "load_calibration",
+    "destination_grasp", "measure_grounding", "observe",
+    "point_readings", "tag_at", "to_frame_pixels", "load_calibration",
 ]
 
 # Short replies only: a decision is an action, a box, a destination and a clause
@@ -170,15 +177,6 @@ class Observation:
         """
         return [e for e in self.snapshot.entities if e.kind == KIND_MARKER]
 
-    def marker(self, entity_id: str) -> Entity | None:
-        """The tag with this id, or None. Markers only, on purpose -- a reply
-        naming ``cube_2`` must not resolve to something the model was never
-        shown."""
-        for e in self.markers:
-            if e.id == entity_id:
-                return e
-        return None
-
 
 @dataclass(frozen=True)
 class Action:
@@ -206,11 +204,10 @@ class Action:
     # measured; the centre is what the preview draws and what the desk-deviation
     # path falls back to when GrabCut cannot cut the box.
     source: Grounding | None = None
-    # A destination is one of these two, never both. ``dest_entity_id`` is an
-    # ArUco id -- the only name in this protocol, because it is the only thing
-    # the model was given a name for. ``dest_point_px`` is a bare pixel on the
-    # desk, for "anywhere else".
-    dest_entity_id: str | None = None
+    # Where to release, in frame pixels, and the same reply read as raw pixels
+    # as a retry. This is the only destination form: landing on a tag means the
+    # model echoed that tag's listed coordinates, so a destination is always a
+    # place the reply itself pointed at rather than a name it looked up.
     dest_point_px: tuple[float, float] | None = None
     dest_alt_point_px: tuple[float, float] | None = None
     raw: str = ""
@@ -235,8 +232,6 @@ class Action:
                     round(self.source.alt_point_px[0], 1),
                     round(self.source.alt_point_px[1], 1),
                 ]
-        if self.dest_entity_id:
-            out["dest_entity_id"] = self.dest_entity_id
         if self.dest_point_px:
             out["dest_point_px"] = [
                 round(self.dest_point_px[0], 1), round(self.dest_point_px[1], 1)
@@ -298,7 +293,22 @@ def observe(
 
 
 def _marker_lines(obs: "Observation") -> str:
-    """The ArUco tags, id and pixel. The whole of what the model is told.
+    """The ArUco tags, id and position. The whole of what the model is told.
+
+    These coordinates are not just a hint about where a tag is -- they are the
+    *answer* for a destination on one, because ``dest_2d`` is the only
+    destination form. So the round trip has to be tight, and it is: a tag's
+    listed pixel is its calibrated robot position run through
+    ``robot_to_pixel``, and reading an exact echo back through
+    ``pixel_to_robot`` inverts the same homography. All that survives is the
+    rounding to whole 0-1000 units, measured across the five tags at
+    **0.05-0.48mm**.
+
+    What that rounding does *not* bound is the model mistyping a coordinate.
+    One unit of the 0-1000 grid is 0.67-1.42mm on this desk depending where,
+    so a ten-unit slip lands 6.6-14.0mm out -- past what a place tolerates.
+    That failure is visible, which is the trade: it shows up as a drawn point
+    in the wrong place instead of as a correct-looking tag id.
 
     No capability flags. A flag like ``placeable`` invites the model to treat
     the list as the set of legal answers, and a tag that fails the reach test is
@@ -363,21 +373,19 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         f"{_marker_lines(obs)}\n\n"
         "Choose one action:\n"
         "  TRANSFER - pick something up and put it somewhere, in one go. "
-        "box_2d is the thing to pick up; dest_marker or dest_2d is where it "
-        "goes. Use this whenever the task names BOTH a thing and a place for "
-        "it, and the gripper is empty\n"
+        "box_2d is the thing to pick up; dest_2d is where it goes. Use this "
+        "whenever the task names BOTH a thing and a place for it, and the "
+        "gripper is empty\n"
         "  PICK     - pick something up and hold it, when the task names no "
         "destination at all (only if the gripper is empty). box_2d is the "
         "thing to pick up\n"
-        "  PLACE    - put down what is ALREADY held. dest_marker or dest_2d "
-        "says where\n"
+        "  PLACE    - put down what is ALREADY held. dest_2d says where\n"
         "  DONE     - the task is complete\n"
         "  STOP     - the task cannot be done, or you cannot tell which thing "
         "is meant\n\n"
         "Reply with ONLY a JSON object, no prose, no markdown fence:\n"
         '{"action": "...", "box_2d": [x1, y1, x2, y2], "label": "...", '
-        '"dest_marker": "marker_N", "dest_2d": [x, y], '
-        '"reason": "<one short clause>"}\n\n'
+        '"dest_2d": [x, y], "reason": "<one short clause>"}\n\n'
         "Every coordinate you give is on a 0-1000 scale across the image: 0 is "
         "the left edge, 1000 the right edge, and the same top to bottom. The "
         "tag positions above are written that way too.\n"
@@ -386,20 +394,28 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "little else as possible -- not the desk around it, and not a "
         "neighbouring object. Required for TRANSFER and PICK.\n"
         "label is a short noun for whatever you boxed.\n"
-        "A destination is EITHER dest_marker or dest_2d, never both. Use "
-        "dest_marker when the task names a tag by its number, copying the id "
-        "exactly as listed above. Use dest_2d -- a pixel on bare desk -- for "
-        "anywhere else, including 'somewhere clear', 'not on a marker' and "
-        "'on the table'. One of the two is required for TRANSFER and PLACE.\n"
+        "dest_2d says where something goes, and it is always a point on the "
+        "image -- there is no way to name a destination, only to point at one. "
+        "Required for TRANSFER and PLACE. Three cases, all the same field:\n"
+        "  - onto a tag: copy that tag's two numbers from the list above, "
+        "exactly as they are written there\n"
+        "  - onto or against another object: the point on THAT object. An "
+        "object is a legal destination, not only bare desk -- when the task "
+        "says to put something on top of something else, dest_2d is the thing "
+        "it goes on, wherever in the image you can see that thing to be\n"
+        "  - 'somewhere clear', 'on the table', 'not on a marker': any point "
+        "on empty desk\n"
         # The one text-derived rule left, and it is about the one datum we
         # supply rather than about the model's own grounding. Measured live
         # 2026-08-03, "place it on marker 0" on a desk of markers 1-4: the model
         # answered marker_3, then marker_1, then "task already completed", never
         # once saying the number was not there.
         "A tag number in the task is an identity, not a hint: 'marker 0' means "
-        "the tag whose id is exactly marker_0. If that id is not listed above "
-        "then that tag is not on this desk -- answer STOP and say which number "
-        "is missing. A different number is never a substitute for it.\n"
+        "the tag whose id is exactly marker_0, so dest_2d must be the pair of "
+        "numbers listed above for marker_0. If that id is not listed then the "
+        "tag is not on this desk -- answer STOP and say which number is "
+        "missing. Another tag's numbers are never a substitute for it, and "
+        "neither is a point near where you expect it to be.\n"
         "Use null for every field the chosen action does not need.\n"
         "Begin your reply with { and end it with }."
     )
@@ -430,29 +446,45 @@ def _first_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _said_id(got: dict[str, Any], key: str) -> str | None:
-    """The id the model wrote under ``key``, or None.
+def _named_a_tag(got: dict[str, Any]) -> str:
+    """Refusal clause for a reply that named a tag instead of pointing at one.
 
-    JSON null is None, but the model also writes the *string* "null" -- taking
-    that literally would look up a tag called "null" and refuse for the wrong
-    reason.
+    The one malformed destination worth spelling out, because the correction
+    lives in the reply rather than on the desk: the tag's coordinates are
+    already in the prompt and only have to be copied across. The model writes
+    the *string* "null" as well as JSON null, and neither is a name.
     """
-    said = got.get(key)
-    if isinstance(said, str) and said.strip().lower() in ("", "null", "none"):
-        said = None
-    return str(said) if isinstance(said, str) else None
+    said = got.get("dest_marker")
+    if not isinstance(said, str) or said.strip().lower() in ("", "null", "none"):
+        return ""
+    return (
+        f" -- the reply gives dest_marker {said.strip()!r}, and a destination "
+        "is never a name; copy the coordinates listed for that tag into dest_2d"
+    )
 
 
-def grasp_for(entity: Entity, calib: Calibration):
-    """The motion-layer pose for landing on a decoded tag.
+# Half a printed tag, which measures 41.2-44.1mm on a side across the five on
+# this desk. A destination within this of a tag's listed position is standing on
+# that tag, and the transcript says so by name.
+ON_TAG_MM = 22.0
 
-    A tag is a calibrated position with no orientation of its own, so the
-    landing yaw is squared to the world axes rather than left wherever the pick
-    put the wrist.
+
+def tag_at(obs: Observation, x: float, y: float) -> Entity | None:
+    """The tag a robot-frame destination is standing on, or None.
+
+    Reporting only. Nothing routes a move through this: the coordinate the model
+    gave is where the arm goes, whether or not a tag happens to be under it.
+    What it buys is a transcript line an operator can check at a glance -- an
+    echoed tag position reads as "onto marker_2", and a destination that is
+    merely *near* one reads as the bare pixel it is.
     """
-    from mt4_vision.motion import square_place
-
-    return square_place(entity.x, entity.y)
+    best: Entity | None = None
+    best_d = ON_TAG_MM
+    for e in obs.markers:
+        d = ((e.x - x) ** 2 + (e.y - y) ** 2) ** 0.5
+        if d < best_d:
+            best, best_d = e, d
+    return best
 
 
 def destination_grasp(
@@ -460,31 +492,20 @@ def destination_grasp(
 ) -> tuple[Any | None, str]:
     """Where to release, or (None, why not). Squared to the world axes.
 
-    Two shapes, and both end in the same physical gate. A ``dest_entity_id`` is
-    a decoded tag, so its position comes from the calibration. A
-    ``dest_point_px`` is a pixel the model chose on bare desk, so its position
-    is the plain table-plane projection of that pixel -- no height, because a
-    destination is a place on the table rather than an object with a top.
+    One shape: a point the model gave, projected onto the table plane. No
+    height, because a destination is a place on the table rather than an object
+    with a top.
 
-    The pixel is **not** snapped to the nearest tag or slot. "Somewhere clear"
-    means the pixel it pointed at; nudging that onto a calibrated position
-    would be the loop overriding the only thing it asked the model to decide.
-    What the pixel must still survive is ``work_region_block_reason``, which is
-    geometry: reach, the J1 keep-out, ground Z, the desk polygon and the camera
-    frame.
+    The point is **not** snapped to the nearest tag or slot, and that holds even
+    when it lands squarely on one. A destination on marker 2 is marker 2's
+    coordinates echoed back, so snapping could only ever move the arm somewhere
+    the reply did not ask for -- and it would hide the case this protocol exists
+    to expose, where the model points at a tag while the task named an object
+    46mm away. What the point must survive is ``work_region_block_reason``,
+    which is geometry: reach, the J1 keep-out, ground Z, the desk polygon and
+    the camera frame.
     """
     from mt4_vision.workspace import work_region_block_reason
-
-    if action.dest_entity_id:
-        entity = obs.marker(action.dest_entity_id)
-        if entity is None:
-            return None, (
-                f"{action.dest_entity_id} is not a tag decoded in this frame"
-            )
-        why = work_region_block_reason(entity.x, entity.y, obs.calib)
-        if why is not None:
-            return None, f"{entity.id} cannot be reached: {why}"
-        return grasp_for(entity, obs.calib), ""
 
     readings = [
         p for p in (action.dest_point_px, action.dest_alt_point_px) if p is not None
@@ -499,9 +520,11 @@ def destination_grasp(
         blocked = work_region_block_reason(x, y, obs.calib)
         if blocked is None:
             return square_place(x, y), ""
+        on = tag_at(obs, x, y)
         why = why or (
             f"the destination pixel ({px:.0f}, {py:.0f}) is robot "
-            f"({x:.0f}, {y:.0f}), where {blocked}"
+            f"({x:.0f}, {y:.0f})"
+            f"{'' if on is None else f', on {on.id}'}, where {blocked}"
         )
     return None, why
 
@@ -630,40 +653,24 @@ def decide(
             return Action("STOP", False, bad, raw=raw)
 
     # ---- the destination -------------------------------------------------
-    dest_id: str | None = None
     dest_pt: tuple[float, float] | None = None
     dest_alt: tuple[float, float] | None = None
     if kind in ("TRANSFER", "PLACE"):
-        dest_id = _said_id(got, "dest_marker")
         readings = point_readings(got.get("dest_2d"), obs.size)
-        if dest_id and readings:
-            # Both given. The tag wins, because it is the one thing in this
-            # protocol the model was handed rather than asked to see, and a
-            # pixel that disagrees with it is the weaker of the two.
-            readings = ()
-        if dest_id is None and not readings:
+        if not readings:
             return Action(
                 "STOP", False,
-                f"{kind} needs a destination: either dest_marker naming a tag "
-                "listed in the prompt, or dest_2d as a pixel on the desk",
+                f"{kind} needs dest_2d, a point [x, y] on the 0-1000 grid "
+                f"inside the image{_named_a_tag(got)}",
                 raw=raw,
             )
-        if dest_id is not None and obs.marker(dest_id) is None:
-            listed = ", ".join(e.id for e in obs.markers) or "none"
-            return Action(
-                "STOP", False,
-                f"the reply names {dest_id}, which did not decode in this "
-                f"frame -- the tags in view are: {listed}",
-                raw=raw,
-            )
-        dest_pt = readings[0] if readings else None
+        dest_pt = readings[0]
         dest_alt = readings[1] if len(readings) > 1 else None
 
     return Action(
         kind, True, why or kind.lower(),
         label=None if source is None else source.label,
         source=source,
-        dest_entity_id=dest_id,
         dest_point_px=dest_pt,
         dest_alt_point_px=dest_alt,
         raw=raw,
