@@ -118,6 +118,34 @@ def test_stack_candidates_exclude_site_and_use_pickable():
     assert stack_candidates(scene, 200.0, 60.0) == [far]
 
 
+def test_stack_candidates_hold_back_cubes_behind_the_standing_column():
+    """A real cube radially beyond the column on its own bearing cannot be
+    approached -- the forearm would cross over the stack. Taking it as the
+    next pick fails the approach transit with no route and ends the run, so
+    it must drop out of the candidate list while a neighbour stays in."""
+    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
+    from mt4_vision.stackpath import StackPlanner
+
+    calib = load_calibration(DEFAULT_CALIB_PATH)
+    sx, sy = 153.6, 156.9
+    planner = StackPlanner(calib, sx, sy)
+    behind = SimpleNamespace(x=202.0, y=239.0, color="red", yaw_deg=0.0)
+    beside = SimpleNamespace(x=250.0, y=-134.0, color="blue", yaw_deg=0.0)
+    scene = SimpleNamespace(
+        cubes=[behind, beside],
+        pickable=lambda cubes: list(cubes),
+    )
+    cands = stack_candidates(
+        scene, sx, sy, calib=calib, stack_levels=3, planner=planner,
+    )
+    assert behind not in cands
+    assert beside in cands
+    # Nothing standing yet: the same cube is a fine pick.
+    assert behind in stack_candidates(
+        scene, sx, sy, calib=calib, stack_levels=0, planner=planner,
+    )
+
+
 def test_stack_shadow_rejects_marker3_phantom():
     """Field case 2026-07-21: stack (179,180) → phantom ~(115,227)."""
     from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration

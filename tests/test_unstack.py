@@ -10,6 +10,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
+from mt4_vision.landing import landing_ok
+from mt4_vision.stackpath import StackPlanner
 from mt4_vision.workspace import (
     MARKER_PAPER_CLEARANCE_MM,
     dist_mm,
@@ -79,7 +81,9 @@ def test_find_landing_degrades_spacing_when_crowded():
 
     calls = []
 
-    def fake_random_landing(rng, calib, *, sx, sy, markers, avoid, spacing_mm, attempts=0):
+    def fake_random_landing(
+        rng, calib, *, sx, sy, markers, avoid, spacing_mm, blocked=None, attempts=0
+    ):
         calls.append(spacing_mm)
         if spacing_mm == uc.DROP_SPACING_FALLBACKS_MM[-1]:
             return (250.0, 0.0)
@@ -90,6 +94,7 @@ def test_find_landing_degrades_spacing_when_crowded():
     try:
         landing, spacing = find_landing(
             random.Random(3), sx=0.0, sy=0.0, markers=[], avoid=[], calib=CALIB,
+            planner=StackPlanner.free_space(CALIB), levels=0,
         )
     finally:
         uc.random_landing = orig
@@ -108,13 +113,55 @@ def test_find_landing_raises_when_desk_has_no_room():
         try:
             find_landing(
                 random.Random(4), sx=0.0, sy=0.0, markers=[], avoid=[],
-                calib=CALIB,
+                calib=CALIB, planner=StackPlanner.free_space(CALIB), levels=0,
             )
             assert False, "expected Mt4ClientError"
         except Mt4ClientError:
             pass
     finally:
         uc.random_landing = orig
+
+
+def test_landing_gates_alone_approve_a_spot_the_column_makes_unusable():
+    """A drop point past the stack on nearly its own bearing is reachable, on
+    the desk and clear of every other cube, so every landing gate approves it
+    -- and the arm still cannot serve it while the column stands, because the
+    forearm crosses over the stack on the way. StackPlanner.column_shadow is
+    the only thing that knows, and it has to fire before the cube is picked up
+    rather than as a routing failure afterwards."""
+    calib = load_calibration(DEFAULT_CALIB_PATH)
+    markers = marker_slots_from_calibration(calib)
+    site = next(m for m in markers if m.marker_id == 3)
+    planner = StackPlanner(calib, site.x, site.y)
+
+    behind = (202.0, 239.0)
+    assert landing_ok(
+        behind[0], behind[1], calib, markers=markers,
+        marker_clearance_mm=MARKER_PAPER_CLEARANCE_MM,
+        site_xy=(site.x, site.y), site_avoid_mm=SITE_AVOID_MM,
+        min_radius_mm=SCATTER_MIN_RADIUS_MM, max_radius_mm=SCATTER_MAX_RADIUS_MM,
+    )
+    assert planner.route((154.0, 97.0, 216.0), (*behind, calib.safe_z), 3) is None
+    assert planner.column_shadow(3)(*behind)
+    # Same radius band, off the column's bearing: unaffected.
+    assert not planner.column_shadow(3)(250.0, -134.0)
+
+
+def test_find_landing_never_returns_a_spot_in_the_column_shadow():
+    calib = load_calibration(DEFAULT_CALIB_PATH)
+    markers = marker_slots_from_calibration(calib)
+    site = next(m for m in markers if m.marker_id == 3)
+    planner = StackPlanner(calib, site.x, site.y)
+    rng = random.Random(7)
+    for _ in range(40):
+        (x, y), _spacing = find_landing(
+            rng, sx=site.x, sy=site.y, markers=markers, avoid=[],
+            calib=calib, planner=planner, levels=3,
+        )
+        assert planner.pose_safe(x, y, calib.safe_z, 3)
+        assert planner.route(
+            (site.x, site.y, planner.hover_z(4)), (x, y, calib.safe_z), 3
+        ) is not None
 
 
 def test_random_place_j4_delegates_to_face_align_with_the_drawn_angle():

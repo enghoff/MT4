@@ -15,9 +15,10 @@ column and released at a randomly chosen open spot on the table at a
 randomly chosen orientation, kept clear of every marker, every cube
 scattered earlier in this run, and any pre-existing loose cube seen in
 one initial scan by at least ``DROP_SPACING_FALLBACKS_MM[0]`` (degrading
-to a tighter fallback only if the desk is too crowded for that). As with
-stack_cubes.py's placement, there is no visual alignment or post-place
-verification of the drop itself.
+to a tighter fallback only if the desk is too crowded for that), and out
+of the standing column's forearm shadow. As with stack_cubes.py's
+placement, there is no visual alignment or post-place verification of the
+drop itself.
 
 Column-safe transit reuses the same ``mt4_vision.stackpath.StackPlanner``
 + ``routed_travel``/``go_camera_park`` machinery stack_cubes.py uses to
@@ -33,11 +34,17 @@ import random
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from jog import console_focused, flush_console_input, key_down
 from mt4_jog.client import Mt4Client, Mt4ClientError
-from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibration
+from mt4_vision.calib import (
+    DEFAULT_CALIB_PATH,
+    Calibration,
+    CalibrationError,
+    load_calibration,
+)
 from mt4_vision.camera import FrameStream, capture_frame
 from dataclasses import replace
 
@@ -187,6 +194,7 @@ def random_landing(
     markers: list[MarkerSlot],
     avoid: list[tuple[float, float]],
     spacing_mm: float,
+    blocked: Callable[[float, float], bool] | None = None,
     attempts: int = LANDING_ATTEMPTS,
 ) -> tuple[float, float] | None:
     """A random reachable table XY at least ``spacing_mm`` from everything
@@ -198,6 +206,7 @@ def random_landing(
         attempts=attempts,
         min_radius_mm=SCATTER_MIN_RADIUS_MM,
         max_radius_mm=SCATTER_MAX_RADIUS_MM,
+        blocked=blocked,
     )
 
 
@@ -209,15 +218,24 @@ def find_landing(
     markers: list[MarkerSlot],
     avoid: list[tuple[float, float]],
     calib: Calibration,
+    planner: StackPlanner,
+    levels: int,
 ) -> tuple[tuple[float, float], float]:
     """Best-effort landing spot: try the preferred spacing first, then
-    degrade through ``DROP_SPACING_FALLBACKS_MM`` before giving up."""
+    degrade through ``DROP_SPACING_FALLBACKS_MM`` before giving up.
+
+    ``levels`` is the column height the carry will have to work past -- one
+    less than the level being lifted, since that cube is in the gripper.
+    A landing the arm cannot serve past that column is refused here rather
+    than surfacing as a routing failure with the cube already gripped.
+    """
     # Loop here (not via landing.find_landing) so tests can monkeypatch
     # this module's random_landing.
+    blocked = planner.column_shadow(levels)
     for spacing in DROP_SPACING_FALLBACKS_MM:
         landing = random_landing(
             rng, calib, sx=sx, sy=sy, markers=markers, avoid=avoid,
-            spacing_mm=spacing,
+            spacing_mm=spacing, blocked=blocked,
         )
         if landing is not None:
             return landing, spacing
@@ -467,6 +485,7 @@ def main() -> int:
                 landing, spacing = find_landing(
                     rng, sx=sx, sy=sy, markers=all_markers,
                     avoid=placed + obstacles, calib=calib,
+                    planner=planner, levels=level - 1,
                 )
                 tx, ty = landing
                 j4 = random_place_j4(tx, ty, rng)

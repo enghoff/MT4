@@ -430,15 +430,26 @@ def stack_candidates(
     *,
     calib=None,
     stack_levels: int = 0,
+    planner: StackPlanner | None = None,
 ) -> list[CubeDetection]:
     """Reachable pickable cubes outside the site keep-clear radius.
 
-    When the stack already has cubes, also drop detections in the camera
-    line-of-sight shadow behind the site (stack-top phantoms).
+    When the stack already has cubes, two more things drop out. Detections in
+    the camera line-of-sight shadow behind the site are stack-top phantoms,
+    not cubes. Cubes in the column's forearm shadow are real, but the arm
+    cannot reach over the standing column to grab them
+    (``StackPlanner.column_shadow``) -- taking one as the next pick makes the
+    approach transit fail with no route, so they are held back until the run
+    ends or the operator moves them.
     """
     behind_u = None
     if stack_levels > 0 and calib is not None:
         behind_u = stack_shadow_behind_unit(calib, sx, sy)
+    past_column = (
+        planner.column_shadow(stack_levels)
+        if planner is not None
+        else (lambda x, y: False)
+    )
     out: list[CubeDetection] = []
     for c in scene.pickable(scene.cubes):
         if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
@@ -450,6 +461,8 @@ def stack_candidates(
                 stack_levels=stack_levels,
             )
         ):
+            continue
+        if past_column(float(c.x), float(c.y)):
             continue
         out.append(c)
     return out
@@ -966,6 +979,7 @@ def main() -> int:
                     )
                 cands = stack_candidates(
                     scene, sx, sy, calib=calib, stack_levels=built,
+                    planner=planner,
                 )
                 if not cands:
                     print(f"level {level}: no reachable cube outside site")

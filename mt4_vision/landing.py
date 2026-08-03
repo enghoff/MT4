@@ -202,8 +202,13 @@ def random_landing(
     min_radius_mm: float = LANDING_MIN_RADIUS_MM,
     max_radius_mm: float = LANDING_MAX_RADIUS_MM,
     marker_clearance_mm: float = MARKER_PAPER_CLEARANCE_MM,
+    blocked: Callable[[float, float], bool] | None = None,
 ) -> tuple[float, float] | None:
-    """Random reachable table XY clear of site/markers/avoid, or None."""
+    """Random reachable table XY clear of site/markers/avoid, or None.
+
+    ``blocked`` is the same extra veto ``landing_ok`` takes -- unstack passes
+    the standing column's forearm shadow through it.
+    """
     for _ in range(attempts):
         r = rng.uniform(min_radius_mm, max_radius_mm)
         theta = rng.uniform(0.0, 2.0 * math.pi)
@@ -214,7 +219,7 @@ def random_landing(
             marker_clearance_mm=marker_clearance_mm,
             site_xy=(sx, sy), site_avoid_mm=site_avoid_mm,
             min_radius_mm=min_radius_mm, max_radius_mm=max_radius_mm,
-            avoid_camera_park=True,
+            avoid_camera_park=True, blocked=blocked,
         ):
             return (x, y)
     return None
