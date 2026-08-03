@@ -1040,34 +1040,59 @@ _FILLER = frozenset(
 )
 
 
+# Other words for a KIND that is already in the snapshot. Not filler -- these
+# name a real physical target, which is exactly why they must not reach the
+# grounding call: the thing they name is already listed, with a calibrated
+# position, and grounding it again invents a second entity on top of the first.
+#
+# Measured 2026-08-03, "move stapler to center aruco marker": "aruco" was not in
+# any entity's label, so the pre-pass grounded it, measured the tag at 54x20mm
+# and registered ``obj_1`` at (180, -142) -- 19.6mm from ``marker_2`` at
+# (162, -150), the very marker meant. A destination of kind "object" is not a
+# legal TRANSFER target, so the one-step move degraded into PICK then PLACE, and
+# the extra step is where the run then failed.
+#
+# Deliberately only synonyms that are *definitional*, plus plurals. An ArUco tag
+# IS a marker_N here -- the repo says so everywhere, from ``detect_markers`` to
+# the "ArUco tag did not decode" refusal -- so the word cannot name anything
+# else on this desk. "block" and "brick" are NOT in this table for cubes,
+# tempting as they are: a wooden block that the HSV detector never saw is a
+# thing the grounder should still be sent after, and crediting the word would
+# turn that into a silent pick of the nearest coloured cube instead.
+_KIND_SYNONYMS: dict[str, frozenset[str]] = {
+    "marker": frozenset({
+        "markers", "aruco", "arucos", "tag", "tags", "fiducial", "fiducials",
+    }),
+    "slot": frozenset({"slots"}),
+    "cube": frozenset({"cubes"}),
+    "object": frozenset({"objects"}),
+}
+
+
 def unmatched_nouns(
     instruction: str, snapshot: Snapshot, *, held: str | None = None
 ) -> set[str]:
     """Words naming a target that nothing in the snapshot could be.
 
-    The attribute check can only verify vocabulary it has -- cube colours from
-    HSV, marker numbers from ArUco. Faced with "the stapler" it found no
-    attribute at all and, having nothing to check, waved the choice through.
-    Measured live: the model named a blue cube for a stapler, said in its own
-    reason that the task could not be completed, and the arm went and picked
-    the cube up.
+    An unrecognised noun means the task is asking for something the cube
+    detector cannot see, so the caller sends the grounder after it and registers
+    what it finds as ``obj_N``. This is the productive use of the word list --
+    nothing here refuses anything.
 
-    An unrecognised noun is not the absence of evidence, it is evidence: the
-    task is asking for something the detector cannot see. That must reach
-    LOCATE_AT_PIXEL or STOP, never a nearby cube.
-
-    ``held`` names what is in the jaws, and its words are treated as known
-    vocabulary even though the object is deliberately no longer an entity.
-    Without that, the noun that started the task stays unmatched for the rest
-    of it and every later step re-grounds it. Measured live on "pick up the
-    stapler and place it on marker 0": step 1 picked the stapler, and step 2
-    searched for a stapler again, found the arm's own gripper, and registered
-    ``obj_2`` at robot (-50, -97) -- r = 109mm, inside the 140mm J1 keep-out.
-    A phantom that far inside the envelope is not a target the arm can ever
-    act on, so the only thing it can do is confuse the next decision.
+    ``held`` names what is in the jaws, and its words count as known vocabulary
+    even though the object is deliberately no longer an entity. Without it the
+    noun that started the task stays unmatched for the rest of the task and
+    every later step re-grounds it, which finds the arm's own gripper.
     """
     vocab = {w for e in snapshot.entities for w in e.label.lower().split()}
-    vocab |= {e.kind for e in snapshot.entities} | {"cube", "marker", "slot", "object"}
+    kinds = {e.kind for e in snapshot.entities}
+    vocab |= kinds | {"cube", "marker", "slot", "object"}
+    # Only for kinds actually present. With no marker in the snapshot there is
+    # nothing for "the aruco tag" to already be, so the word stays unmatched and
+    # reaches the grounder -- which is the honest answer rather than quietly
+    # resolving to whichever kind the model picks. See :data:`_KIND_SYNONYMS`.
+    for kind in kinds:
+        vocab |= _KIND_SYNONYMS.get(kind, frozenset())
     if held:
         vocab |= set(held.lower().split())
     words = {
