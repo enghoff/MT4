@@ -61,8 +61,8 @@ A raw-pixel reading is still kept and retried when the first will not segment,
 because a coordinate under 1000 is only *probably* normalized. That retry is
 also the loop's one soft spot: both readings can land on real, separately
 measurable objects, and the retry fires only when the leading one fails, so a
-reading that is wrong *and* segments is not caught. It is a much smaller target
-now that the leading reading is the one the model means.
+reading that is wrong *and* segments is not caught. It is a small target,
+because the leading reading is the one the model means.
 
 One capture per decision: :func:`observe` takes the frame, the overlay and the
 marker positions from the same exposure.

@@ -272,10 +272,9 @@ def is_phantom_detection(cube: CubeDetection, calib: Calibration) -> bool:
     statement about the blob. Or it can be somewhere the arm may not work --
     that is ``workspace.in_work_region``, and it is the same predicate a place
     target is held to, so a cube can never be pickable somewhere a place is
-    refused or the other way round.
-
-    This used to take ``markers`` and test the convex hull of their centres.
-    See the note above ``workspace.in_work_region`` for what that cost.
+    refused or the other way round. The convex hull of the marker centres is
+    not one of the two reasons -- see the note above
+    ``workspace.in_work_region``.
     """
     if cube.x is None or cube.y is None:
         return True

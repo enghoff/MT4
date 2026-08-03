@@ -66,8 +66,9 @@ from mt4_vision.workspace import (
 )
 
 # Always include calibrated marker centers in the height-probe grid when they
-# aren't already covered. Markers 0/1 (x~35-50) sat ~100mm outside the old
-# PLACEMENT_SLOTS hull; cube-top picks there missed by ~26mm (2026-07-21).
+# aren't already covered. Markers 0/1 (x~35-50) sit ~100mm outside the
+# PLACEMENT_SLOTS hull; unprobed, cube-top picks there miss by ~26mm
+# (measured 2026-07-21).
 MARKER_PROBE_COVER_MM = 25.0
 
 
@@ -118,9 +119,9 @@ GRID_POINTS = PLACEMENT_SLOTS + [
 MATCH_RADIUS_PX = 120.0
 # pick() is open-loop -- no force/current sensing, so a closed gripper isn't
 # proof of a grasp. If the cube is still within this many px of where it sat
-# before the pick, the grasp almost certainly failed (confirmed happening:
-# multiple "successful" placements turned out to be the untouched cube still
-# sitting at its very first starting position).
+# before the pick, the grasp almost certainly failed (seen live: several
+# "successful" placements were the untouched cube still sitting at its very
+# first starting position).
 GRASP_FAIL_RADIUS_PX = 30.0
 # Vision-bootstrap picks (no arm-known position yet) go through the table
 # homography, which reads a cube-top ~this much low in X (height parallax,

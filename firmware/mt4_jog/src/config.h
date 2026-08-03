@@ -60,9 +60,8 @@ static const uint8_t MP_FEASIBILITY_MAX_SAMPLES = 20;
  * instead of driving into the base. */
 static const float MT4_KEEPOUT_RADIUS_MM = 140.0f;
 /* Desk / ground plane: TCP Z below this is rejected (`mp`) and Cartesian jog
- * clamps downward velocity. Was 136 from envelope min Z in the old home-angle
- * frame (2026-07-19); after 2026-07-21 home refit (107/−9.3) the same desk
- * contact reports ~127mm, so floor lowered to leave headroom. */
+ * clamps downward velocity. Desk contact reports ~127mm in this home-angle
+ * frame (107/−9.3), so the floor sits ~12mm under it for headroom. */
 static const float MT4_GROUND_Z_MM = 115.0f;
 /* Ground / keep-out guard poll for joint-space motion (`j` jog, `m` moves) --
  * see refresh_envelope_guard_if_due() in motion.cpp for why this is a poll and
@@ -80,9 +79,10 @@ static const int32_t MT4_ENVELOPE_LOOKAHEAD_MIN = 6;
 static const int32_t MT4_ENVELOPE_LOOKAHEAD_MAX = 200;
 /* Soft joint step limits. J2/J3 counters are relative to the
  * limit/interference reference (steps=0 at switch / J3 fold-into-J2).
- * Envelope maxima measured 2026-07-19 in the old park-zero frame were
- * shifted by +(1000, 500) when the reference moved to the limit
- * (same physical poses). J1 switch-side min is overwritten at do_home()
+ * The J2/J3 numbers are the envelope maxima measured 2026-07-19 plus
+ * (1000, 500), the offset between the park-zero reference they were taken in
+ * and this limit reference (same physical poses). J1 switch-side min is
+ * overwritten at do_home()
  * from the center distance (limit = -j1_center); J2 switch-side min is
  * forced to 0. */
 static const int32_t MT4_JOINT_SOFT_MIN_DEFAULT[MT4_NUM_JOINTS] = {
@@ -92,8 +92,8 @@ static const int32_t MT4_JOINT_SOFT_MAX_DEFAULT[MT4_NUM_JOINTS] = {
 /* Coupled J2+J3 extension limit (step counters, limit-referenced).
  * Because J2 and J3 have opposite step signs, j2_deg - j3_deg =
  * const - (j2_steps + j3_steps)/spd, so a *minimum* link-angle difference
- * at full stretch is a *maximum* on j2_steps + j3_steps. Old park-zero
- * in-sample max sum was 2910; +1500 for the (1000+500) reference shift
+ * at full stretch is a *maximum* on j2_steps + j3_steps. The park-zero
+ * in-sample max sum is 2910; +1500 for the (1000+500) reference shift
  * → 4410. Soft min on the sum is loose — the folded extreme is gated by
  * J3 min + ground Z. */
 static const int32_t MT4_J2_J3_SUM_MAX = 4410L;
@@ -116,8 +116,8 @@ static const uint8_t MT4_ROUTE_RADIUS_COUNT =
 /* `mp` acceleration ramp (dda.cpp): a move starts at this slower, safe-to-
  * start-from-rest step period and ramps toward the move's cruise speed over
  * up to this many master ticks, then symmetrically ramps back up to
- * MP_ACCEL_START_US before the move ends. No-ops (falls back to the old
- * constant-speed stepping) when the requested cruise speed is already this
+ * MP_ACCEL_START_US before the move ends. No-ops (plain constant-speed
+ * stepping) when the requested cruise speed is already this
  * slow or slower, or the move is too short for a full ramp -- see
  * dda_set_ramp(). Untuned against real stall/skip behavior yet; the values
  * below are a conservative starting point for reaching the 700us max. */

@@ -38,9 +38,9 @@ from mt4_jog.status import TcpPose, parse_status_lines
 POLL_MS = 10
 HOME_WAIT_S = 180.0
 CJ_RESEND_S = 0.05
-# Gripper commands used to be sent once per key-transition only; a single
-# dropped serial line then left them stuck until the next transition. Resend
-# on a timer while held, same fix already applied to Cartesian jog above.
+# Gripper commands are resent on a timer while the key is held, as Cartesian
+# jog is above: sent once per key-transition, a single dropped serial line
+# leaves the gripper stuck until the next transition.
 GRIP_RESEND_S = 0.05
 SPEED_STEP_US = 100
 SPEED_MIN_US = 700
@@ -345,8 +345,7 @@ def sync_cart_jog(
     """Send the unified jog command: Cartesian direction and/or J4 roll.
     The firmware layers the roll onto the resolved-rate solution (`cj dx dy
     dz [j4]`), so the wrist can rotate while the TCP moves; a zero vector
-    with nonzero roll is a pure wrist roll through the same path (the old
-    separate single-axis J4 jog is gone)."""
+    with nonzero roll is a pure wrist roll through the same path."""
     if vector is None and j4_roll == 0:
         stop_jog(ser)
         return
@@ -641,7 +640,7 @@ def main() -> int:
                 plus = key_down("plus")
                 if (minus or plus) and now - last_speed_adjust >= SPEED_REPEAT_S:
                     # Lower period = faster; "=" (plus) speeds up. Keyboard
-                    # setting only — gamepad shoulders no longer nudge speed.
+                    # setting only — the gamepad shoulders do not touch speed.
                     keyboard_speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
                     keyboard_speed_us = max(
                         SPEED_MIN_US, min(SPEED_MAX_US, keyboard_speed_us)

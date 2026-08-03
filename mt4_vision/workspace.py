@@ -24,9 +24,9 @@ from mt4_vision.detect import CubeDetection, detect_cubes
 # With the cube-top calibration fitted, on-marker cubes read 5-15mm from
 # center while beside-the-paper cubes read 20mm+; 40mm classified adjacent
 # cubes as occupants. Measured live 2026-07-14: a cube resting on the tag
-# read 23mm from center, 1mm outside the old 22mm radius -- missed
-# "occupied" and (with the tag covered) landed in unknown instead, where
-# the planner can neither place onto it nor pick it off.
+# read 23mm from center, so a 22mm radius misses "occupied" and (with the
+# tag covered) lands the marker in unknown instead, where the planner can
+# neither place onto it nor pick it off.
 MARKER_OCCUPY_RADIUS_MM = 26.0
 # Min distance from any other cube for a *placement destination*: the
 # fingers sweep outward when releasing, so they need more room than the
@@ -125,7 +125,8 @@ class WorkspaceState:
     unknown_markers: list[MarkerSlot]
     free_slots: list[tuple[float, float]]
     # Marker ids whose ArUco tag decoded in the source frame; None when the
-    # state was built without decode information (legacy/test path).
+    # state was built without decode information (tests, and any caller that
+    # assembles a state by hand).
     visible_marker_ids: set[int] | None = None
 
 
@@ -185,21 +186,16 @@ def joints_within_soft_limits(
 #   3. the desk is physically there               (on_table)
 #   4. the camera can confirm what landed         (camera_covers)
 #
-# What this replaced, and why: the old gate was the convex hull of the
-# calibrated ArUco marker centres, applied twice with different allowances --
-# -80px in detect.py (a hard drop, the blob never became a detection) and
-# -55mm here (a demotion to non-pick). Marker positions are where the printed
-# paper happens to lie; they are not a statement about the desk, the arm, or
-# the camera. Measured 2026-08-02, that hull admitted 828cm^2 of a table where
-# the arm can safely work 2278cm^2, cut off at r=255-292mm depending on
-# bearing, and rejected everything past +-105deg. Three cubes physically on
-# the desk and well inside the arm's envelope were absent from the snapshot
-# entirely -- not listed-with-a-reason, just gone, because the drop happened
-# below the layer that writes reasons.
-#
-# The angular span of that hull turned out to be about right: past ~100deg the
-# desk itself runs out. It was the RADIUS that was badly under-called, by
-# 40-90mm in nearly every direction.
+# Nothing else may gate a pick or a place, and in particular the convex hull
+# of the calibrated ArUco marker centres is not a work region. Marker
+# positions are where the printed paper happens to lie; they are not a
+# statement about the desk, the arm, or the camera. Measured 2026-08-02, that
+# hull covers 828cm^2 of a table where the arm can safely work 2278cm^2: it
+# stops at r=255-292mm depending on bearing, 40-90mm short in nearly every
+# direction, and rejects everything past +-105deg (only the angular span is
+# about right -- past ~100deg the desk itself runs out). A gate applied below
+# the layer that writes reasons is worse still: a cube dropped there is absent
+# from the snapshot entirely rather than listed with a reason.
 
 
 def _table_polygon(calib: Calibration) -> np.ndarray | None:
@@ -235,8 +231,8 @@ def camera_covers(
 ) -> bool:
     """True when a cube resting at (x, y) images inside the frame.
 
-    Asks the question the old ``MAX_VERIFIABLE_RADIUS_MM`` circle was reaching
-    for, but asks it of the actual camera. This mount is steeply oblique with
+    Asks that of the actual camera rather than of a radius about the base.
+    This mount is steeply oblique with
     its nadir off to one side at (518, -35), so coverage is nothing like a
     circle about the base: the frame's near edge cuts in at x~284mm on the
     centreline while both sides reach past 380mm. A 240mm circle threw away
@@ -372,9 +368,9 @@ def partition_cubes_on_markers(
     """Return (occupied marker pairs, cubes not on any marker).
 
     Globally greedy nearest-pair matching: when two cubes contend for one
-    marker, the loser can still claim its own second-nearest marker. The old
-    per-cube nearest-only rule dropped the loser entirely, leaving a
-    physically occupied marker "free" -- an invitation to stack.
+    marker, the loser can still claim its own second-nearest marker. A
+    per-cube nearest-only rule drops the loser entirely, leaving a physically
+    occupied marker "free" -- an invitation to stack.
     """
     pairs: list[tuple[float, int, MarkerSlot]] = []
     for index, cube in enumerate(cubes):

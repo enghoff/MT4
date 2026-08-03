@@ -716,22 +716,22 @@ static bool mp_segment_target(uint16_t seg, const JointAnglesDeg *near,
  * fresh via live IK against the real (possibly curved, keep-out-detouring)
  * route as each segment runs.
  *
- * This used to sum a full IK solve per ~2mm segment along the planned
- * route (up to ~125 for a full-workspace move) to account for detours and
- * segmentation precisely. Measured live at 55-420ms depending on distance
- * -- long enough that start_absolute_move()'s in-flight-retarget path
- * (which deliberately doesn't stop the arm while this runs, to avoid an
- * abrupt halt) let the arm physically outrun the route snapshot this was
- * planned against before the new path was even armed: the freshly-armed
- * segment 1 target could already be behind the arm's real position by the
- * time "ok mp" was even printed, seen live as the arm freezing for several
- * ticks then jerking forward once a later, no-longer-stale retarget
- * finally landed. The straight joint-space chord between the current pose
- * and the final target (both already solved by the time this is called)
- * is a cheap substitute -- one delta computation, no IK, no per-segment
- * loop. It can't predict a curved detour's true joint travel as precisely,
- * but a slightly mistimed decel point is a bounded/safe cosmetic
- * difference, unlike the multi-hundred-ms block it replaces. */
+ * The estimate is the straight joint-space chord between the current pose
+ * and the final target, both already solved by the time this is called:
+ * one delta computation, no IK, no per-segment loop. Summing a full IK
+ * solve per ~2mm segment along the planned route (up to ~125 for a
+ * full-workspace move) would account for detours and segmentation
+ * precisely, and costs 55-420ms depending on distance, measured live --
+ * long enough that start_absolute_move()'s in-flight-retarget path (which
+ * deliberately doesn't stop the arm while this runs, to avoid an abrupt
+ * halt) lets the arm physically outrun the route snapshot it was planned
+ * against before the new path is armed: the freshly-armed segment 1 target
+ * can already be behind the arm's real position by the time "ok mp" is
+ * printed, seen live as the arm freezing for several ticks then jerking
+ * forward once a later, no-longer-stale retarget lands. The chord can't
+ * predict a curved detour's true joint travel as precisely, but a slightly
+ * mistimed decel point is a bounded/safe cosmetic difference next to a
+ * multi-hundred-ms block. */
 static int32_t mp_estimate_path_ticks(const JointAnglesDeg *target) {
   int32_t deltas[MT4_NUM_JOINTS];
   int32_t master = 0;
@@ -1233,7 +1233,7 @@ static bool setup_cartesian_jog(const Vec3 *dir) {
   }
 
   if (cart_j4_roll != 0) {
-    /* Full-rate roll (one step per tick, same feel as the old standalone
+    /* Full-rate roll (one step per tick, the same feel as the standalone
      * J4 jog), added on top of any orient-hold counter-rotation and
      * clamped to the DDA's one-step-per-tick ceiling. Sign convention:
      * positive roll = positive joint direction (dda_arm derives the DIR
@@ -1507,10 +1507,9 @@ bool start_absolute_move(float x, float y, float z, float j4_deg,
   // would clear/kill it, so the arm can be spliced onto the new path at
   // whatever speed it's already going instead of hard-stopping and
   // re-accelerating from MP_ACCEL_START_US every single retarget -- that
-  // stop/slow-restart cycle is what produced the sawtooth speed jerk on
-  // every retarget before this fix. A genuinely fresh start (idle, or
-  // interrupting `cj`/`m`) is untouched: it still stops and ramps from
-  // MP_ACCEL_START_US exactly as before.
+  // stop/slow-restart cycle puts a sawtooth speed jerk on every retarget.
+  // A genuinely fresh start (idle, or interrupting `cj`/`m`) is not
+  // affected: it stops and ramps from MP_ACCEL_START_US.
   const bool retarget_in_flight = mp_path.active && jog_active;
   if (retarget_in_flight) {
     // `mp` always means "go here now" -- it supersedes whatever's in

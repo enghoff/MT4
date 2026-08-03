@@ -17,20 +17,19 @@ Two phases:
   2. Tracking (raw serial, streaming `mp`): `Mt4Client.move_to()` blocks
      until the whole move completes, so this script instead re-sends a
      bounded absolute move (`mp x y z j4 g speed_us`) every tick, retargeting
-     it to the cube's latest position before the previous one finishes. This
-     used to be done with the firmware's Cartesian jog (`cj dx dy dz`)
-     instead -- direction-only, no notion of a destination, so *something*
-     external always has to decide when to stop it, and that something was
-     this host loop's ~100ms-stale glance at position: overshoot wasn't a
-     stepper coasting past the target (steppers don't coast), it was the
-     arm faithfully stepping in the last commanded direction for the entire
-     gap between one position sample and the next. `mp` moves the stop
-     decision into firmware, which tracks its own remaining step count and
-     halts exactly there, no host reaction time involved. The one thing that
-     took firmware work to support was retargeting *mid-flight* without an
-     abrupt stop -- see start_absolute_move()'s in-flight-retarget path in
-     motion.cpp -- so a moving cube gets a continuously updated destination
-     instead of finish-then-redirect. This script closes `Mt4Client` and
+     it to the cube's latest position before the previous one finishes. The
+     firmware's Cartesian jog (`cj dx dy dz`) is the wrong tool for this:
+     direction-only, no notion of a destination, so *something* external has
+     to decide when to stop it, and that something is this host loop's
+     ~100ms-stale glance at position. The resulting overshoot is not a
+     stepper coasting past the target (steppers don't coast), it is the arm
+     faithfully stepping in the last commanded direction for the entire gap
+     between one position sample and the next. `mp` keeps the stop decision
+     in firmware, which tracks its own remaining step count and halts exactly
+     there, no host reaction time involved, and retargets *mid-flight*
+     without an abrupt stop -- see start_absolute_move()'s in-flight-retarget
+     path in motion.cpp -- so a moving cube gets a continuously updated
+     destination instead of finish-then-redirect. This script closes `Mt4Client` and
      opens its own serial connection for the loop, since only one process
      may own the COM port at a time.
 
@@ -132,20 +131,20 @@ DEADBAND_MM = 3.0  # inside this, stop rather than jitter
 # feedback that's stale by about one tick (~40-60ms) instead of the several
 # hundred ms a synchronous send(wait=...) would cost every tick.
 #
-# A synchronous per-tick poll was tried first and did fix a real bug (a
-# multi-tick blind window where the arm kept jogging on a stale position
-# estimate, overshot the target during it, and reversed hard once the next
-# poll revealed the overshoot -- a feedback-deadtime limit cycle, confirmed
-# live as TCP y oscillating ~40-70mm around a perfectly stationary target).
-# But blocking ~150-200ms per tick throttled the whole loop from
-# ~15-30Hz (camera-bound) to ~5-6Hz, and a bang-bang controller that looks
-# smooth at high update rate looks like discrete steps at a low one --
-# nothing about the motion logic changed, just how coarse each visible
-# correction segment became. The async version keeps the fast loop rate
-# and keeps the blind window short enough not to matter.
+# Feedback matters: without it the arm jogs on a stale position estimate
+# through a multi-tick blind window, overshoots, and reverses hard once the
+# next poll reveals the overshoot -- a feedback-deadtime limit cycle, seen
+# live as TCP y oscillating ~40-70mm around a perfectly stationary target.
+# A synchronous poll buys that at ~150-200ms per tick, which throttles the
+# whole loop from ~15-30Hz (camera-bound) to ~5-6Hz, and a bang-bang
+# controller that looks smooth at a high update rate looks like discrete
+# steps at a low one -- the motion logic is identical, only each visible
+# correction segment gets coarser. The async version keeps the fast loop
+# rate and keeps the blind window short enough not to matter.
+#
 # Requested speed ramps with distance-to-target: fast (the firmware's
 # quickest step rate) while far away, slower as it converges. This IS
-# load-bearing, confirmed by removing it: even with fresh per-tick TCP
+# load-bearing: without it, and even with fresh per-tick TCP
 # feedback, a constant max-speed approach overshoots the 3mm deadband within
 # a single ~100ms tick (real linear speed at max jog covers more than that
 # easily), and the correction the next tick overshoots the other way -- a
@@ -156,42 +155,38 @@ DEADBAND_MM = 3.0  # inside this, stop rather than jitter
 # in-flight-retarget path (dda_continue_ramp) is what smooths the applied
 # step rate toward each newly requested speed_us on the firmware's own
 # clock, so a changing schedule value never itself produces a jerk, the
-# same way `cjramp` did for `cjspeed` before this script switched from `cj`
-# to `mp`. That smoothing is cheap -- but unlike `cj` (a direction+speed
+# same way `cjramp` does for `cjspeed`. That smoothing is cheap -- but
+# unlike `cj` (a direction+speed
 # re-arm), an `mp` call itself is NOT: it solves IK and plans a
 # keep-out-clear route (in-flight retargets now skip the route's IK
 # feasibility sweep, reusing the in-flight path's detour radius when the
 # chord doesn't clear -- see plan_mp_xy_route -- but target IK, route
-# geometry, and parsing remain), real work on an 8-bit AVR with no FPU. An earlier version of this constant gated resends
-# on target drift (skip unless the target moved >= 5mm since the last `mp`
-# actually sent) to protect against that cost -- confirmed necessary at the
-# time: resending every ~100ms tick regardless of whether the target moved
-# was blocking firmware's loop() long enough (55-420ms, scaling with
-# distance -- motion.cpp's mp_estimate_path_ticks() was solving IK once per
-# ~2mm segment of the whole path just to time the accel/decel ramp) that
-# the AVR's UART RX buffer filled and silently dropped bytes, corrupting
-# `mp` lines (`err mp <x> <y> <z> <j4> <g> [speed_us]`) or splicing two
-# lines together (`err unknown`). But gating on drift instead of just
-# eating the cost had its own failure mode, also confirmed live: it let the
-# arm coast to the end of its current (now slightly stale) target and sit
-# there -- since `mp` is a bounded move that finishes and holds on its own
-# once nothing new is sent -- until enough drift finally accumulated to
-# unblock the next send, which then had no in-flight move left to splice
-# onto and had to cold-start, seen as the arm stopping dead and jerking
-# forward again while being tracked continuously in one direction. Fixing
-# mp_estimate_path_ticks() to use a cheap straight joint-space chord
-# instead of a per-segment IK sum (see motion.cpp) cut the block to a flat
-# ~65-110ms independent of distance -- but that's still comparable to this
-# loop's own ~100ms tick, and send_quick never waits for a reply, so
-# resending unconditionally again just traded byte-loss for a different
-# problem: Python outpacing what firmware could actually drain, queuing up
-# an ever-growing backlog of already-stale targets that landed in an
-# uneven rhythm (confirmed live as tcp alternating small/big steps between
-# polls -- the arm executing whatever the queue caught up to, not the
-# current camera-fresh target). See awaiting_mp_ack in run_tracking_loop:
-# gating resends on the firmware's own ack self-paces to its real
-# throughput without an arbitrary constant, and unlike the drift gate it
-# never withholds a send once firmware is actually ready.
+# geometry, and parsing remain), real work on an 8-bit AVR with no FPU.
+#
+# Resends are therefore paced by the firmware's own ack -- see
+# awaiting_mp_ack in run_tracking_loop -- which matches its real throughput
+# without an arbitrary constant and never withholds a send once firmware is
+# ready. Both alternatives fail:
+#
+# * Resending every ~100ms tick regardless blocks firmware's loop() long
+#   enough that the AVR's UART RX buffer fills and silently drops bytes,
+#   corrupting `mp` lines (`err mp <x> <y> <z> <j4> <g> [speed_us]`) or
+#   splicing two together (`err unknown`). That block is ~65-110ms flat with
+#   mp_estimate_path_ticks()'s straight joint-space chord (55-420ms, scaling
+#   with distance, if it sums IK per ~2mm segment -- see motion.cpp), still
+#   comparable to this loop's own ~100ms tick. send_quick never waits for a
+#   reply, so Python outpaces what firmware can drain: an ever-growing
+#   backlog of already-stale targets landing in an uneven rhythm, seen live
+#   as tcp alternating small/big steps between polls -- the arm executing
+#   whatever the queue caught up to, not the current camera-fresh target.
+# * Gating on target drift (skip unless the target moved >= 5mm since the
+#   last `mp` sent) lets the arm coast to the end of its current, slightly
+#   stale target and sit there -- `mp` is a bounded move that finishes and
+#   holds on its own once nothing new is sent -- until enough drift
+#   accumulates to unblock the next send, which then has no in-flight move
+#   left to splice onto and must cold-start. Seen live as the arm stopping
+#   dead and jerking forward again while tracking continuously in one
+#   direction.
 SPEED_FAR_US = JOG_SPEED_MIN_US  # fastest, used beyond SPEED_FAR_MM
 SPEED_NEAR_US = 2400  # gentle final approach, used within SPEED_NEAR_MM
 SPEED_FAR_MM = 40.0
@@ -482,8 +477,8 @@ def run_tracking_loop(
                 # ticks, felt as the arm micro-stepping/jerking even though
                 # each individual retarget is itself smooth. Gating on the
                 # firmware's own ack (rather than a fixed delay or a
-                # position deadzone -- see git history for why a drift-based
-                # gate was tried and reverted) self-paces to whatever rate
+                # position deadzone -- see the note on SPEED_FAR_US for why
+                # a drift gate stalls the arm) self-paces to whatever rate
                 # firmware can actually sustain and always sends the
                 # freshest known target the moment it's ready, so it can't
                 # build a backlog and can't stall waiting for accumulated

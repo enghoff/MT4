@@ -5,14 +5,13 @@ taking a ``Grasp`` (x, y, yaw, and how that yaw repeats) rather than bare
 coordinates. Everything above this (``pickplace``'s pick/place, shuffle, the
 entity layer, MCP) composes these instead of hand-rolling leg sequences.
 
-**Why this exists.** Motion used to be split in two. ``routed_travel`` sent a
-whole column-aware route as one `mq` queue with per-leg wrist and speed, and
-only stack_cubes/unstack_cubes used it. Everything else -- ``pick``, ``place``,
-shuffle, MCP -- issued one blocking `mp` per segment with a stop/settle and a
-serial round trip each, plus separate blocking gripper calls, so a shuffle
-pick-and-place cost ~6 `mp` round trips and 2 gripper sleeps for a move the
-stacking path did in two queues. Meanwhile yaw was handled five different ways
-across three conventions, and no primitive took a target *pose* at all.
+**Why this exists.** Left to each caller, motion degrades two ways. A caller
+that composes its own segments issues one blocking `mp` each, with a
+stop/settle and a serial round trip per segment plus separate blocking gripper
+calls -- about 6 `mp` round trips and 2 gripper sleeps for a pick-and-place
+that ``routed_travel``'s queued, column-aware route does in two queues. And yaw
+needs one owner: with no primitive taking a target *pose*, every caller invents
+its own convention.
 
 **What makes one queue possible.** Firmware grip stations (a queued entry with
 ``dwell_ms`` > 0: no motion, grip, hold until the sweep finishes plus a settle
@@ -368,9 +367,9 @@ def send_legs(
     """Send ``legs`` as as few `mq` queues as the firmware depth allows.
 
     Returns the number of move_path calls made. Uniform j4/speed collapse to
-    scalars so the wire form of an ordinary transit is byte-identical to what
-    it was before this layer existed; only genuinely mixed legs go out as
-    lists. Raises on the first failing queue rather than sending the rest,
+    scalars, so an ordinary transit goes out in the plain scalar wire form and
+    only genuinely mixed legs go out as lists. Raises on the first failing
+    queue rather than sending the rest,
     since later legs were planned against poses the arm never reached.
     """
     if not legs:
@@ -432,9 +431,8 @@ def plan_pick_legs(
 
     The open rides on the first transit leg's ``grip`` so the sweep overlaps
     travel for free, and the barrier then guarantees it finished before the
-    descent. Compare the old sequence: a blocking gripper call, a blocking
-    travel `mp`, a blocking descend `mp`, a blocking gripper call, a blocking
-    lift `mp`.
+    descent. The whole pick is one queue: no blocking gripper calls, no `mp`
+    per segment, no stop and settle between travel, descent and lift.
     """
     plan = _planner_for(calib, planner)
     gz = g.grasp_z(calib)
@@ -555,8 +553,8 @@ def pick_at(
     ``pickplace.pick_centered``, which this defers to.
     """
     # The one backward dependency in this module, and deferred so the import
-    # graph stays wrist -> motion -> pickplace. pick_centered is a legacy
-    # multi-`mp` sequence that cannot be expressed as legs (see above); moving
+    # graph stays wrist -> motion -> pickplace. pick_centered is a multi-`mp`
+    # sequence that cannot be expressed as legs (see above); moving
     # it down here would buy nothing but churn.
     from mt4_vision.pickplace import pick_centered
 

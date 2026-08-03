@@ -68,7 +68,7 @@ L_WEIGHT = 0.35
 MIN_DEVIATION = 10.0
 # Half-side (mm) of the region around each marker treated as scene furniture.
 # The tags sit on ~67mm paper held by white tape; all of it is background. This
-# is why a pen beside a tag no longer fuses with it -- but it also means an
+# is why a pen beside a tag does not fuse with it -- but it also means an
 # object resting ON a marker cannot be measured. Move it off the tag.
 PAPER_HALF_MM = 42.0
 # A measurement is only returned if two window sizes agree within these bounds.
@@ -997,17 +997,17 @@ def relocate_detail(
     The reason matters because they call for opposite responses. "It moved" is
     a scene problem the caller should report; "found it, could not re-measure
     it" is ours, and telling a user their stationary stapler moved sends them
-    looking at the desk instead of at the code. Measured 2026-08-02: a stapler
-    that had not moved template-matched at **0.993** on the identical pixel and
-    was still refused, because the re-measure below used to be the plain
-    desk-deviation :func:`measure`, which cannot segment that stapler at all.
+    looking at the desk instead of at the code.
 
-    **The re-measure now runs through the matched template's own bounds.**
-    That box is a tight, true outline of the object in this frame -- it is the
-    crop the object was registered from, found again -- so it seeds GrabCut
-    exactly the way a detector box does. Without it, any object that only
-    GrabCut could find in the first place was permanently un-re-acquirable:
-    registration succeeded, and every attempt to act on it was refused.
+    **The re-measure runs through the matched template's own bounds.** That box
+    is a tight, true outline of the object in this frame -- it is the crop the
+    object was registered from, found again -- so it seeds GrabCut exactly the
+    way a detector box does. The plain desk-deviation :func:`measure` cannot
+    segment a stapler at all (measured 2026-08-02: one that had not moved
+    template-matched at **0.993** on the identical pixel), so without the
+    template bounds any object that only GrabCut could find in the first place
+    is permanently un-re-acquirable: registration succeeds, and every attempt
+    to act on it is refused.
     """
     th, tw = obj.template.shape[:2]
     if th < 2 or tw < 2:
@@ -1072,8 +1072,8 @@ def plan_object_grasp(obj: LocatedObject, calib: Calibration):
 
     Falls back to the outline when no silhouette was stored -- ``measure_box``
     has no mask, and neither do objects measured before the mask was carried --
-    so the answer degrades to the old "close across the short axis at the
-    centroid" rather than to a refusal.
+    so the answer degrades to "close across the short axis at the centroid"
+    rather than to a refusal.
     """
     from mt4_vision.grasp import GraspPlan, footprint_mm, plan_grasp
 

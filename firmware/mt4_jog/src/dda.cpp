@@ -143,14 +143,14 @@ bool dda_arm(int32_t master, const int32_t deltas[MT4_NUM_JOINTS], bool track_mo
   // writes on an 8-bit AVR, so each one is several non-atomic store
   // instructions. When the timer's stopped (the common case: every `mp`
   // segment boundary goes through motion_poll_move_done()'s dda_stop()
-  // first) the Timer1 ISR can't fire mid-update, so this was never a
-  // problem in practice. But a live splice (an in-flight `mp` retarget, or
+  // first) the Timer1 ISR can't fire mid-update, so there it is not a
+  // problem. But a live splice (an in-flight `mp` retarget, or
   // an `mq` queue-pop continuation -- see mp_execute_segment's jog_active
   // branch) deliberately calls this WITHOUT stopping the timer first, so
   // the ISR keeps ticking on the OLD state while this function is mid-write
-  // to the NEW state. Caught live: an `mp` retarget arriving mid-flight
-  // left the arm permanently stalled with axes still shown armed (STEP=..)
-  // but JOG=off and no further "mp done"/"err" -- consistent with the ISR
+  // to the NEW state. Unguarded, an `mp` retarget arriving mid-flight
+  // leaves the arm permanently stalled with axes still shown armed (STEP=..)
+  // but JOG=off and no further "mp done"/"err" (seen live) -- the ISR
   // reading a torn dda_accum/move_remaining and driving dda_axis_mask into
   // a state nothing thereafter could complete. cli()/sei() around the
   // mutation (mirroring dda_set_ramp/dda_continue_ramp's own guard on their
@@ -261,12 +261,12 @@ void dda_continue_ramp(uint16_t cruise_us, uint16_t end_us, int32_t total_ticks,
   // Period the leg must have decelerated back to by the time its ticks run
   // out -- the ISR's DECEL phase ramps toward ramp_start_ticks, so for a
   // retargeted leg that must be the slow safe-stop period (the same one a
-  // cold start launches from), NOT the current speed. Seeding it with
-  // cur_ticks (as an earlier version did) meant a leg spliced in at full
-  // speed either skipped decel entirely (cur == cruise -> the old
-  // early-return below) or, worse, decelerated to the new slower cruise and
-  // then snapped BACK UP to the old fast period for the final ticks before
-  // the hard stop -- a speed-up jerk exactly at arrival, where a tracker
+  // cold start launches from), NOT the current speed. Seeded with
+  // cur_ticks, a leg spliced in at full speed would either skip decel
+  // entirely (cur == cruise -> the early-return below) or, worse,
+  // decelerate to the new slower cruise and then snap BACK UP to the faster
+  // period for the final ticks before the hard stop -- a speed-up jerk
+  // exactly at arrival, where a tracker
   // spends most of its time. If the requested cruise is already as slow or
   // slower than end_us, ending flat at cruise is already stop-safe.
   uint16_t end_ticks = static_cast<uint16_t>(end_us * TIMER_TICKS_PER_US);

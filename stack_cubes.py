@@ -91,8 +91,8 @@ from mt4_vision.workspace import (
 # Cubes this close to the stack marker are moved aside before building.
 SITE_CLEAR_MM = 70.0
 # Clear landings sit this far past the keep-clear radius so release drag /
-# vision scatter can't bounce them straight back into the zone (the old
-# free-slot path parked at ~70mm and re-cleared the same cube forever).
+# vision scatter can't bounce them straight back into the zone; parking at
+# ~70mm re-clears the same cube forever.
 CLEAR_MARGIN_MM = 40.0
 CLEAR_PARK_MM = SITE_CLEAR_MM + CLEAR_MARGIN_MM  # 110mm from marker
 # Finger clearance from other cubes when parking a cleared cube.
@@ -110,10 +110,9 @@ SITE_CLEAR_ATTEMPTS = 6
 # the camera than the site. Ignore pick candidates in that corridor.
 # Measured 2026-07-21 on marker 3, level 4: true (179,180) -> phantom
 # ~(115,227) (~79mm along, ~8mm lateral). The phantom spreads laterally as
-# well as along as the stack grows, not just along -- field case 2026-07-24
-# marker 2 level 6 put a phantom at ~49mm lateral, past the old fixed 45mm
-# cutoff, and it slipped through as a real pick candidate. Both axes now
-# scale with stack height.
+# well as along as the stack grows -- field case 2026-07-24, marker 2 level
+# 6: a phantom at ~49mm lateral, past a fixed 45mm cutoff, slips through as a
+# real pick candidate. Both axes scale with stack height.
 STACK_SHADOW_LATERAL_MIN_MM = 45.0
 STACK_SHADOW_LATERAL_PER_LEVEL_MM = 10.0
 STACK_SHADOW_ALONG_MIN_MM = 25.0
@@ -121,12 +120,11 @@ STACK_SHADOW_ALONG_PER_LEVEL_MM = 35.0
 STACK_SHADOW_ALONG_FLOOR_MM = 90.0
 
 
-# Field case 2026-07-24: the old +-110 deg cap only ever tried a narrow fan
-# off the marker->cube bearing. At a corner site (marker 0) that fan mostly
-# fell outside the pick hull, leaving exactly one valid landing -- which the
-# previously-cleared cube had just taken, stranding the next clear with
-# "no reachable clear spot" even though open table space existed elsewhere
-# around the site. A full-circle sweep finds those spots.
+# A full circle, not a fan off the marker->cube bearing. Field case
+# 2026-07-24: at a corner site (marker 0) a +-110 deg fan falls mostly
+# outside the work region, leaving exactly one valid landing -- and once a
+# cleared cube takes it, the next clear strands with "no reachable clear
+# spot" while open table space remains elsewhere around the site.
 _CLEAR_ANGLES_DEG = expanding_angles_deg()
 _PARK_GRID = annulus_grid()
 
@@ -361,8 +359,8 @@ def in_stack_camera_shadow(
 # themselves (levels 1..built each cast one, at ~26mm/level along the
 # camera LOS) and must never be treated as fallen -- they hold perfectly
 # still as the stack grows, unlike the top phantom. A "static in corridor
-# means fallen" rule was tried 2026-07-24 and false-positived on exactly
-# those side faces; only the off-corridor test is trustworthy.
+# means fallen" rule false-positives on exactly those side faces (field case
+# 2026-07-24); only the off-corridor test is trustworthy.
 NEAR_SITE_MIN_MM = 25.0
 CORRIDOR_ALIGN_COS = math.cos(math.radians(35.0))
 
@@ -526,7 +524,7 @@ def place_on_stack(
     hz = planner.hover_z(level)
     if hz is None:
         raise Mt4ClientError(f"level {level}: hover height unreachable")
-    # Same axis-square wrist as the old along-arm place (assumes j4zero).
+    # The axis-square wrist an along-arm place uses (assumes j4zero).
     j4 = j4_for_face_align(0.0, current_j4_deg=None, x=sx, y=sy)
     tcp = client.get_tcp()
     if tcp is None:
@@ -547,8 +545,7 @@ def place_on_stack(
     # covers the column, not the table); the hop clears the column by
     # construction (hz = hover height, fingers above the top cube); the
     # descend is a pure vertical drop down the column axis to rz, run slow
-    # (approach speed) like the old standalone _approach so the cube seats
-    # at the same speed.
+    # (approach speed) so the cube seats gently.
     legs = plan_route_legs(
         calib, planner, (float(tcp.x), float(tcp.y), float(tcp.z)),
         stage[0], stage[1], hz, built,

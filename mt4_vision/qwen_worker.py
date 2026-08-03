@@ -53,9 +53,9 @@ def format_region(r: Region) -> str:
 def _display_lines(text: str, regions: list[Region]) -> list[str]:
     """Split an answer into lines for the terminal transcript.
 
-    BottomUI.emit() wraps a too-long line across rows now rather than
-    dropping its tail, so a JSON array on one line -- the schema /identify
-    and the new default both reply with -- no longer loses text on screen.
+    BottomUI.emit() wraps a too-long line across rows rather than dropping
+    its tail, so a JSON array on one line -- the schema /identify and the
+    default both reply with -- keeps all its text on screen.
     But ``json.dumps(indent=2)`` explodes every ``bbox_2d`` into 6 lines of
     its own, which is technically readable and practically a scroll-fest for
     a handful of objects. ``regions`` is already the exact fields worth

@@ -112,7 +112,7 @@ def test_a_coordinate_above_the_scale_rules_normalized_out():
 
 
 def test_every_live_reply_lands_on_its_object():
-    """The regression, on all four objects measured on the rig."""
+    """All four objects measured on the rig."""
     for label, (nbox, truth) in LIVE.items():
         x1, y1, x2, y2 = to_frame_pixels(nbox, SIZE)
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2

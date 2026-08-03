@@ -123,10 +123,10 @@ def cleared_fields(previous: dict, incoming: dict) -> list[str]:
 
 
 # One-shot per process: a table-plane recalibration clears
-# cube_top_homography (correctly -- it was fit at the old camera pose), and
-# nothing downstream failed when the refit was skipped; picks just silently
-# regained 15-30mm of parallax error. Warn at use time so every entry path
-# (recalibrate script, manual JSON edits, backup restores) is covered.
+# cube_top_homography (correctly -- that fit belongs to the camera pose it was
+# measured at), and nothing downstream fails when the refit is skipped; picks
+# silently carry 15-30mm of parallax error. Warn at use time so every entry
+# path (recalibrate script, manual JSON edits, backup restores) is covered.
 _warned_no_cube_top_correction = False
 
 
@@ -225,9 +225,9 @@ class Calibration:
     # default; assumes firmware ``j4zero`` (``calibrate_j4.py``) so world
     # J4 = 0 means jaws along the arm.
     face_align_picks: bool = True
-    # Pixel-space convex hull of the marker centers. Kept for the overlay and
-    # for older calibrations; no longer a pick/place gate -- see
-    # workspace.in_work_region for what replaced it and why.
+    # Pixel-space convex hull of the marker centers. Drawn on the overlay, and
+    # accepted from calibration files that carry it; it is not a pick/place
+    # gate -- workspace.in_work_region is, and its note says why.
     workspace_hull_px: list[list[float]] | None = None
     # Desk surface as a polygon in ROBOT frame (mm), safety margin already
     # applied. Written by calibrate_table_edge.py. This is the answer to "is
@@ -353,14 +353,14 @@ class Calibration:
         quietly reverts to ``None`` does not break anything; it degrades
         everything, silently, until someone notices weeks later.
 
-        That happened on 2026-08-03. ``recalibrate_camera.py`` rebuilt a fresh
-        ``Calibration`` naming 16 of the 22 fields, and the six it did not name
-        took their dataclass defaults. Four had been measured:
-        ``grip_span_s_at_zero_mm`` = 212.3 and ``grip_span_s_per_mm`` = 1.881
-        (the jaw-opening model, a property of the *gripper*, which a camera
-        recalibration has no business touching -- with it gone the width
-        refusal switched itself off), plus the camera nadir and height, which
-        that script clears on purpose.
+        A partial rebuild is the sharp case: a script that constructs a fresh
+        ``Calibration`` and names only the fields it measured leaves every
+        other field on its dataclass default. ``grip_span_s_at_zero_mm`` =
+        212.3 and ``grip_span_s_per_mm`` = 1.881 go that way -- the jaw-opening
+        model, a property of the *gripper*, which a camera recalibration has no
+        business touching, and with it gone the width refusal switches itself
+        off. The camera nadir and height are the fields such a script does mean
+        to clear.
 
         Hence: **losing a value must be stated, not defaulted.** Pass the field
         names in ``clearing`` when a script means to invalidate them, and this
@@ -445,8 +445,8 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> Calibration:
             f"no calibration at {path} -- run: python calibrate_vision.py"
         )
     data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    # Ignore unknown / retired keys (e.g. removed j4_face_offset_deg) so old
-    # JSON files still load; the next save drops them.
+    # Ignore keys that are not fields (e.g. j4_face_offset_deg) so a
+    # calibration file carrying them still loads; the next save drops them.
     known = {f.name for f in fields(Calibration)}
     return Calibration(**{k: v for k, v in data.items() if k in known})
 

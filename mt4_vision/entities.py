@@ -270,9 +270,8 @@ def _reach_block_reason(x: float, y: float, calib) -> str | None:
     no fifth gate). The two ``elif`` arms below are the no-calibration fallback,
     which is the only case where reach has to be tested directly.
 
-    Written out three times before this (cube pick, marker place, object pick),
-    differing only in whether the keep-out message named the firmware. It does
-    now, everywhere.
+    One helper for all three call sites (cube pick, marker place, object pick),
+    so the keep-out message names the firmware everywhere.
     """
     if calib is not None:
         return work_region_block_reason(x, y, calib)
@@ -500,13 +499,12 @@ def build_snapshot(
             )
         )
 
-    # placeable is computed, not asserted. It used to be a literal True on
-    # every slot free_placement_slots returned, and that function checked only
-    # keep-out and reach -- so five of the eight fixed slots were advertised as
-    # place targets while sitting where the detector discarded anything put
-    # there. free_placement_slots now gates on the work region too, making this
+    # placeable is computed, not asserted. free_placement_slots gates on the
+    # work region as well as keep-out and reach, which makes this
     # belt-and-braces; it is written out anyway because a slot list that lies
     # about placeable is the one failure mode with no symptom at the time.
+    # Keep-out and reach alone are not enough: five of the eight fixed slots
+    # sit where the detector discards anything put there.
     slot_entities = [
         Entity(
             id=f"slot_{i}",
@@ -578,9 +576,9 @@ def object_entity(
     calib = None if scene is None else scene.calib
     reason = _reach_block_reason(obj.x, obj.y, calib)
     # Where on it can the jaws close, and at what angle? This is the question
-    # that decides a non-cube pick, and the entity layer used to skip it
-    # entirely -- it reported "pickable" from the outline's short axis, which
-    # says nothing about the width at the point being gripped. Measured live
+    # that decides a non-cube pick, and the outline's short axis is not an
+    # answer to it -- that says nothing about the width at the point being
+    # gripped. Measured live
     # 2026-08-02: a stapler picked cleanly when segmentation happened to return
     # only its 16mm rail, and closed on air when it returned the whole 73mm
     # body. Same object, same arm, no deliberate choice either time.
@@ -625,13 +623,13 @@ def object_entity(
     # ("green cube"), and for the same reason: the first word is something the
     # detector established and the rest is what the thing is called.
     #
-    # Before this, an object's label was only the noun(s) a language model had
-    # grounded, and `instruct.instruction_attributes` pools its vocabulary from
-    # every entity's label. Those two rules are exact complements, so any
-    # adjective shared with another entity became a REQUIREMENT this object
-    # could never satisfy: "pick up the green statue" with a green cube on the
-    # desk harvested {green, statue}, and the statue's label was "statue".
-    # Measured live 2026-08-03 -- refused every time, not intermittently.
+    # The colour is load-bearing, not decoration. `instruct.instruction_attributes`
+    # pools its vocabulary from every entity's label, so a label carrying only
+    # the noun(s) a language model grounded turns any adjective shared with
+    # another entity into a REQUIREMENT this object can never satisfy: "pick up
+    # the green statue" with a green cube on the desk harvests {green, statue},
+    # and a statue labelled "statue" is refused every time, not intermittently
+    # (measured live 2026-08-03).
     label = f"{obj.color} {obj.label}" if obj.color else obj.label
     return Entity(
         id=ref if isinstance(ref, str) else f"obj_{ref}",

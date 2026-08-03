@@ -92,11 +92,11 @@ EDGE_QUANTILE = 0.9
 #
 # The wall test looks strict -- it costs every column where the door frame
 # rather than the wall sits above the desk. It is load-bearing anyway.
-# Relaxing it to a plain "not desk-coloured above" was tried and made the
-# detector find the lower edge of every dark object ON the desk instead: the
-# controller box, the black ArUco pads, shadows. Those false edges outnumbered
-# the true boundary, so the robust trimming kept them and threw the real edge
-# away, moving the fitted desk 150mm toward the arm. Green above is what makes
+# Relaxed to a plain "not desk-coloured above", the detector finds the lower
+# edge of every dark object ON the desk instead: the controller box, the black
+# ArUco pads, shadows. Those false edges outnumber the true boundary, so the
+# robust trimming keeps them and throws the real edge away, moving the fitted
+# desk 150mm toward the arm. Green above is what makes
 # a detection mean "wall", and nothing on this desk is green.
 WOOD_HSV = ((8, 40, 90), (30, 255, 255))
 WALL_HSV = ((60, 0, 0), (105, 255, 150))

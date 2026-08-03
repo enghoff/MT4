@@ -20,11 +20,11 @@ static const float HEAD_OFFSET = 35.0f;    /* wrist pivot -> TCP, horizontal */
 static const float HEAD_HEIGHT = 14.43f;   /* TCP below wrist pivot */
 
 /* All four measured 2026-07-06 (J2-J4 with a phone clinometer against the
- * link; J1 by direct measurement of its yaw rotation), replacing the
- * factory-EEPROM-derived guesses -- J1/J2/J3 share a physical motor/gearbox
- * design (~35 steps/deg each). J3's own EEPROM setting was missing from the
- * dump entirely (the old 35.556 was borrowed from unrelated extra axes),
- * and J4's old value (852) was a wrong axis-letter assumption ("d" = J4). */
+ * link; J1 by direct measurement of its yaw rotation), not taken from the
+ * factory EEPROM dump -- J1/J2/J3 share a physical motor/gearbox design
+ * (~35 steps/deg each). The dump has no J3 setting at all (its 35.556
+ * belongs to unrelated extra axes), and its 852 for J4 comes from reading
+ * the axis letter "d" as J4, which it is not. */
 const float MT4_STEPS_PER_DEG[MT4_NUM_JOINTS] = {35.0f, 35.0f, 35.0f,
                                                  45.0f};
 static const float J_STEP_SIGN[MT4_NUM_JOINTS] = {
@@ -171,13 +171,13 @@ bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
       J_STEP_SIGN[2] * dq[2] * MT4_STEPS_PER_DEG[2],
       J_STEP_SIGN[3] * dq4 * MT4_STEPS_PER_DEG[3]};
 
-  /* Peak/master-scale spans all four joints. This used to be a problem when
-   * J4's steps/deg (852, an axis-letter misassignment -- see kinematics.h)
-   * was ~19x J1's, letting a modest orientation-hold correction dominate the
-   * DDA timing budget and throttle the primary motion to a crawl. Now that
-   * J4 is correctly calibrated (~45, close to J1's ~44), including it here
-   * costs at most a few percent of speed and gives exact wrist-unwind
-   * fidelity instead of clamping J4 short. */
+  /* Peak/master-scale spans all four joints, which is affordable only
+   * because J4's steps/deg (~45) is close to J1's (~44): at the 852 the
+   * EEPROM dump implies (an axis-letter misassignment -- see kinematics.h)
+   * a modest orientation-hold correction would dominate the DDA timing
+   * budget and throttle the primary motion to a crawl. Including J4 costs
+   * at most a few percent of speed and gives exact wrist-unwind fidelity
+   * instead of clamping J4 short. */
   float peak = 0.0f;
   for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
     const float v = fabsf(steps[i]);

@@ -188,10 +188,10 @@ void handle_line(char *line) {
 
   /* Any command outside this exemption list safely stops an active jog
    * first (e.g. "?", "e0") -- but gripper commands ("g o"/"g c"/"g stop"/
-   * "g <S>") don't touch TCP motion and used to be caught by this net too,
-   * silently killing cartesian jog every time the gripper was actuated
-   * while jogging. Exempt them so the gripper sweeps concurrently with an
-   * active `cj` jog instead of interrupting it. Same story for "pos": it's
+   * "g <S>") don't touch TCP motion, and caught by this net they would
+   * silently kill cartesian jog every time the gripper is actuated while
+   * jogging. Exempt, so the gripper sweeps concurrently with an active
+   * `cj` jog instead of interrupting it. Same story for "pos": it's
    * a read-only FK query polled every tick by cj-based trackers specifically
    * as a non-blocking, non-disruptive status read (unlike "?", which also
    * dumps mode/limits/gripper and isn't polled in a hot loop) -- without
@@ -209,9 +209,9 @@ void handle_line(char *line) {
    * stop_jog() here would zero that first and make every `mq` look idle,
    * so nothing would ever actually get queued. "?"/"d" are pure status
    * reads and must be passive like "pos" already is: a host polling
-   * progress (or resolving state) mid-path must not halt the path -- that
-   * un-exempted "?" is exactly what used to force clients to choose
-   * between knowing the arm's state and keeping it moving. */
+   * progress (or resolving state) mid-path must not halt the path -- an
+   * un-exempted "?" forces clients to choose between knowing the arm's
+   * state and keeping it moving. */
   if (strcmp(line, "!") && strcmp(line, "stop") && strcmp(line, "j") &&
       strcmp(line, "jog") && strcmp(line, "home") && strcmp(line, "$H") &&
       strncmp(line, "home ", 5) && strncmp(line, "cj ", 3) &&

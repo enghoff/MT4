@@ -112,8 +112,8 @@ COMPILE = os.environ.get("QWEN_VL_COMPILE", "0") not in ("0", "false", "False")
 # from dynamic-cache-eager on 3 of 4 probe prompts). Both are the ordinary
 # consequence of changed floating-point reduction order: one near-tied argmax
 # goes the other way and the rest of the sequence follows. Greedy stays
-# reproducible run-to-run, which is what /freeze and /again rely on; it is only
-# comparisons against answers recorded before this change that are affected.
+# reproducible run-to-run, which is what /freeze and /again rely on; only
+# comparisons against answers recorded under the other setting are affected.
 FORCE_COMPILE = os.environ.get("QWEN_VL_FORCE_COMPILE", "0") not in ("0", "false", "False")
 
 # The vision encoder pairs adjacent frames into one temporal patch (config

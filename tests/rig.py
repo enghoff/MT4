@@ -9,17 +9,14 @@ loaded from that file on purpose: a test that reads the live calibration
 changes its own expectations every time somebody recalibrates, which makes a
 red test ambiguous between "the code broke" and "the desk moved".
 
-Why tests need a calibration at all now
----------------------------------------
-They did not before. ``scene.py`` was deliberately calib-free, because the old
-pick gate was the convex hull of the marker centres and markers are just data.
-The work region that replaced it is defined by where the desk physically is
-and what the camera can see, and neither of those can be expressed as a list
-of marker positions. So the rig comes with the tests.
+Why tests need a calibration at all
+-----------------------------------
+The work region is defined by where the desk physically is and what the camera
+can see, and neither of those can be expressed as a list of marker positions --
+which is all a test could otherwise supply. So the rig comes with the tests.
 
-``MARKERS`` are the live marker layout. Tests that predate this module used
-their own slightly-shifted set; those still work, since markers no longer gate
-anything.
+``MARKERS`` are the live marker layout. Tests carrying their own
+slightly-shifted set work just as well, since markers do not gate anything.
 """
 
 from __future__ import annotations

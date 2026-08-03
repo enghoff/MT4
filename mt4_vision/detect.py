@@ -26,21 +26,20 @@ COLOR_RANGES: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]]
     "blue": [((90, 100, 60), (128, 255, 255))],
 }
 # Reject blobs smaller than this (px^2) -- noise, shadows, cable ties.
-# At the closer overhead mount (post-2026-07-20), real cube blobs are
-# ~1600-3600px^2 (the old far-mount range was ~150-650, hence the old 120
-# floor). Keep a 2x margin below the smallest real cube: sub-cube blobs are
-# never cubes here, and 120 let a 263px^2 specular glare on a laminated
-# marker (reflecting the wall) pass as a blue cube -- calibrate_height then
-# "picked" and "placed" that phantom and recorded its pixels as probe data.
+# At this overhead mount real cube blobs are ~1600-3600px^2 (measured
+# 2026-07-20). Keep a 2x margin below the smallest real cube: sub-cube blobs
+# are never cubes here, and a floor near 120 lets a 263px^2 specular glare on
+# a laminated marker (reflecting the wall) pass as a blue cube -- which
+# calibrate_height then "picks" and "places", recording the phantom's pixels
+# as probe data.
 MIN_BLOB_AREA = 800.0
 # Reject blobs larger than this -- the arm's own orange/red body still reads
-# as "red", but after moving the camera closer a real on-pad cube is
-# ~2800-3600px^2 (measured 2026-07-20) while the old MAX of 900 dropped
-# it as "too big" and left only arm-paint flecks. Arm-scale blobs that
-# survive are still rejected downstream by keep-out / marker-hull / reach
-# (scene.is_phantom_detection). detect_cubes sorts largest-first, so this
-# cap still matters when an uncapped wall/arm smear would otherwise
-# outrank every cube.
+# as "red", but a real on-pad cube is ~2800-3600px^2 (measured 2026-07-20), so
+# a cap anywhere near cube size drops the cube as "too big" and leaves only
+# arm-paint flecks. Arm-scale blobs that survive are still rejected downstream
+# by keep-out / reach / work region (scene.is_phantom_detection). detect_cubes
+# sorts largest-first, so this cap still matters when an uncapped wall/arm
+# smear would otherwise outrank every cube.
 MAX_BLOB_AREA = 6000.0
 # Reject blobs whose bounding-box aspect is far from square (cubes are square
 # from above; this drops elongated glare streaks and desk-edge artifacts).

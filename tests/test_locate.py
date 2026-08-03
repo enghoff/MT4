@@ -528,14 +528,14 @@ def test_infeasible_past_the_cameras_coverage() -> None:
     """Placing where the camera cannot see loses the object until it is moved
     by hand, so it is refused even though the arm can physically reach it.
 
-    This used to be a 240mm circle. It is now the actual frame projection, so
-    the refusal is bearing-dependent: straight out along +x the camera's near
+    The gate is the actual frame projection rather than a radius, so the
+    refusal is bearing-dependent: straight out along +x the camera's near
     edge cuts in at ~284mm, while the same radius to the side is fine.
     """
     ok, reason = grasp_feasibility(_obj(320.0, 0.0), RIG_CALIB)
     assert not ok and "camera frame" in reason
     ok_side, _ = grasp_feasibility(_obj(0.0, 320.0), RIG_CALIB)
-    assert ok_side, "the old radius cap refused this; the camera sees it fine"
+    assert ok_side, "a 240mm radius cap refuses this; the camera sees it fine"
 
 
 def test_infeasible_wider_than_the_jaws_open() -> None:

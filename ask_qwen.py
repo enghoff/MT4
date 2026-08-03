@@ -325,8 +325,8 @@ def handle_command(
                 if was else "watch was already off"
             )
         elif not rest:
-            # Bare /watch reports when on and resumes when off -- it must not
-            # be the way to turn monitoring off, now that it starts on.
+            # Bare /watch reports when on and resumes when off -- monitoring
+            # starts on, so this must not be the way to turn it off.
             if watcher.armed:
                 state, score, events, skipped, *_ = watcher.snapshot()
                 ui.emit(f"  watching for: {watcher.last_question}")

@@ -1,12 +1,11 @@
 """Pick and place sequences for cubes on the calibrated work surface.
 
-The queued-motion core moved to ``mt4_vision.motion``: ``pick``/``place`` here
-are thin wrappers over ``motion.pick_at``/``motion.place_at`` (same signatures,
-so every existing caller is untouched), and ``routed_travel`` now sends legs
-built by ``motion.plan_route_legs`` rather than composing them itself. What
-stays here is the cube-specific and legacy-sequence material: the camera park,
-``pick_centered``'s ±90° re-grip, ``center_placed_cube``, and the
-``CubeDetection``-shaped entry points.
+The queued-motion core lives in ``mt4_vision.motion``: ``pick``/``place`` here
+are thin wrappers over ``motion.pick_at``/``motion.place_at``, and
+``routed_travel`` sends legs built by ``motion.plan_route_legs`` rather than
+composing them itself. What stays here is the cube-specific and multi-`mp`
+material: the camera park, ``pick_centered``'s ±90° re-grip,
+``center_placed_cube``, and the ``CubeDetection``-shaped entry points.
 """
 
 from __future__ import annotations
@@ -51,8 +50,8 @@ def _resolve_travel_j4(j4: float | str | None) -> float | str:
     """Explicit j4 passes through; None becomes the firmware `w` sentinel.
 
     `w` holds the J4 *joint* angle across the leg's J1 swing, resolved
-    on-device at leg-plan time -- the firmware-native version of the old
-    host-side TCP probe + j4_preserve_wrist() computation (kept above for
+    on-device at leg-plan time -- the firmware-native form of the
+    host-side TCP probe + j4_preserve_wrist() computation above (kept for
     reference and tests), with identical endpoint behavior, one less serial
     round trip per travel, and correct per-leg resolution on queued
     (`mq`/move_path) waypoints.
@@ -195,12 +194,12 @@ def near_camera_park(x: float, y: float) -> bool:
 def retreat_for_camera(client: Mt4Client, calib: Calibration) -> dict[str, object]:
     """Move the TCP to the camera-clear park pose (post-move capture prep).
 
-    Same orthogonal lift / traverse / drop track as always (a depart from
-    over a stack must never diagonal into the column), but sent as ONE
-    queued firmware path: one TCP read, one blocking call, no
-    stop/settle/reaccel at the two corners -- this used to be up to three
-    probe+move round trips per capture, on the hottest path in every
-    vision loop.
+    The orthogonal lift / traverse / drop track (a depart from over a
+    stack must never diagonal into the column), sent as ONE queued
+    firmware path: one TCP read, one blocking call, no
+    stop/settle/reaccel at the two corners. Sent corner by corner instead
+    it costs up to three probe+move round trips per capture, on the
+    hottest path in every vision loop.
     """
     tcp = client.get_tcp()
     if tcp is None:
@@ -246,8 +245,7 @@ def routed_travel(
     that does and doesn't smooth out). `j4=None` maps to the firmware `w`
     sentinel: the wrist *joint* angle is held leg-by-leg across each J1
     swing, resolved on-device from wherever the previous leg actually
-    ended -- the per-leg behavior the old per-waypoint _travel() fallback
-    loop existed to emulate.
+    ended.
 
     ``lift_to`` prepends a vertical lift-off to the route: the TCP rises
     straight up from wherever it is (e.g. still at grab height holding a

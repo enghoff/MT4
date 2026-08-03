@@ -512,10 +512,10 @@ def annotate_for_pointing(
     ``pickable`` (i.e. ``mt4_vision.entities.Entity``); entities without a pixel
     are skipped. Kept duck-typed so preview does not depend on the entity layer.
 
-    Markers and slots used to have no pixel and so were never drawn -- the
-    overlay showed the cubes and nothing to put them on, while the prompt
-    promised every listed id was circled. ``entities._desk_pixel_projector``
-    fills them in now; see its docstring for what that cost.
+    Markers and slots carry no pixel of their own;
+    ``entities._desk_pixel_projector`` fills one in, so the overlay circles
+    every id the prompt promises rather than showing cubes and nothing to put
+    them on. See that projector's docstring for what it costs.
     """
     out = frame.copy()
     h, w = out.shape[:2]

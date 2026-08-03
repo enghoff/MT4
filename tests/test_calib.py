@@ -264,8 +264,8 @@ def test_a_stale_writer_no_longer_reverts_another_scripts_work(tmp_path):
     # Script B finishes in the meantime and writes what it measured.
     update_calibration(path, cam_xy_robot=[518.1, -35.0], cam_height_mm=244.0)
 
-    # Script A now saves what IT measured. The old way -- stale.save(path) --
-    # would write back a whole object that predates B and silently drop both.
+    # Script A now saves what IT measured. A whole-object stale.save(path)
+    # would write back a snapshot that predates B and silently drop both.
     stale.table_polygon_robot = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
     update_calibration(
         path, table_polygon_robot=stale.table_polygon_robot

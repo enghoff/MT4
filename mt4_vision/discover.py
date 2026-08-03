@@ -192,10 +192,9 @@ def oversize_mask(
     under ``MAX_BLOB_PX``, yet three kernels wide and therefore unmeasurable.
 
     Width is tested *per pixel*, by opening with a disk, rather than per
-    connected component. Per-component was tried first and is wrong: at the
-    coarse scale a cube 100px from the arm's base merges into the base's blob,
-    and judging the merged blob by its widest part deleted two real cubes on
-    the live frame. Opening asks "does a disk this wide fit here", which the
+    connected component. Per-component is wrong: at the coarse scale a cube
+    100px from the arm's base merges into the base's blob, and judging the
+    merged blob by its widest part deletes two real cubes on the live frame. Opening asks "does a disk this wide fit here", which the
     cube fails and the base passes, whatever they are connected to.
     """
     h, w = frame.shape[:2]

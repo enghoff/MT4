@@ -167,8 +167,8 @@ def test_reason_outside_the_camera_frame() -> None:
 
 
 def test_far_desk_cube_is_pickable_now() -> None:
-    # The measured regression: on the desk, in reach, in frame -- and until
-    # 2026-08-02 silently absent because it sat outside the marker hull.
+    # Measured live 2026-08-02: on the desk, in reach, in frame, and outside
+    # the marker hull, which does not gate a pick.
     s = scene([cube("blue", 266.5, -52.7)])
     assert pick_block_reason(s.raw_cubes[0], s) is None
 

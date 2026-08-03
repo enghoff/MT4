@@ -124,10 +124,10 @@ def _decide_on(reply_json: str, obs, instruction: str) -> Action:
 
 # -- nothing pickable reaches the model ------------------------------------ #
 #
-# The whole point of the 2026-08-03 rewrite. Qwen is the visual grounding, so it
-# is told what it cannot see (a tag's printed number) and nothing else. A
-# regression here is silent and expensive: the model starts answering from a
-# list again, and the list is cube-complete and object-sparse.
+# Qwen is the visual grounding, so it is told what it cannot see (a tag's
+# printed number) and nothing else. A failure here is silent and expensive: the
+# model answers from a list instead, and the list is cube-complete and
+# object-sparse.
 
 
 def test_the_prompt_names_the_tags_and_nothing_else():

@@ -147,13 +147,13 @@ def test_marker_cube_to_free_marker_when_no_blocker():
 
 
 def test_camera_park_adjacent_cube_is_pickable():
-    """A cube near the old camera-park pose (200,0) is a normal pick target.
+    """A cube near the camera-park pose (200,0) is a normal pick target.
 
-    That exclusion existed to hide the arm's own silhouette when it used to
-    retreat to (200,0) between captures via retreat_for_camera() -- the live
-    loop (shuffle.py) never calls that, so this position isn't special and
-    shouldn't veto a real cube (it used to permanently exclude marker 4,
-    ~42mm away, and two PLACEMENT_SLOTS entries)."""
+    An exclusion there would hide the arm's own silhouette when it retreats to
+    (200,0) between captures via retreat_for_camera(), but the live loop
+    (shuffle.py) never calls that, so the position is not special and must not
+    veto a real cube -- it would permanently exclude marker 4, ~42mm away, and
+    two PLACEMENT_SLOTS entries."""
     from mt4_vision.scene import is_phantom_detection
 
     near_park = cube("green", 193.0, -51.0, area=412.0)
@@ -186,9 +186,9 @@ def test_off_desk_blob_filtered_as_phantom():
     from mt4_vision.scene import filter_phantoms, is_phantom_detection
 
     # Behind the desk's back edge: the arm's own body images up there on this
-    # oblique mount, which is what this gate is for. (272,-188) used to be the
-    # canonical case as "outside the marker hull"; it is a perfectly good desk
-    # location and is now pickable, which was the point of the change.
+    # oblique mount, which is what this gate is for. (272,-188) is not such a
+    # case: it sits outside the marker hull, but it is a perfectly good desk
+    # location and a pick target.
     phantom = cube("red", -100.0, 250.0, area=733.0)
     real = cube("green", 177.2, 181.5, area=400.0)
     assert is_phantom_detection(phantom, CALIB)
@@ -198,11 +198,12 @@ def test_off_desk_blob_filtered_as_phantom():
 
 
 def test_far_desk_blob_is_a_pick_target_now():
-    """The regression the work region exists to prevent.
+    """What the work region exists to prevent.
 
     Measured on a live frame 2026-08-02: three cubes plainly on the desk and
-    plainly in reach were absent from the snapshot because they fell outside
-    the marker-centre hull. These are their measured positions.
+    plainly in reach, all of them outside the marker-centre hull -- which is
+    enough to drop them from the snapshot entirely. These are their measured
+    positions.
     """
     from mt4_vision.scene import is_phantom_detection
 
@@ -214,9 +215,9 @@ def test_keepout_blob_filtered():
     from mt4_vision.scene import is_phantom_detection
 
     # The arm base's own hardware reads as small blue blobs near the column.
-    # (-19, 161) used to be this test's case; it is r=162mm, comfortably
-    # outside the keep-out, and was only ever rejected by the marker hull. It
-    # is a legitimate pick target now, so the test uses a real keep-out point.
+    # (-19, 161) is not a case for this test: at r=162mm it is comfortably
+    # outside the keep-out and a legitimate pick target, so the point below is
+    # one actually inside the cylinder.
     assert is_phantom_detection(cube("blue", 60.0, 60.0, area=400.0), CALIB)
 
 
@@ -298,8 +299,8 @@ def test_lookahead_second_move_visible_in_same_capture():
 
 
 def test_blocker_choice_is_randomized_not_always_first():
-    """Regression guard: picking candidates must not collapse back to
-    always-the-first-in-list (the original repeating-pattern complaint)."""
+    """Picking candidates must not collapse to always-the-first-in-list,
+    which shows up as the same move repeating cycle after cycle."""
     s = scene(
         [
             cube("red", 240.0, 100.0),
@@ -348,8 +349,8 @@ if __name__ == "__main__":
 
 def test_marker_at_touched_reach_limit_is_placeable():
     """Marker 1 lives at 322.5mm -- physically touched and reachable; the
-    reach filter must not veto it (regression: MAX_REACH_MM=320 did;
-    current envelope allows 350mm)."""
+    reach filter must not veto it (MAX_REACH_MM is 350; a 320 cap vetoes
+    it)."""
     from mt4_vision.workspace import MarkerSlot, rebuild_workspace_state
 
     m1 = MarkerSlot(1, 45.0, 319.3)

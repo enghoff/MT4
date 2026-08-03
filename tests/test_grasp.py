@@ -92,7 +92,7 @@ def _stapler(cx=140.0, cy=-200.0, deg=0.0):
 
 
 def test_the_whole_stapler_outline_does_not_fit_the_jaws():
-    """Sanity: the short axis of the outline is 70mm, so the old rule refuses."""
+    """Sanity: the outline's short axis is 70mm, so a whole-outline rule refuses."""
     pts = _stapler()
     short = pts[:, 1].max() - pts[:, 1].min()
     assert short > JAWS_MM

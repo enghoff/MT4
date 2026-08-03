@@ -511,7 +511,7 @@ class TaskWorker:
             #
             # Both ends of a transfer are resolved here, while the object is
             # still on the desk. Refusing after the grasp strands it in the
-            # jaws, which is the failure the old pick-then-place pair had.
+            # jaws.
             #
             # Every refusal past the reply's own shape lives here, and all of
             # them are physical. `decide` sees a box, not a target, so "is there
@@ -679,8 +679,9 @@ MAX_STEPS = 6
 # Seconds between the park finishing and the frame that gets decided on. The
 # arm reports a move done when the firmware's step generator has finished, not
 # when the linkage has stopped ringing, and the camera needs a moment more to
-# clear the motion from its exposure. Cheap next to the 2-3s the old reopen of
-# the camera cost per step; see FrameStream vs capture_frame.
+# clear the motion from its exposure. Cheap next to the 2-3s a camera reopen
+# costs per step, which is why the loop holds one FrameStream open rather than
+# calling capture_frame.
 CAMERA_SETTLE_S = 0.4
 
 

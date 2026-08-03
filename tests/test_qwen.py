@@ -154,7 +154,7 @@ def test_ask_rejects_unknown_mode() -> None:
 
 
 def test_frame_warning_catches_dropped_video_frames() -> None:
-    """The exact failure the service used to have: 6 frames in, 2 groups out."""
+    """The failure this catches: 6 frames in, 2 temporal groups out."""
     dropped = Reply(text="fluent but wrong", mode="video", frames_sent=6,
                     temporal_groups=2)
     warning = dropped.frame_warning()

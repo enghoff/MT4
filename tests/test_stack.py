@@ -63,9 +63,8 @@ def test_clear_aside_stays_in_pick_hull():
         240.0, 20.0, 240.0, 40.0, [], CALIB, markers=markers,
     )
     assert dest is not None
-    # The gate is no longer the marker hull -- markers do not bound the work
-    # area at all now -- so what a clear must still guarantee is that the cube
-    # lands somewhere the arm can pick it up again.
+    # Markers do not bound the work area, so what a clear must guarantee is
+    # that the cube lands somewhere the arm can pick it up again.
     assert in_work_region(dest[0], dest[1], CALIB)
 
 
@@ -149,8 +148,8 @@ def test_stack_shadow_rejects_marker3_phantom():
 
 def test_stack_shadow_lateral_widens_with_level():
     """Field case 2026-07-24, marker 2 level 6: true site (161.9,-149.6),
-    phantom read at (4.4,-203.7) -- 49mm lateral, past the old fixed 45mm
-    corridor width (calibrated from an 8mm lateral offset at level 4). The
+    phantom read at (4.4,-203.7) -- 49mm lateral, past a fixed 45mm corridor
+    width (calibrated from an 8mm lateral offset at level 4). The
     tolerance must widen with stack height on both axes, not just along."""
     from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
 
@@ -159,8 +158,8 @@ def test_stack_shadow_lateral_widens_with_level():
     behind = stack_shadow_behind_unit(calib, sx, sy)
     assert behind is not None
     assert in_stack_camera_shadow(4.4, -203.7, sx, sy, behind, stack_levels=6)
-    # At low levels the old narrow corridor still applies -- a cube this far
-    # laterally off the LOS at level 1 is a real, pickable cube.
+    # At low levels the corridor stays narrow -- a cube this far laterally off
+    # the LOS at level 1 is a real, pickable cube.
     assert not in_stack_camera_shadow(4.4, -203.7, sx, sy, behind, stack_levels=1)
 
 

@@ -67,7 +67,7 @@ def within_joint_box(s2: int, s3: int) -> bool:
 
 
 def test_joint_limits_alone_do_not_keep_the_tcp_above_the_desk():
-    """The regression this guard exists for.
+    """What this guard exists for.
 
     If this ever fails, the joint soft limits have been tightened enough to
     imply the desk plane and the guard is redundant -- verify that before
@@ -92,7 +92,8 @@ def test_joint_limits_alone_do_not_keep_the_tcp_above_the_desk():
 
 def test_guard_stops_a_jog_descending_into_the_desk():
     # J2=3000, J3=-800 sits at z=116.2mm -- 1.2mm of desk clearance. Stepping
-    # J3 down from there is exactly the jog that used to go through the table.
+    # J3 down from there is exactly the jog that goes through the table with
+    # nothing but joint limits watching.
     here = (0, 3000, -800)
     z_here, _ = tcp_of(*here)
     assert z_here > GROUND_Z_MM, "start above the desk or the test proves nothing"
