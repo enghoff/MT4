@@ -812,11 +812,18 @@ def test_tag_at_names_a_tag_underfoot_and_nothing_further_off():
 # -- grip geometry --------------------------------------------------------- #
 
 
-def test_a_pick_infers_the_objects_height():
-    """The pick path leaves ``object_height_mm`` unset, so the measurement
-    infers the height and unprojects the aim point to the table plane. Pinning
-    it: a fixed zero here aims 18.1-22.4mm outward of a 20mm cube, past the
-    ~10mm the jaws tolerate."""
+def test_a_pick_assumes_the_configured_cube_height():
+    """The pick path pins ``object_height_mm`` to ``calib.cube_height_mm``.
+
+    Height cannot be measured from one view, and every millimetre of error in
+    it moves the aim point by 1.4-1.9mm on this mount. Leaving it unset infers
+    it from the silhouette, which read 0.4 to 16.8mm for 20mm cubes across nine
+    readings of one frame (2026-08-04) because the silhouette takes in shadow
+    and its size swings with the box the model drew. Pinning it routes the
+    centroid through the calibrated cube-top map instead, which lands 1.0-2.6mm
+    from the cube detector's reading where inferring landed 8.1-22.5mm. A fixed
+    zero -- no height at all -- aims 18.1-22.4mm outward of a 20mm cube.
+    """
     seen: dict[str, object] = {}
 
     sentinel = object()
@@ -840,7 +847,7 @@ def test_a_pick_infers_the_objects_height():
         instruct.measure_grounding = saved
 
     assert obj is not None, why
-    assert seen["height"] is sentinel, "the pick path must not pin a height"
+    assert seen["height"] == _desk().calib.cube_height_mm
     assert _close(seen["box"], (180.0, 80.0, 220.0, 120.0))
 
 

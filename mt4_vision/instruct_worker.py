@@ -623,9 +623,11 @@ class TaskWorker:
             if action.kind in ("TRANSFER", "PICK"):
                 self._phase("measuring")
                 self._ui.set_status(f"step {step}: measuring the {action.label}")
-                # GrabCut inside the model's box, at zero assumed height, on the
-                # exact frame it drew the box on. No fresh capture: the arm is
-                # parked and nothing else on this desk moves.
+                # GrabCut inside the model's box, on the exact frame it drew the
+                # box on. No fresh capture: the arm is parked and nothing else
+                # on this desk moves. Height is taken to be the configured cube
+                # height rather than read off the silhouette -- see
+                # instruct.measure_source.
                 picked, why = I.measure_source(obs, action)
                 if picked is None:
                     trouble = f"could not measure what it boxed: {why}"

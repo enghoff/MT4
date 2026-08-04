@@ -721,10 +721,19 @@ def measure_source(
       falls back to desk-deviation at the box centre, then to the raw box.
       Measured on one live frame, GrabCut from a box segmented 4 of 4 objects
       where the point path managed 1 of 4.
-    * **Height inferred from the silhouette**, so the returned XY is where the
-      object meets the table rather than where its top face images. The jaws
-      still close at ``calib.table_z`` regardless -- height moves the aim
-      point, never the grip height. See ``locate._height_corrected``.
+    * **Height assumed to be ``calib.cube_height_mm``**, not inferred from the
+      silhouette. Height cannot be measured from one view, and on this steeply
+      oblique mount every millimetre of error in it moves the aim point by
+      1.4-1.9mm, so a bad guess is what a missed grip is made of. Inferring it
+      from the silhouette guessed 0.4 to 16.8mm for 20mm cubes across nine
+      readings of one frame (2026-08-04), because the silhouette it is derived
+      from takes in shadow and marker paper and its size swings with the box
+      the model drew -- the same red cube measured 38x11, 57x27 and 53x23mm
+      under three box sizes. Assuming the configured height instead routes the
+      centroid through the calibrated cube-top map and lands 1.9-4.8mm from the
+      cube detector's reading on the same objects. The jaws still close at
+      ``calib.table_z`` regardless -- height moves the aim point, never the
+      grip height. See ``locate._height_corrected``.
     * **Orientation from that same mask** -- ``axis_yaw_deg`` is the long axis
       of the mask's ``minAreaRect``, which is what ``object_entity`` turns into
       a wrist angle and a 90/180 periodicity.
@@ -734,7 +743,9 @@ def measure_source(
     """
     if action.source is None:
         return None, "no box in the reply"
-    return measure_grounding(obs, action.source)
+    return measure_grounding(
+        obs, action.source, object_height_mm=obs.calib.cube_height_mm
+    )
 
 
 def source_entity(obs: Observation, obj: Any) -> Entity:
