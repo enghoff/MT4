@@ -102,10 +102,19 @@ reset the arm sits at r = 124.6 mm, already inside the cylinder, so a guard
 that refused every violating pose would freeze it there. Homing is unaffected:
 it pulses the step pins directly and never touches the DDA.
 
-**`GROUND_Z_MM` = 115 sits ~12 mm below actual desk contact (~127).** The
+**`GROUND_Z_MM` = 115 sits ~5 mm below actual desk contact (~120).** The
 guard enforces the floor faithfully; the floor itself is deliberately slack so
-picks at `table_z` = 127.2 have room. Raising it would make the guard prevent
+picks at `table_z` = 120 have room. Raising it would make the guard prevent
 contact rather than limit it, but it would also squeeze every pick.
+
+Desk contact was measured 2026-08-04 by a camera-tracked descent at robot
+(230, −60) and (205, −52): the closed gripper's silhouette advances ~2 px/mm
+while airborne and goes flat from z = 119 down, so commanding 117 or 115 only
+presses harder without moving. **Do not measure the desk by jogging down until
+the arm stops** — it stops at the 115 guard clamp, which feels exactly like the
+desk and is what wrote `table_z` = 115.0 into the calibration. `table_z` = 115
+costs real workspace: it lifts the innermost holdable radius from 140 mm (the
+J1 keep-out) to 157 mm.
 
 ## Where pick/place is allowed
 
@@ -120,7 +129,7 @@ must all hold, and `work_region_block_reason` names the first that fails:
 Do not add a fifth gate somewhere else. The thing this replaced was a convex
 hull of the ArUco marker centres applied twice with different allowances, in
 two files; measured 2026-08-02 it admitted 828 cm² of a table where the arm can
-safely work 2278 cm², and three cubes plainly on the desk were missing from
+safely work 2237 cm², and three cubes plainly on the desk were missing from
 `mt4_scene` entirely. Marker positions describe where paper was taped down,
 not where the desk, the arm, or the camera end.
 

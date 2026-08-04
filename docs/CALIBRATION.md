@@ -37,7 +37,7 @@ silently rather than failing loudly.
 
 | # | Layer | Fields | Fixes | Missing → |
 |---|-------|--------|-------|-----------|
-| 1 | **Table plane** | `homography`, `bundle_homography`, `table_z`, `safe_z`, `workspace_hull_px` | Pixel → robot XY for anything lying on the table | Nothing works |
+| 1 | **Table plane** | `homography`, `bundle_homography`, `table_z`, `safe_z` | Pixel → robot XY for anything lying on the table | Nothing works |
 | 2 | **Cube top** | `cube_top_homography`, `cube_top_residual` | Cubes are detected by their *top* face, 20 mm up — parallax shifts it | ~15–30 mm pick error, warning on stderr |
 | 3 | **Camera geometry** | `cam_xy_robot`, `cam_height_mm` | True parallax at *any* height — drives the trajectory overlay | Overlay draws low; also the cube-top fallback |
 | 4 | **J4 wrist zero** | *(MCU step counter — not in the file)* | "Jaws along the arm" = world J4 0°, so face-aligned picks work | Wrist angles are meaningless; picks hit cube corners |
@@ -132,8 +132,10 @@ Detects markers and saves an annotated frame. Check that:
   bundle and the centre pixel, and glare on a crease reads as a phantom blob
   later.
 - The markers **span the working area**. The table map is most accurate inside
-  their convex hull; detections outside it are rejected outright
-  (`workspace_hull_px`).
+  their convex hull, and accuracy degrades with distance from it. Nothing is
+  rejected for being outside it — where a pick or place is allowed is
+  `workspace.in_work_region`, and what counts as desk is
+  `table_polygon_robot` from `calibrate_table_edge.py`.
 
 `--dict scan` tries every dictionary if the ids look wrong.
 
@@ -223,7 +225,7 @@ Then it asks for a few values, each with a default; Enter accepts.
 
 | Prompt | Default | Notes |
 |--------|---------|-------|
-| `table_z` | Median TCP Z of the recorded touches | The TCP Z while touching a marker *is* the table height there. Also the grip height for a cube on the table — the jaws straddle its lower faces. Currently ≈ 127.2 |
+| `table_z` | Median TCP Z of the recorded touches | The TCP Z while touching a marker *is* the table height there. Also the grip height for a cube on the table — the jaws straddle its lower faces. Currently 120. **Sanity-check the prompted default against `GROUND_Z_MM` = 115:** a touch jogged down until the arm stopped has hit the guard clamp, not the desk, and every marker then records exactly 115.0. Desk contact measured 2026-08-04 is ~120 |
 | `cube edge length` | Previous, else 20 | Feeds the parallax model and stack place height |
 | `safe_z` | Previous, else `table_z + 1.5 × cube` | Travel height. Keep modest — the arm belongs low over the desk |
 | `camera height above table` | Previous, else 240 | **Only a seed.** Step 4 derives this properly and overwrites it |
@@ -557,7 +559,6 @@ carried through refits — dropping it would silently re-arm that trap.
 | Field | `calibrate_vision` | `recalibrate_camera` | `calibrate_height` | `calibrate_camera_nadir` |
 |-------|:---:|:---:|:---:|:---:|
 | `homography`, `bundle_homography` | **writes** | **writes** | keeps | keeps |
-| `workspace_hull_px` | **writes** | **writes** | keeps | keeps |
 | `raw_marker_observations` | **writes** | **writes** (new pixels, old robot, flags kept) | keeps | keeps |
 | `table_z`, `safe_z`, `cube_height_mm` | prompts | keeps | keeps | keeps |
 | `grip_open_s`, `grip_close_s` | prompts | keeps | keeps | keeps |
@@ -654,7 +655,15 @@ suspecting the arm.
 | `color_ranges` | Per-colour HSV overrides merged over `detect.COLOR_RANGES` |
 | `color_xy_offset_mm` | Per-colour XY correction. Each HSV band admits a different mix of lit/shaded side faces, so centroid bias is colour-dependent — a map calibrated with one probe colour mis-locates the others by a constant few-to-15 mm |
 | `face_align_picks` | Command J4 from the detection's `yaw_deg`. Assumes step 5 has been done |
-| `workspace_hull_px` | Pixel convex hull of the marker centres. Detections outside are rejected |
+
+**`workspace_hull_px` is gone.** It held the pixel convex hull of the marker
+centres and nothing read it — the gate it once was is `workspace.in_work_region`,
+and what counts as desk is `table_polygon_robot`. A calibration written before
+its removal still loads (unknown keys are ignored), but `Calibration.save` reads
+what is on disk to catch dropped measurements, so re-saving such a file raises
+and names the key. Restoring a pre-removal backup therefore needs the key
+deleted from the JSON, or one `save(clearing=("workspace_hull_px",))`. Delete
+this note once no archived calibration in `backups/` still carries it.
 
 ---
 

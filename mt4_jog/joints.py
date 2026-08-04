@@ -14,8 +14,12 @@ J3_HOME_PULLOFF_STEPS = 500
 # Soft joint step limits + desk plane. Mirror firmware config.h
 # MT4_JOINT_SOFT_* / MT4_GROUND_Z_MM. J2/J3 counters are limit-referenced
 # (steps=0 at J2 switch / J3 interference). J1 switch-side min is replaced
-# at home with -J1_HOME_CENTER_STEPS; J2 min is forced to 0. Ground lowered
-# 2026-07-21 with home-angle refit (desk contact ~127mm in new FK frame).
+# at home with -J1_HOME_CENTER_STEPS; J2 min is forced to 0. Desk contact is
+# ~120mm in this home-angle frame, measured 2026-08-04 by a camera-tracked
+# descent at robot (230,-60) and (205,-52): the closed gripper's silhouette
+# advances ~2px/mm while airborne and goes flat from z=119 down. So this floor
+# sits ~5mm under the surface, which is what lets a pick at table_z press into
+# the desk instead of being stopped short of it.
 GROUND_Z_MM = 115.0
 # Soft joint limits (limit-referenced for J2/J3). Mirror firmware
 # firmware/mt4_jog/src/config.h MT4_JOINT_SOFT_*.

@@ -577,6 +577,54 @@ def test_place_plan_from_grab_height_lifts_before_carrying() -> None:
     assert legs[0].j4 == "wrist"
 
 
+def test_camera_park_clamps_the_lift_to_the_ceiling_at_this_radius() -> None:
+    """The arm's ceiling falls off with reach, because J2 and J3 share a coupled
+    extension cap. Stranded live at (66.5, -309.1, 155), r = 316mm, the ceiling
+    is 253mm and the straight lift to the 260mm park height needed J2+J3 = 4592
+    steps against a 4410 cap -- ``err mp joints``, and the firmware refuses the
+    whole queued path, so the recovery move was the one that could not run from
+    exactly the poses that most need it.
+    """
+    from mt4_vision.pickplace import (
+        CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z, retreat_for_camera,
+    )
+    from mt4_vision.workspace import joint_reachable
+
+    c = FakeClient(tcp=_Tcp(66.5, -309.1, 155.0))
+    retreat_for_camera(c, CALIB)
+    wps = [tuple(round(v, 1) for v in xyz) for xyz in c.calls[0]["wps"]]
+
+    # Every waypoint has to pass the joint check the firmware agrees with.
+    for x, y, z in wps:
+        assert joint_reachable(x, y, z), f"{(x, y, z)} is not holdable"
+
+    # The departure is still a pure vertical lift -- same XY, higher z -- so it
+    # still cannot diagonal into a column standing where the arm was.
+    assert wps[0][:2] == (66.5, -309.1)
+    assert wps[0][2] > 155.0
+    assert wps[0][2] < 260.0, "the lift that failed live must not be re-issued"
+
+    # And the height it could not gain out there is gained over the park XY.
+    assert wps[-1] == (CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z)
+    assert any(w[:2] == (CAMERA_PARK_X, CAMERA_PARK_Y) for w in wps[1:])
+
+
+def test_camera_park_from_a_close_pose_keeps_the_three_corner_shape() -> None:
+    """The clamp must not change the ordinary case: near the base the full lift
+    is legal, so the path stays lift / traverse and costs one extra check."""
+    from mt4_vision.pickplace import (
+        CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z, retreat_for_camera,
+    )
+
+    c = FakeClient(tcp=_Tcp(200.0, -60.0, CALIB.table_z))
+    retreat_for_camera(c, CALIB)
+    wps = [tuple(round(v, 1) for v in xyz) for xyz in c.calls[0]["wps"]]
+    assert wps == [
+        (200.0, -60.0, CAMERA_PARK_Z),
+        (CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z),
+    ]
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:

@@ -557,7 +557,11 @@ def is_own_colour_blob(obj: "LocatedObject", cube: CubeDetection) -> bool:
 
 
 def object_entity(
-    obj: "LocatedObject", ref: int | str, *, scene: Scene | None = None
+    obj: "LocatedObject",
+    ref: int | str,
+    *,
+    scene: Scene | None = None,
+    require_clearance: bool = True,
 ) -> Entity:
     """Entity for a non-cube object measured by :mod:`mt4_vision.locate`.
 
@@ -569,6 +573,11 @@ def object_entity(
     Elongated objects are 180°-periodic (the jaws close *across* the long
     axis). Compact / near-square extents use the 90° square period instead --
     grip orientation is not critical when there is no obvious shaft.
+
+    ``require_clearance=False`` keeps every envelope test and drops only the
+    neighbour check. ``scene`` must still be passed either way: it carries the
+    calibration that ``_reach_block_reason`` and ``plan_object_grasp`` need,
+    and without it the reach test degrades to keep-out and max reach alone.
     """
     from mt4_vision.locate import is_compact, plan_object_grasp
 
@@ -593,7 +602,10 @@ def object_entity(
     gx = obj.x if plan is None else plan.x
     gy = obj.y if plan is None else plan.y
     gw = obj.short_mm if plan is None else plan.width_mm
-    if reason is None and scene is not None:
+    # Only cubes are counted, because ``scene.cubes`` is the only list of other
+    # things there is -- a pen or a key beside the grasp point is invisible
+    # here and blocks nothing. That asymmetry is why the check is optional.
+    if reason is None and scene is not None and require_clearance:
         need = max(gw, 20.0) * 0.5 + 12.0
         for other in scene.cubes:
             if other.x is None or other.y is None:
@@ -621,15 +633,8 @@ def object_entity(
     )
     # Measured colour first, then the noun -- the same shape a cube's label has
     # ("green cube"), and for the same reason: the first word is something the
-    # detector established and the rest is what the thing is called.
-    #
-    # The colour is load-bearing, not decoration. `instruct.instruction_attributes`
-    # pools its vocabulary from every entity's label, so a label carrying only
-    # the noun(s) a language model grounded turns any adjective shared with
-    # another entity into a REQUIREMENT this object can never satisfy: "pick up
-    # the green statue" with a green cube on the desk harvests {green, statue},
-    # and a statue labelled "statue" is refused every time, not intermittently
-    # (measured live 2026-08-03).
+    # detector established and the rest is what the thing is called. The label
+    # is for transcripts and for `held`; nothing matches on it.
     label = f"{obj.color} {obj.label}" if obj.color else obj.label
     return Entity(
         id=ref if isinstance(ref, str) else f"obj_{ref}",

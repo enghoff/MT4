@@ -177,7 +177,7 @@ def _approach(
 # From the front-mounted camera the arm parked here only occludes the strip
 # behind it -- essentially the mp keep-out region, where nothing pickable or
 # placeable ever sits. Anywhere over the workspace, the forearm hides cubes
-# and markers AND reads as cube-sized red blobs inside the workspace hull.
+# and markers AND reads as cube-sized red blobs on the desk itself.
 CAMERA_PARK_X = 200.0
 CAMERA_PARK_Y = 0.0
 CAMERA_PARK_Z = 260.0
@@ -191,6 +191,40 @@ def near_camera_park(x: float, y: float) -> bool:
     ) < CAMERA_PARK_CLEARANCE_MM**2
 
 
+# Margin below the highest pose the joint check still accepts at a given XY.
+# The check and the firmware agree on the coupled J2+J3 cap, but they compute
+# it from separately rounded step counts, so the last millimetre of the ceiling
+# is not worth betting a whole queued path on.
+_LIFT_CEILING_MARGIN_MM = 4.0
+
+
+def _reachable_lift_z(cx: float, cy: float, cz: float, want_z: float) -> float:
+    """How high a straight lift at (cx, cy) may go, at most ``want_z``.
+
+    Returns ``want_z`` whenever that is legal, so the ordinary case costs one
+    check and the path shape never changes. Otherwise it bisects for the
+    ceiling at this XY and backs off by ``_LIFT_CEILING_MARGIN_MM``, never
+    below the current height -- a "lift" that descends is not a lift, and a
+    pose already past the limit must not be dragged further by this function.
+    """
+    from mt4_vision.workspace import joint_reachable
+
+    if joint_reachable(cx, cy, want_z):
+        return want_z
+    lo, hi = cz, want_z
+    if not joint_reachable(cx, cy, lo):
+        # Already outside the check down here; leave the height alone and let
+        # the firmware be the judge of the move that follows.
+        return cz
+    for _ in range(24):
+        mid = (lo + hi) / 2.0
+        if joint_reachable(cx, cy, mid):
+            lo = mid
+        else:
+            hi = mid
+    return max(cz, lo - _LIFT_CEILING_MARGIN_MM)
+
+
 def retreat_for_camera(client: Mt4Client, calib: Calibration) -> dict[str, object]:
     """Move the TCP to the camera-clear park pose (post-move capture prep).
 
@@ -200,16 +234,35 @@ def retreat_for_camera(client: Mt4Client, calib: Calibration) -> dict[str, objec
     stop/settle/reaccel at the two corners. Sent corner by corner instead
     it costs up to three probe+move round trips per capture, on the
     hottest path in every vision loop.
+
+    **The departure lift is clamped to what the current radius allows.** The
+    arm's ceiling falls off with reach, because J2 and J3 share a coupled
+    extension cap: at r = 316mm the TCP tops out at 253mm, below the 260mm
+    park height. Lifting to the park height first therefore asks for a pose
+    the firmware refuses, and it refuses the whole queued path -- so the
+    recovery move is the one that cannot run, from exactly the far-out poses
+    that most need it. Measured live: stranded at (66.5, -309.1, 155), the
+    lift to 260 needed J2+J3 = 4592 steps against a 4410 cap and came back
+    ``err mp joints``.
+
+    Clamping keeps the shape intact. The departure is still a pure vertical
+    lift, just a shorter one, so it still cannot diagonal into a column
+    standing where the arm was. Height that could not be gained out there is
+    gained after the traverse, where the smaller radius affords it.
     """
     tcp = client.get_tcp()
     if tcp is None:
         raise Mt4ClientError("retreat to camera park: could not read TCP")
     cx, cy, cz = float(tcp.x), float(tcp.y), float(tcp.z)
     z_hi = max(cz, CAMERA_PARK_Z, float(calib.safe_z))
+    lift_z = _reachable_lift_z(cx, cy, cz, z_hi)
     wps: list[tuple[float, float, float]] = []
-    if z_hi - cz > _Z_EPS_MM:
-        wps.append((cx, cy, z_hi))
+    if lift_z - cz > _Z_EPS_MM:
+        wps.append((cx, cy, lift_z))
     if math.hypot(cx - CAMERA_PARK_X, cy - CAMERA_PARK_Y) > _XY_EPS_MM:
+        wps.append((CAMERA_PARK_X, CAMERA_PARK_Y, lift_z))
+    # Regain over the park XY whatever the departure radius would not give.
+    if z_hi - lift_z > _Z_EPS_MM:
         wps.append((CAMERA_PARK_X, CAMERA_PARK_Y, z_hi))
     if z_hi - CAMERA_PARK_Z > _Z_EPS_MM:
         wps.append((CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z))

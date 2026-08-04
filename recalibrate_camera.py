@@ -44,9 +44,6 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-import cv2
-import numpy as np
-
 from mt4_vision.calib import (
     CalibrationError,
     DEFAULT_CALIB_PATH,
@@ -255,13 +252,6 @@ def main() -> int:
         # invalidates them just like the parallax fallback below. Re-measure
         # at the new pose if needed.
         color_xy_offset_mm={},
-        # Hull from every visible marker (matched or not), like
-        # calibrate_vision.py -- a hull of only the matched markers would
-        # silently exclude an occluded marker's corner of the desk from cube
-        # detection until the next full calibration.
-        workspace_hull_px=cv2.convexHull(
-            np.array([[m.px, m.py] for m in detected.values()], dtype=np.float32)
-        ).reshape(-1, 2).tolist(),
     )
     # Every loss this script intends, listed. Anything else that would go
     # missing makes save() raise rather than write -- see Calibration.save.

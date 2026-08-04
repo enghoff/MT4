@@ -225,10 +225,6 @@ class Calibration:
     # default; assumes firmware ``j4zero`` (``calibrate_j4.py``) so world
     # J4 = 0 means jaws along the arm.
     face_align_picks: bool = True
-    # Pixel-space convex hull of the marker centers. Drawn on the overlay, and
-    # accepted from calibration files that carry it; it is not a pick/place
-    # gate -- workspace.in_work_region is, and its note says why.
-    workspace_hull_px: list[list[float]] | None = None
     # Desk surface as a polygon in ROBOT frame (mm), safety margin already
     # applied. Written by calibrate_table_edge.py. This is the answer to "is
     # there anything there to set an object down on", which the marker hull

@@ -880,7 +880,9 @@ def annotate_qwen(
       the object's shadow and one that fits it exactly report the same *kind* of
       answer, differing only in a millimetre count that looks plausible either
       way. Seeing the filled pixels is the check.
-    * **Magenta ring** -- the point the decision carried.
+    * **Magenta ring** -- the point the decision carried. A magenta line
+      through the destination ring is the axis the reply asked the object to be
+      laid along; no line means it goes down square to the desk.
     * **Green or red ring, joined to the magenta one** -- the entity the stack
       resolved that point to, and the gap between them in pixels. Green when the
       action was accepted, red when it was refused. A model that names one thing
@@ -991,6 +993,29 @@ def annotate_qwen(
     dest_point = None if action is None else getattr(action, "dest_point_px", None)
     if dest_point is not None:
         draw_lock_ring(out, dest_point[0], dest_point[1], QWEN_POINT_BGR)
+    # The release orientation, drawn for the same reason every coordinate is:
+    # it is a thing the reply decided and the arm obeys, so it has to be
+    # checkable at a glance rather than only in the JSON. Both ways along the
+    # axis, because the jaws close across it and the reverse means the same.
+    dest_axis = None if action is None else getattr(action, "dest_axis_px", None)
+    if dest_point is not None and dest_axis is not None:
+        ax, ay = dest_axis[0] - dest_point[0], dest_axis[1] - dest_point[1]
+        span = (ax * ax + ay * ay) ** 0.5
+        if span > 1.0:
+            ux, uy = ax / span, ay / span
+            reach = max(28.0, min(span, 90.0))
+            cv2.line(
+                out,
+                (int(dest_point[0] - ux * reach), int(dest_point[1] - uy * reach)),
+                (int(dest_point[0] + ux * reach), int(dest_point[1] + uy * reach)),
+                QWEN_POINT_BGR, 2, cv2.LINE_AA,
+            )
+            draw_outlined_text(
+                out, "lay along",
+                (int(dest_point[0] + ux * reach) + 6,
+                 int(dest_point[1] + uy * reach) + 4),
+                scale=0.45, color=QWEN_POINT_BGR,
+            )
     if dest_bound_px is not None:
         dx, dy = int(dest_bound_px[0]), int(dest_bound_px[1])
         cv2.circle(out, (dx, dy), 20, colour, 2)

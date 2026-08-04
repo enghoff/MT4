@@ -154,10 +154,11 @@ Weight-only int4 has to unpack for the wide GEMMs prefill is made of, where bf16
 just multiplies, so **prefill went 0.45 s → 0.85 s** while decode went 34 → 45
 tok/s. That puts the crossover at about **56 output tokens**: below it nf4 was
 marginally quicker, above it int4 wins and keeps winning. The only workload here
-is one decision per step — an action, a box, a destination and a clause of
-reason, capped at 220 tokens by `instruct.MAX_NEW_TOKENS`. That is short enough
-to sit near the crossover rather than far above it, so measure before assuming
-int4 is the faster choice for this loop in particular.
+is one decision per step — an action, a box, a destination and however much the
+model writes into `reason`, capped at 640 tokens by `instruct.MAX_NEW_TOKENS`.
+A cap is a ceiling and most decisions decode far below it, so this workload
+still sits nearer the crossover than far above it; measure before assuming int4
+is the faster choice for this loop in particular.
 
 `QWEN_VL_INT4_SKIP` (default `visual`) keeps the vision tower in bf16. That is
 better on every axis at once — 43 → 45 tok/s, VRAM 5.0 → 4.7 GB, and compile time
@@ -298,10 +299,21 @@ told the keys. `instruct.build_prompt` spells its own keys out for exactly this
 reason, forbids prose and markdown fences, and ends with "Begin your reply with
 `{` and end it with `}`".
 
-Budget tokens accordingly: roughly 35 per boxed object. `MAX_NEW_TOKENS` is 220
-in the instruction loop, which is ample for the one action, one box and one
-clause of reason a decision returns — and nowhere near enough for a list of
-everything on the desk.
+Budget tokens accordingly: roughly 35 per boxed object. `MAX_NEW_TOKENS` is 640
+in the instruction loop. The arm-facing fields need a few dozen tokens of that;
+the rest is headroom for `reason`, which is the only channel back from the
+model and carries the answer when a task asks a question rather than for a
+movement.
+
+**The decision prompt does not get the service's fast path, and never did.**
+`server.py` takes the reused StaticCache only when `prompt_len + max_new_tokens
+<= CACHE_LEN` (1664). Measured on a 1280x720 frame, `build_prompt` alone comes
+to **1815 prompt tokens**, so every decision already falls back to the dynamic
+cache and eager decode regardless of the reply budget. Restoring the fast path
+means raising `QWEN_VL_CACHE_LEN` past prompt + reply, and the cache is sized
+tightly on purpose — 1664 measured 43 tok/s where 2048 gave 34 and 4096 gave
+23.6, so a bigger cache slows every other request the service serves. That is a
+service-level trade, not one the loop can make for itself.
 
 ### The frame-dropping trap
 
@@ -376,7 +388,7 @@ Instructions queue FIFO — one arm, so one at a time. The commands worth knowin
 |---|---|
 | `/stop` | End after the current step and drop the queue. The arm finishes what it is doing, so it stops somewhere it chose to be |
 | `/abort` | Also interrupt the move in flight (`Mt4Client.request_interrupt`). The arm halts where it stands with the jaws as they are — the recovery, not the tidy exit |
-| `/held [thing]` | What the loop believes is in the jaws, and how to correct it. **Nothing on this rig can sense this**, so after an `/abort` mid-carry the belief and the world can differ and only you can say so |
+| `/held [thing]` | What the loop believes is in the jaws, and how to correct it. **Nothing on this rig can sense this**, so after an `/abort` mid-carry the belief and the world can differ and only you can say so. It is reported to the model and drawn in the panel; it never refuses an action, because a belief that cannot be checked must not gate one |
 | `/open` | Release the jaws — what `/abort` mid-carry leaves you needing |
 | `/scene` | The entity list as the model will be shown it, with the reason each blocked one is blocked |
 | `/status` `/park` `/home` | Arm state and recovery, queued behind the run rather than racing it down one serial port |
@@ -402,8 +414,69 @@ observed; outcome lines say "commanded, not checked". There is no sensor in the
 jaws, and the vision test that once stood in for one was measured reporting a
 completed pick as a failure because it matched the ArUco tag beside a stapler
 instead of the stapler. What is still checked, before the gripper opens, is
-reach, keep-out, ground, finger clearance, the desk polygon, and both ends of a
+reach, keep-out, ground, the jaw-width plan, the desk edge, and both ends of a
 transfer.
+
+**What the loop deliberately will not refuse.** Three checks the rest of the
+stack applies are off in the instruction path, because each one substitutes a
+judgement for the operator's instead of reporting a physical limit. None of
+them can produce an illegal pose, and each failure they used to prevent is
+visible on the desk and recoverable.
+
+| Off | Why | What it costs |
+|---|---|---|
+| Camera coverage on a destination | Says the result would leave the frame and could not be re-detected, not that the arm cannot place there. Still on wherever the stack picks a spot itself — a slot nothing can re-detect is a bad autonomous choice | Nothing. It was vetoing **316 cm² of the 1541 cm²** the arm can hold a grasp pose over, 21% |
+| Neighbour clearance on a pick | Counts `scene.cubes` and nothing else, so it refuses a grasp beside a cube and permits the same grasp beside a pen — in a loop that never tells the model cubes are a category | A tight pick can nudge a neighbour |
+| The gripper state | `held` is typed in by hand, not sensed. A stale belief is the common case after an `/abort` mid-carry, and gating on it blocked a fine action until someone typed `/held` | A PICK while genuinely holding drops the carried object from grab height |
+
+**A destination can carry an orientation.** `dest_2d` says where, and the
+optional `dest_axis_2d` says which way: a second image point, such that the
+line between them is the direction the object should lie in. Two points rather
+than an angle, for the same reason every destination is a point — an angle
+would need a frame to be measured in and the model has no access to the
+robot's. Absent, the destination squares to the world axes as before. Two
+guards matter: the points must be **8mm apart in robot space** to mean a
+direction, and `[0, 0]` reads as absent, because this build fills an unused
+optional field with zeros rather than null (observed live beside a real
+`dest_2d`, where it would otherwise mean "lay it along the line to the frame's
+top-left corner").
+
+**A STOP the model chose is terminal.** It is the model's answer to the
+request, so re-asking is asking the same question again. Live, `open the
+gripper` — an instruction naming no object to see — was answered STOP six times
+running, each time in different words, spending six park-capture-decide cycles
+to arrive where step 1 already was. Full jaws do not buy a retry: the object
+stays in them either way, so the loop says so on the first step rather than the
+sixth. `Action.declined` marks it, and it is set only where the model's own
+`action` field says STOP.
+
+**Every other refusal retries once, and the same one twice stops.** Those are
+the refusals the model did not choose — a malformed or missing reply, and the
+physical gates on a measurement or a pose. A refusal caused by the frame rather
+than the request goes away on a fresh park and capture, so one more look is
+worth it whatever the jaws hold. A second identical refusal is worth nothing —
+nothing moved in between, so the reason is about the request — and repeating it
+spends the whole step budget arriving where step 1 already was. Sameness is
+judged with the numbers stripped, because a re-measured object jitters: one
+out-of-reach blob refused at `r=367mm` and then `r=373mm`, two strings for one
+problem. That test works on the gates' fixed wording and would not have worked
+on model prose, which is the other reason a chosen STOP is not re-asked.
+
+`decide` re-asks once **sampled** when a reply carries no JSON at all — greedy
+re-asking is the same prompt against the same weights and returns the same
+reply, so that retry is the one place this loop does not decode greedily.
+
+**The action list depends on what the jaws hold.** With them empty, TRANSFER is
+described as preferable to PICK-then-PLACE, which it is — one motion against
+two, with a park and a second decision in between. With them full that
+preference is false, because TRANSFER there means picking up a *second* object
+and abandoning the first, so it is not stated and both pick actions say plainly
+that they act on a different object. The model cannot see into the gripper:
+given a standing "prefer TRANSFER" and the task *"place the held object on
+marker 2"*, it was measured matching "the held object" to a lookalike on the
+desk and transferring that instead — twice in a row, each attempt refused for
+max reach on a blob at r=367mm, a message that names nothing to do with the
+real problem.
 
 ## Configuration (environment variables)
 

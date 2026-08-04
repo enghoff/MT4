@@ -504,12 +504,6 @@ def main() -> int:
         grip_close = int(prompt_float("grip_close_s", grip_close_default))
         grip_open = int(prompt_float("grip_open_s", prev.grip_open_s if prev else 140))
 
-        import cv2
-        import numpy as np
-
-        hull = cv2.convexHull(
-            np.array([[m.px, m.py] for m in ref_markers], dtype=np.float32)
-        ).reshape(-1, 2)
         calib = Calibration(
             homography=matrix,
             table_z=table_z,
@@ -529,7 +523,6 @@ def main() -> int:
             grip_span_s_at_zero_mm=prev.grip_span_s_at_zero_mm if prev else None,
             grip_span_s_per_mm=prev.grip_span_s_per_mm if prev else None,
             face_align_picks=prev.face_align_picks if prev else True,
-            workspace_hull_px=hull.tolist(),
             raw_marker_observations={
                 str(mid): {
                     "pixel": list(touch_px[mid]),

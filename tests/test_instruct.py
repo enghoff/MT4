@@ -453,29 +453,190 @@ def test_a_place_with_no_destination_is_refused():
     assert "dest_2d" in act.reason
 
 
-def test_picking_while_holding_is_refused_and_names_the_correction():
+def test_a_full_gripper_is_not_told_to_prefer_transfer():
+    """With the jaws full, TRANSFER is not the same errand in one motion -- it
+    is picking up a second object and dropping the first. A standing "prefer
+    TRANSFER" against "place the held object on marker 2" was measured live
+    sending the arm to box a lookalike on the desk, twice in a row."""
+    full = instruct.build_prompt(
+        _desk(held="green cube"), "place the held object on marker 2"
+    )
+    empty = instruct.build_prompt(_desk(), "put the green cube on marker 2")
+    assert "Prefer it over PICK then PLACE" in empty
+    assert "Prefer it over PICK then PLACE" not in full
+    # And it must say what boxing something would mean instead.
+    assert "DIFFERENT object" in full
+    assert "NOT lying on the desk" in full
+
+
+def test_a_repeated_refusal_signature_ignores_remeasured_numbers():
+    """A re-measured object jitters, so two refusals of one request are two
+    strings: live, ``r=367mm`` then ``r=373mm`` for the same out-of-reach blob.
+    Comparing the prose with numbers stripped is what makes them one."""
+    from mt4_vision.instruct_worker import _refusal_signature
+
+    a = "cannot pick it up: r=367mm is beyond the 350mm max reach"
+    b = "cannot pick it up: r=373mm is beyond the 350mm max reach"
+    assert _refusal_signature(a) == _refusal_signature(b)
+    other = "the destination will not do: outside the camera frame"
+    assert _refusal_signature(a) != _refusal_signature(other)
+
+
+def test_the_same_refusal_twice_stops_instead_of_spending_the_budget():
+    """One retry is for a bad exposure; a second is for nothing. Nothing moves
+    between tries, so a reason that recurs is about the request. Live, this loop
+    spent every step re-deciding an out-of-reach blob and reporting a max-reach
+    error that had nothing to do with the actual task."""
+    from mt4_vision.instruct_worker import TaskWorker
+
+    class _UI:
+        def __init__(self):
+            self.lines = []
+
+        def emit(self, text=""):
+            self.lines.append(text)
+
+        def set_status(self, msg):
+            pass
+
+    class _Fake:
+        def __init__(self):
+            self._ui = _UI()
+            self._last_refusal = None
+
+    w = _Fake()
+    first = TaskWorker._refused(
+        w, "cannot pick it up: r=367mm is beyond the 350mm max reach",
+        "green cube", 1, 6,
+    )
+    second = TaskWorker._refused(
+        w, "cannot pick it up: r=373mm is beyond the 350mm max reach",
+        "green cube", 2, 6,
+    )
+    assert first is True
+    assert second is False
+    assert any("same way twice" in ln for ln in w._ui.lines)
+    # Stopping with a full gripper has to say the object is still in the jaws.
+    assert any("Still holding the green cube" in ln for ln in w._ui.lines)
+
+
+def test_a_different_refusal_still_gets_its_retry():
+    """The bad-exposure case the retry exists for: a tag that did not decode on
+    one frame decodes on the next, and the refusal reads differently."""
+    from mt4_vision.instruct_worker import TaskWorker
+
+    class _UI:
+        def emit(self, text=""):
+            pass
+
+        def set_status(self, msg):
+            pass
+
+    class _Fake:
+        def __init__(self):
+            self._ui = _UI()
+            self._last_refusal = None
+
+    w = _Fake()
+    assert TaskWorker._refused(w, "marker_2 did not decode", None, 1, 6) is True
+    assert TaskWorker._refused(
+        w, "the destination will not do: r=367mm is beyond reach", None, 2, 6
+    ) is True
+
+
+def test_the_gripper_belief_does_not_gate_a_pick():
+    """``held`` is typed in by hand, not sensed, so it cannot refuse an action.
+
+    A stale belief is the common case, not the rare one: an abort mid-carry
+    leaves the session sure it is holding something it dropped. Gating on it
+    blocks a physically fine pick until someone types ``/held``.
+    """
     act = _decide_on(
         '{"action": "PICK", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
         '"label": "cube", "reason": "the cube"}',
         _desk(held="stapler"),
         "pick up the cube",
     )
-    assert not act.ok
-    assert "stapler" in act.reason and "/held" in act.reason
+    assert act.ok
+    assert act.kind == "PICK"
 
 
-def test_placing_with_an_empty_gripper_is_refused_and_names_the_correction():
-    """Nothing on this rig can sense a grip, so ``held`` is session state that
-    only the operator can correct. A refusal that does not name ``/held`` leaves
-    them re-wording the task instead of fixing the state it was judged against.
-    """
+def test_the_gripper_belief_does_not_gate_a_place():
+    """Placing with jaws the session thinks are empty is a move and an open."""
     act = _decide_on(
         '{"action": "PLACE", "dest_2d": [80, 500], "reason": "on the desk"}',
         _desk(),
         "leave the object you are holding on the table",
     )
+    assert act.ok
+    assert act.kind == "PLACE"
+
+
+def test_a_model_chosen_stop_is_marked_declined():
+    """STOP from the model is its answer, and `declined` is what says so.
+
+    The loop needs to tell it from a STOP that parsing forced, because the two
+    deserve opposite handling: one is a judgement about the request, the other
+    is a bad reply worth another look.
+    """
+    act = _decide_on(
+        '{"action": "STOP", "reason": "there is no red cube on this desk"}',
+        _desk(),
+        "open the gripper",
+    )
+    assert act.kind == "STOP"
     assert not act.ok
-    assert "/held" in act.reason
+    assert act.declined
+    assert "no red cube" in act.reason
+
+
+def test_a_forced_stop_is_not_declined():
+    """A malformed reply says nothing about the request, so it stays retryable."""
+    for reply in (
+        "I would pick up the blue cube.",
+        '{"action": "PICK", "box_2d": null, "reason": "the cube"}',
+        '{"action": "LOCATE_AT_PIXEL", "point_2d": [1, 2]}',
+    ):
+        act = _decide_on(reply, _desk(), "pick up the cube")
+        assert act.kind == "STOP", reply
+        assert not act.ok, reply
+        assert not act.declined, reply
+
+
+def test_a_declined_stop_stops_on_the_first_step_holding_or_not():
+    """Six identical STOPs is what this replaces.
+
+    Live, ``open the gripper`` was answered STOP six times running, reworded
+    each time so the same-signature guard never fired, because a full gripper
+    was taken as a reason to look again. The object stays in the jaws either
+    way, so the loop reports that once instead of six times.
+    """
+    from mt4_vision.instruct_worker import TaskWorker
+
+    class _UI:
+        def __init__(self):
+            self.lines = []
+
+        def emit(self, text=""):
+            self.lines.append(text)
+
+        def set_status(self, msg):
+            pass
+
+    class _Fake:
+        def __init__(self):
+            self._ui = _UI()
+            self._last_refusal = None
+
+    holding = _Fake()
+    TaskWorker._declined(holding, "there is no red cube on this desk", "red cube")
+    assert any("STOP is the answer" in ln for ln in holding._ui.lines)
+    assert any("Still holding the red cube" in ln for ln in holding._ui.lines)
+
+    empty = _Fake()
+    TaskWorker._declined(empty, "there is no red cube on this desk", None)
+    assert any("STOP is the answer" in ln for ln in empty._ui.lines)
+    assert not any("Still holding" in ln for ln in empty._ui.lines)
 
 
 def test_an_unknown_action_is_refused():
@@ -530,6 +691,113 @@ def test_an_unreachable_destination_pixel_is_refused():
     grasp, why = instruct.destination_grasp(obs, act)
     assert grasp is None
     assert "destination pixel" in why
+
+
+def test_a_destination_the_camera_cannot_see_is_still_allowed():
+    """Coverage says the arm would not see the result again, not that it cannot
+    do the thing. That is the operator's call about a spot they pointed at, and
+    it is worth 316 cm2 of the 1541 cm2 the arm can hold a grasp pose over."""
+    from mt4_vision.workspace import work_region_block_reason
+
+    obs = _desk(held="pen")
+    # (320, 40) px is robot (160, 20): reachable, on the desk, and 40px from the
+    # top border, inside the 50px margin the coverage test wants.
+    assert "camera frame" in work_region_block_reason(160.0, 20.0, CALIB)
+    act = Action("PLACE", True, "off to the side", dest_point_px=(320.0, 40.0))
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert (grasp.x, grasp.y) == (160.0, 20.0)
+
+
+def test_dropping_coverage_does_not_drop_reach():
+    """The envelope gates are a different kind of thing and all still apply."""
+    obs = _desk(held="pen")
+    act = Action("PLACE", True, "way out there", dest_point_px=(960.0, 1360.0))
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is None
+    assert "max reach" in why
+
+
+def test_a_destination_axis_sets_the_release_orientation():
+    """Two points, not an angle: the model has no access to the robot frame, so
+    it points at a second place and the direction is read off in millimetres."""
+    obs = _desk(held="pen")
+    act = Action(
+        "PLACE", True, "along the edge",
+        dest_point_px=(300.0, 500.0), dest_axis_px=(400.0, 500.0),
+    )
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert (grasp.x, grasp.y) == (150.0, 250.0)
+    assert grasp.yaw_deg == 0.0
+    # 180, not 90: an axis to lay the object along reads the same reversed.
+    assert grasp.yaw_period_deg == 180.0
+
+    act = Action(
+        "PLACE", True, "across it",
+        dest_point_px=(300.0, 500.0), dest_axis_px=(300.0, 600.0),
+    )
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert grasp.yaw_deg == 90.0
+
+
+def test_a_destination_axis_too_short_to_mean_anything_squares_instead():
+    """Two points 5mm apart are one point and rounding noise, not a direction."""
+    obs = _desk(held="pen")
+    act = Action(
+        "PLACE", True, "here",
+        dest_point_px=(300.0, 500.0), dest_axis_px=(310.0, 500.0),
+    )
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert grasp.yaw_deg == 0.0
+    assert grasp.yaw_period_deg == 90.0
+
+
+def test_a_zero_axis_is_read_as_no_axis():
+    """This build fills an unused optional field with ``[0, 0]`` rather than
+    leaving it null -- observed live beside a real dest_2d. Read literally that
+    is "lay it along the line to the top-left corner", a wrist angle nothing
+    asked for."""
+    obs = _desk(held="pen")
+    act = _decide_on(
+        '{"action": "PLACE", "dest_2d": [234, 694], "dest_axis_2d": [0, 0], '
+        '"reason": "on the tag"}',
+        obs,
+        "put it on marker 3",
+    )
+    assert act.ok, act.reason
+    assert act.dest_axis_px is None
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert grasp.yaw_period_deg == 90.0
+
+
+def test_a_null_axis_is_read_as_no_axis():
+    obs = _desk(held="pen")
+    act = _decide_on(
+        '{"action": "PLACE", "dest_2d": [234, 694], '
+        '"dest_axis_2d": [null, null], "reason": "on the tag"}',
+        obs,
+        "put it on marker 3",
+    )
+    assert act.ok, act.reason
+    assert act.dest_axis_px is None
+
+
+def test_a_reply_with_no_axis_squares_to_the_world_axes():
+    obs = _desk(held="pen")
+    act = _decide_on(
+        '{"action": "PLACE", "dest_2d": [234, 694], "reason": "on the tag"}',
+        obs,
+        "put it on marker 3",
+    )
+    assert act.ok, act.reason
+    assert act.dest_axis_px is None
+    grasp, why = instruct.destination_grasp(obs, act)
+    assert grasp is not None, why
+    assert grasp.yaw_period_deg == 90.0
 
 
 def test_tag_at_names_a_tag_underfoot_and_nothing_further_off():

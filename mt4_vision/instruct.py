@@ -34,11 +34,29 @@ it.** Three rules follow from that, and every one of them is load-bearing:
 
 **What refuses, and why that is not second-guessing.** The measurement must
 survive segmentation, the two-window stability check and the plausibility band,
-and the resulting pose must clear reach, the J1 keep-out, ground Z, jaw
-clearance and the desk polygon (``entities.object_entity``). Those gates read
+and the resulting pose must clear reach, the J1 keep-out, ground Z, the
+jaw-width plan and the desk edge (``entities.object_entity``). Those gates read
 geometry, never the model's judgement about *what* a thing is. They are what
 makes trusting the rest safe: nothing here can command a pose the envelope
 would reject.
+
+**What deliberately does not refuse.** Three checks the rest of the stack
+applies are off here, because each substitutes a judgement for the operator's
+rather than reporting a physical limit:
+
+* **Camera coverage on a destination.** It says the result would leave the
+  frame and could not be re-detected, not that the arm cannot place there. On
+  this calibration it vetoes 316 cm2 of the 1541 cm2 the arm can hold a grasp
+  pose over, 21%. Worth keeping where the stack picks a spot itself, which is
+  why ``work_region_block_reason`` still defaults to enforcing it.
+* **Neighbour clearance on a pick.** It counts ``scene.cubes`` and nothing
+  else, so it refuses a grasp beside a cube and permits the same grasp beside
+  a pen -- in a loop that never tells the model cubes are a category.
+* **The gripper state.** ``held`` is typed in by hand, not sensed, so it is a
+  belief and a stale one blocks a fine action.
+
+None of the three can produce an illegal pose, and each failure they used to
+prevent is visible on the desk and recoverable.
 
 **Why a box and not a point.** ``box_2d`` unlocks GrabCut, measured at 4 of 4
 objects segmented on a frame where the bare-point desk-deviation path manages
@@ -118,10 +136,28 @@ __all__ = [
     "point_readings", "tag_at", "to_frame_pixels", "load_calibration",
 ]
 
-# Short replies only: a decision is an action, a box, a destination and a clause
-# of reason, and the 1664-token static cache holds one image plus this
-# comfortably.
-MAX_NEW_TOKENS = 220
+# A decision is an action, a box, a destination and whatever the model has to
+# say about it. The budget is well past what the JSON fields need so that
+# ``reason`` can carry a real answer -- a question about the desk, or what a
+# STOP actually ran into -- rather than the clause a tight cap forces. It is
+# the only channel back from the model, and the arm-facing fields are only ever
+# a few dozen tokens of it. A cap is a ceiling, not a target: a short reply
+# still decodes short.
+#
+# It does not cost the service's fast path, because this prompt never had it.
+# ``server.py`` takes the reused StaticCache when ``prompt_len + max_new_tokens
+# <= CACHE_LEN`` (1664), and this prompt measures **1815 tokens** on a 1280x720
+# frame -- over the cache on its own, so every decision already runs on the
+# dynamic cache and eager decode whatever this number is. Restoring the fast
+# path means raising ``QWEN_VL_CACHE_LEN`` past prompt + reply, which slows
+# every other request the service serves; that is a service-level call, not
+# one this constant can make.
+MAX_NEW_TOKENS = 640
+
+# The retry decode in `decide`, and the only sampled call in this loop. Low
+# enough to stay on-task, non-zero because the point of the retry is to land
+# somewhere the greedy path did not.
+RETRY_TEMPERATURE = 0.6
 
 # TRANSFER leads because it is the shape of nearly every real task here: move a
 # thing to a place, in one step, with no park-look-decide in the middle that
@@ -140,12 +176,13 @@ class Observation:
     """One capture: the frame, the tags on it, and what the arm is holding.
 
     ``snapshot`` is the **full** detection -- cubes included -- because the
-    internal safety gates need to know what is on the desk near a grasp point.
-    It is never shown to the model. :attr:`markers` is the model-facing half,
-    and the only thing :func:`build_prompt` and the overlay are allowed to read.
-    Keeping the split here, on the type, is deliberate: the guarantee that the
-    model sees nothing pickable should be one attribute a reader can check,
-    rather than a discipline spread over two call sites.
+    operator summary line counts them and because it is the same object the
+    rest of the stack passes around. It is never shown to the model, and no
+    gate on this path reads the cube list. :attr:`markers` is the model-facing
+    half, and the only thing :func:`build_prompt` and the overlay are allowed
+    to read. Keeping the split here, on the type, is deliberate: the guarantee
+    that the model sees nothing pickable should be one attribute a reader can
+    check, rather than a discipline spread over two call sites.
     """
 
     frame: np.ndarray = field(repr=False)
@@ -157,9 +194,10 @@ class Observation:
     # loop is memoryless: a completed task looks exactly like an untouched one,
     # since both show an empty gripper and the same instruction.
     history: tuple[str, ...] = ()
-    # The detections the snapshot was built from. Kept for the internal gates
-    # (``object_entity`` asks it how close the nearest other thing is), never
-    # for the prompt.
+    # The detections the snapshot was built from. Passed to ``object_entity``
+    # for the calibration it carries, which the reach test and the jaw-width
+    # plan both need; its cube list is not read on this path. Never reaches
+    # the prompt.
     scene: Any = None
 
     @property
@@ -186,6 +224,12 @@ class Action:
     ``DONE``. Every ``STOP`` is ``ok=False``, whether the model chose it or
     parsing forced it, so a caller has one thing to branch on.
 
+    ``declined`` separates those two, because they deserve opposite handling.
+    A forced ``STOP`` -- no JSON, an unknown action, a missing box, a service
+    error -- says nothing about the request and is worth another look. A
+    ``STOP`` the model chose *is* its answer to the request, and asking the
+    same question again gets the same answer in different words.
+
     **This is the reply, not a resolved target.** ``ok`` says the JSON was
     usable and the action's required fields are present -- not that anything
     was measured, is reachable, or exists. The source box is measured and the
@@ -197,6 +241,10 @@ class Action:
     kind: str
     ok: bool
     reason: str
+    # True only when the model itself answered STOP. A STOP that no JSON, an
+    # unknown action, a missing field or a service error forced leaves this
+    # False, because none of those is a judgement about the request.
+    declined: bool = False
     # What the model called the thing it boxed. Carried for the transcript and
     # for `held`; nothing selects on it.
     label: str | None = None
@@ -210,6 +258,10 @@ class Action:
     # place the reply itself pointed at rather than a name it looked up.
     dest_point_px: tuple[float, float] | None = None
     dest_alt_point_px: tuple[float, float] | None = None
+    # A second point saying which way to lay the object down, in frame pixels.
+    # Optional: absent means the reply had no orientation opinion and the
+    # destination is squared to the world axes. See ``instruct._place_grasp``.
+    dest_axis_px: tuple[float, float] | None = None
     raw: str = ""
 
     @property
@@ -240,6 +292,10 @@ class Action:
             out["dest_alt_point_px"] = [
                 round(self.dest_alt_point_px[0], 1),
                 round(self.dest_alt_point_px[1], 1),
+            ]
+        if self.dest_axis_px:
+            out["dest_axis_px"] = [
+                round(self.dest_axis_px[0], 1), round(self.dest_axis_px[1], 1)
             ]
         return out
 
@@ -353,10 +409,15 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "The gripper is empty."
         if not obs.held
         else (
-            f"The gripper is already holding a {obs.held}, so the pick half of "
-            "the task is done -- what remains is where to put it down. PLACE "
-            "says where it goes; there is no need to box the thing you are "
-            "holding, and TRANSFER is not available while the gripper is full."
+            f"The gripper is holding a {obs.held}. That is a fact about the "
+            "arm, not a step still owed: if the task wanted it put somewhere, "
+            f"PLACE says where; if the task only asked for it to be picked up "
+            "or held, the task is already done.\n"
+            f"The {obs.held} is in the jaws, NOT lying on the desk, so there "
+            "is nothing in the image to box for it and PLACE needs only "
+            "dest_2d. Anything you can see on the desk is a DIFFERENT object, "
+            f"even if it looks like a {obs.held} -- boxing one means picking "
+            "that up and abandoning what you are carrying."
         )
     )
     if obs.history:
@@ -369,6 +430,37 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         )
     else:
         progress = "Nothing has been done for this task yet.\n"
+    # Descriptive, not an order: TRANSFER really is one continuous motion where
+    # PICK then PLACE is two, with a park, a fresh photograph and a second
+    # decision in between. Told that, the model can weigh it. Told "use
+    # TRANSFER whenever the task names both", it cannot decompose a task at all
+    # -- and some tasks need the look in the middle.
+    #
+    # The preference is stated only with empty jaws, because with full ones it
+    # is false: TRANSFER there is not the same errand done in one go, it is
+    # picking up a second object and dropping the first. Measured live, a
+    # standing "prefer TRANSFER" against the task "place the held object on
+    # marker 2" sent the arm to box a lookalike on the desk instead, twice.
+    if obs.held:
+        actions = (
+            "  TRANSFER - pick something up and put it somewhere in one "
+            "motion. box_2d is the thing to pick up; dest_2d is where it "
+            "goes. It picks up a DIFFERENT object from the one in the jaws, "
+            "so it abandons what you are carrying\n"
+            "  PICK     - pick up a DIFFERENT object and hold that instead, "
+            "abandoning what you are carrying. box_2d is the thing to pick "
+            "up\n"
+        )
+    else:
+        actions = (
+            "  TRANSFER - pick something up and put it somewhere in one "
+            "motion. box_2d is the thing to pick up; dest_2d is where it "
+            "goes. Prefer it over PICK then PLACE, which stops for a second "
+            "photograph in between\n"
+            "  PICK     - pick something up and hold it. box_2d is the thing "
+            "to pick up. The arm keeps holding it until something puts it "
+            "down\n"
+        )
     return (
         "A robot arm is working on this desk. Choose the single next action.\n\n"
         f'Task: "{instruction}"\n'
@@ -384,20 +476,14 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "every other object is yours to find by looking at the image:\n"
         f"{_marker_lines(obs)}\n\n"
         "Choose one action:\n"
-        "  TRANSFER - pick something up and put it somewhere, in one go. "
-        "box_2d is the thing to pick up; dest_2d is where it goes. Use this "
-        "whenever the task names BOTH a thing and a place for it, and the "
-        "gripper is empty\n"
-        "  PICK     - pick something up and hold it, when the task names no "
-        "destination at all (only if the gripper is empty). box_2d is the "
-        "thing to pick up\n"
-        "  PLACE    - put down what is ALREADY held. dest_2d says where\n"
+        f"{actions}"
+        "  PLACE    - put down what is held. dest_2d says where\n"
         "  DONE     - the task is complete\n"
         "  STOP     - the task cannot be done, or you cannot tell which thing "
         "is meant\n\n"
         "Reply with ONLY a JSON object, no prose, no markdown fence:\n"
         '{"action": "...", "box_2d": [x1, y1, x2, y2], "label": "...", '
-        '"dest_2d": [x, y], "reason": "<one short clause>"}\n\n'
+        '"dest_2d": [x, y], "dest_axis_2d": [x, y], "reason": "..."}\n\n'
         "Every coordinate you give is on a 0-1000 scale across the image: 0 is "
         "the left edge, 1000 the right edge, and the same top to bottom. The "
         "tag positions above are written that way too, and the numbered "
@@ -407,6 +493,10 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "little else as possible -- not the desk around it, and not a "
         "neighbouring object. Required for TRANSFER and PICK.\n"
         "label is a short noun for whatever you boxed.\n"
+        "reason is the only thing you can say to the person who set the task. "
+        "A sentence or two, more when there is more to say. If the task asked "
+        "a question rather than for a movement, answer it there and pick "
+        "DONE.\n"
         "dest_2d says where something goes, and it is always a point on the "
         "image -- there is no way to name a destination, only to point at one. "
         "Required for TRANSFER and PLACE. Three cases, all the same field:\n"
@@ -418,6 +508,10 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "it goes on, wherever in the image you can see that thing to be\n"
         "  - 'somewhere clear', 'on the table', 'not on a marker': any point "
         "on empty desk\n"
+        "dest_axis_2d is OPTIONAL: a second, well-separated point, such that "
+        "the line from dest_2d to it is the direction the object should lie "
+        "in. Give it only when the task says something about direction; null "
+        "otherwise, and the object goes down square to the desk.\n"
         # The one text-derived rule left, and it is about the one datum we
         # supply rather than about the model's own grounding. Measured live
         # 2026-08-03, "place it on marker 0" on a desk of markers 1-4: the model
@@ -457,6 +551,27 @@ def _first_json_object(text: str) -> dict[str, Any] | None:
                 if isinstance(got, dict):
                     return got
     return None
+
+
+def _axis_or_none(said: Any) -> Any:
+    """``dest_axis_2d`` as given, or None when it is the model's way of null.
+
+    An optional field gets an "unused" value rather than an absent one, and
+    this build writes ``[0, 0]`` -- observed live alongside a real ``dest_2d``,
+    which would otherwise read as "lay it along the line to the top-left corner
+    of the frame" and turn the wrist to a direction nothing asked for. A
+    genuine axis pointing at the exact frame origin is not a thing anyone can
+    mean, so the reading is safe to spend.
+
+    ``[null, null]`` needs no help; ``point_readings`` already drops it.
+    """
+    if isinstance(said, (list, tuple)) and len(said) >= 2:
+        try:
+            if all(float(v) == 0.0 for v in said[:2]):
+                return None
+        except (TypeError, ValueError):
+            return said
+    return said
 
 
 def _named_a_tag(got: dict[str, Any]) -> str:
@@ -500,6 +615,51 @@ def tag_at(obs: Observation, x: float, y: float) -> Entity | None:
     return best
 
 
+# A destination axis shorter than this in robot millimetres is two points on
+# top of each other, not a direction: the angle it implies is rounding noise.
+MIN_DEST_AXIS_MM = 8.0
+
+
+def _place_grasp(
+    obs: Observation,
+    action: "Action",
+    x: float,
+    y: float,
+    px: float,
+    py: float,
+) -> Any | None:
+    """The destination grasp implied by ``dest_axis_px``, or None for squared.
+
+    The reply points at a second place on the image rather than naming an
+    angle, for the reason every other destination is a point: an angle would
+    need a frame to be measured in, and the model has no access to the robot's.
+    Two pixels have one meaning. Both go through the flat table homography and
+    the direction between them is read off in robot millimetres, so the answer
+    is in the frame the wrist is commanded in.
+
+    The period is 180°, because what the reply describes is an axis to lay the
+    object along and the jaws close across it -- an axis and its reverse are
+    the same instruction. When no axis is given, the caller squares instead.
+    """
+    from mt4_vision.motion import YAW_PERIOD_LONG_AXIS, Grasp
+
+    if action.dest_axis_px is None:
+        return None
+    ax, ay = obs.calib.pixel_to_robot(
+        action.dest_axis_px[0], action.dest_axis_px[1], on_cube_top=False
+    )
+    dx, dy = ax - x, ay - y
+    if (dx * dx + dy * dy) ** 0.5 < MIN_DEST_AXIS_MM:
+        return None
+    import math
+
+    return Grasp(
+        x, y,
+        yaw_deg=math.degrees(math.atan2(dy, dx)),
+        yaw_period_deg=YAW_PERIOD_LONG_AXIS,
+    )
+
+
 def destination_grasp(
     obs: Observation, action: "Action"
 ) -> tuple[Any | None, str]:
@@ -514,9 +674,17 @@ def destination_grasp(
     coordinates echoed back, so snapping could only ever move the arm somewhere
     the reply did not ask for -- and it would hide the case this protocol exists
     to expose, where the model points at a tag while the task named an object
-    46mm away. What the point must survive is ``work_region_block_reason``,
-    which is geometry: reach, the J1 keep-out, ground Z, the desk polygon and
-    the camera frame.
+    46mm away.
+
+    What the point must survive is ``work_region_block_reason`` minus its
+    camera-coverage test: reach, the J1 keep-out, ground Z and the desk edge.
+    Those say the arm cannot do the thing. Coverage says only that the result
+    would leave the frame and could not be re-detected, which is the operator's
+    call to make about a spot they pointed at -- and it costs 316 cm2 of the
+    1541 cm2 the arm can hold a grasp pose over, 21%.
+
+    Orientation comes from ``dest_axis_px`` when the reply carried one, and is
+    squared to the world axes when it did not. See :func:`build_prompt`.
     """
     from mt4_vision.workspace import work_region_block_reason
 
@@ -530,9 +698,9 @@ def destination_grasp(
     why = ""
     for px, py in readings:
         x, y = obs.calib.pixel_to_robot(px, py, on_cube_top=False)
-        blocked = work_region_block_reason(x, y, obs.calib)
+        blocked = work_region_block_reason(x, y, obs.calib, require_camera=False)
         if blocked is None:
-            return square_place(x, y), ""
+            return _place_grasp(obs, action, x, y, px, py) or square_place(x, y), ""
         on = tag_at(obs, x, y)
         why = why or (
             f"the destination pixel ({px:.0f}, {py:.0f}) is robot "
@@ -578,14 +746,17 @@ def source_entity(obs: Observation, obj: Any) -> Entity:
     than re-deriving a pick test here is the reason a box from the model cannot
     command a pose the envelope would have refused.
 
-    ``obs.scene`` is passed for the clearance check, which asks how close the
-    nearest *other* detected thing is to the planned grasp point. That is the
-    one place the cube detector still earns its keep, and it is an internal
-    safety input -- nothing about it reaches the model.
+    ``obs.scene`` is passed for the calibration it carries, which the reach
+    test and the jaw-width plan both need. The neighbour check it could also
+    feed is off here: it counts only ``scene.cubes``, so it refuses a grasp
+    beside a cube and permits the identical grasp beside a pen, and this loop
+    never tells the model that cubes are a category. A veto the model cannot
+    see, cannot argue with and cannot route around is worse than a nudged
+    neighbour, which is visible on the desk and recoverable.
     """
     from mt4_vision.entities import object_entity
 
-    return object_entity(obj, "obj_1", scene=obs.scene)
+    return object_entity(obj, "obj_1", scene=obs.scene, require_clearance=False)
 
 
 def decide(
@@ -600,22 +771,35 @@ def decide(
     Every failure path produces ``ok=False`` with prose, never an exception.
 
     What this checks is that the reply is *well formed for the action it
-    chose*: a known action, a usable box where a box is required, a
-    destination where one is required, and a gripper state that permits it.
-    What it does not check is whether the model was right about what it boxed
-    -- there is nothing here to check that against, which is the point.
+    chose*: a known action, a usable box where a box is required, and a
+    destination where one is required. What it does not check is whether the
+    model was right about what it boxed -- there is nothing here to check that
+    against, which is the point. Nor does it check the gripper: ``held`` is a
+    belief a person typed in, not a reading.
+
+    A reply carrying no JSON at all is asked once more, **sampled**. Re-asking
+    greedily would be pointless -- same prompt, same weights, same reply -- so
+    the retry is the one place this loop does not decode greedily. It costs one
+    GPU call and no motion, against losing the whole instruction to a stray
+    token.
     """
     prompt = build_prompt(obs, instruction)
-    try:
-        reply = ask(
-            prompt, obs.annotated, url=url,
-            max_new_tokens=max_new_tokens, do_sample=False,
-        )
-    except QwenError as exc:
-        return Action("STOP", False, f"vision-language service failed: {exc}")
-
-    raw = reply.text.strip()
-    got = _first_json_object(raw)
+    raw = ""
+    got = None
+    for sampled in (False, True):
+        try:
+            reply = ask(
+                prompt, obs.annotated, url=url,
+                max_new_tokens=max_new_tokens,
+                do_sample=sampled,
+                temperature=RETRY_TEMPERATURE if sampled else None,
+            )
+        except QwenError as exc:
+            return Action("STOP", False, f"vision-language service failed: {exc}")
+        raw = reply.text.strip()
+        got = _first_json_object(raw)
+        if got is not None:
+            break
     if got is None:
         return Action("STOP", False, f"no JSON object in the reply: {raw[:200]!r}", raw=raw)
 
@@ -633,29 +817,22 @@ def decide(
         #
         # ok means "there is something to act on". A model-chosen STOP is still
         # a refusal; DONE is the loop's only successful exit.
-        return Action(kind, kind == "DONE", why or kind.lower(), raw=raw)
+        #
+        # This is the one place `declined` is set, and it is what makes a STOP
+        # here terminal while a forced one further down stays retryable.
+        return Action(
+            kind, kind == "DONE", why or kind.lower(),
+            declined=kind == "STOP", raw=raw,
+        )
 
-    # ---- gripper state ---------------------------------------------------
-    #
-    # Not a judgement about the reply, but about the arm: the jaws are either
-    # full or they are not, and no reply can change that. `held` is session
-    # state corrected by hand (`/held`), because nothing on this rig can sense
-    # a grip -- so when this refuses, the operator's next move is usually to
-    # correct it rather than to re-word the task.
-    if kind in ("TRANSFER", "PICK") and obs.held:
-        return Action(
-            "STOP", False,
-            f"cannot pick while holding {obs.held} -- put it down first, or "
-            "correct the gripper state with /held if the jaws are actually empty",
-            raw=raw,
-        )
-    if kind == "PLACE" and not obs.held:
-        return Action(
-            "STOP", False,
-            "cannot place with an empty gripper -- if the jaws are actually "
-            "holding something, say so with /held <thing> and repeat the task",
-            raw=raw,
-        )
+    # No gate on the gripper. `held` is a belief typed in by hand (`/held`),
+    # not a reading -- nothing on this rig can sense a grip -- so refusing on
+    # it blocks a physically fine action whenever the belief is stale, which
+    # it most often is after an abort mid-carry. Both directions are
+    # recoverable and both are visible on the desk: a PLACE with empty jaws is
+    # a move and an open command, and a PICK while genuinely holding drops the
+    # carried object from grab height. The transcript records what was
+    # commanded either way.
 
     # ---- the source box --------------------------------------------------
     source: Grounding | None = None
@@ -668,6 +845,7 @@ def decide(
     # ---- the destination -------------------------------------------------
     dest_pt: tuple[float, float] | None = None
     dest_alt: tuple[float, float] | None = None
+    dest_axis: tuple[float, float] | None = None
     if kind in ("TRANSFER", "PLACE"):
         readings = point_readings(got.get("dest_2d"), obs.size)
         if not readings:
@@ -679,6 +857,10 @@ def decide(
             )
         dest_pt = readings[0]
         dest_alt = readings[1] if len(readings) > 1 else None
+        # Optional, so an unreadable one is dropped rather than refused: the
+        # destination still stands, and it simply gets squared.
+        axis = point_readings(_axis_or_none(got.get("dest_axis_2d")), obs.size)
+        dest_axis = axis[0] if axis else None
 
     return Action(
         kind, True, why or kind.lower(),
@@ -686,5 +868,6 @@ def decide(
         source=source,
         dest_point_px=dest_pt,
         dest_alt_point_px=dest_alt,
+        dest_axis_px=dest_axis,
         raw=raw,
     )

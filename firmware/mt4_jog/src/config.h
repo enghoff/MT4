@@ -60,8 +60,10 @@ static const uint8_t MP_FEASIBILITY_MAX_SAMPLES = 20;
  * instead of driving into the base. */
 static const float MT4_KEEPOUT_RADIUS_MM = 140.0f;
 /* Desk / ground plane: TCP Z below this is rejected (`mp`) and Cartesian jog
- * clamps downward velocity. Desk contact reports ~127mm in this home-angle
- * frame (107/−9.3), so the floor sits ~12mm under it for headroom. */
+ * clamps downward velocity. Desk contact is ~120mm in this home-angle frame
+ * (107/−9.3), so the floor sits ~5mm under it for headroom. Anyone jogging
+ * down to feel for the desk hits this clamp first, which is indistinguishable
+ * from contact -- measure the surface with a camera-tracked descent instead. */
 static const float MT4_GROUND_Z_MM = 115.0f;
 /* Ground / keep-out guard poll for joint-space motion (`j` jog, `m` moves) --
  * see refresh_envelope_guard_if_due() in motion.cpp for why this is a poll and

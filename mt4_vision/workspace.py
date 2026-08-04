@@ -56,15 +56,15 @@ NEAR_J3_DEG = -9.3
 # Vertical clearance a pick or place must have at its own XY: the TCP has to
 # rise this far straight up off the grasp without leaving the joint envelope.
 # 50mm covers a 20mm cube plus fingertip length with room to spare, and is
-# comfortably above the 27.8mm the travel height (safe_z 155 over table_z
-# 127.2) actually uses today.
+# comfortably above the 35mm the travel height (safe_z 155 over table_z 120)
+# actually uses today.
 #
-# Measured 2026-08-02 over the whole table on a 5mm grid: this check excludes
+# Measured 2026-08-04 over the whole table on a 2mm grid: this check excludes
 # NOTHING. Every XY where the TCP can grip at table height can also lift 50mm
-# from there. At the outer edge the binding pose is the LOW one, not the
-# lifted one -- at r=342 the arm reaches z=155 and z=177 but not z=127.2,
-# because the coupled J2+J3 extension cap stops it stretching flat that far
-# out. So the check can only ever enlarge the region, never shrink it. It is
+# from there. At the outer edge the binding pose is the LOW one, not the lifted
+# one -- at r=342 the arm reaches z=155 and z=177 but not z=120, because the
+# coupled J2+J3 extension cap stops it stretching flat that far out. So the
+# check can only ever enlarge the region, never shrink it. It is
 # kept anyway because it is nearly free and it is the thing we actually mean:
 # if safe_z, table_z, or MT4_JOINT_SOFT_* ever move, this notices.
 PICK_LIFT_MM = 50.0
@@ -190,7 +190,7 @@ def joints_within_soft_limits(
 # of the calibrated ArUco marker centres is not a work region. Marker
 # positions are where the printed paper happens to lie; they are not a
 # statement about the desk, the arm, or the camera. Measured 2026-08-02, that
-# hull covers 828cm^2 of a table where the arm can safely work 2278cm^2: it
+# hull covers 828cm^2 of a table where the arm can safely work 2237cm^2: it
 # stops at r=255-292mm depending on bearing, 40-90mm short in nearly every
 # direction, and rejects everything past +-105deg (only the angular span is
 # about right -- past ~100deg the desk itself runs out). A gate applied below
@@ -210,10 +210,14 @@ def on_table(x: float, y: float, calib: Calibration) -> bool:
 
     The polygon is stored in the calibration by ``calibrate_table_edge.py``
     and already carries its safety margin, so this is a plain containment
-    test. A calibration with no polygon accepts everything -- the same
-    fallback ``within_pick_hull`` used with fewer than three markers, and the
-    reason ``calibrate_table_edge.py`` prints a loud warning when the fit is
-    thin.
+    test.
+
+    A calibration with no polygon accepts everything, which makes this gate
+    inert rather than strict -- there is no desk edge to be past. Run
+    ``calibrate_table_edge.py`` to fit one, and note that doing so turns a
+    gate *on*: places and picks beyond the fitted edge start being refused.
+    ``calibrate_table_edge.py`` prints a loud warning when the fit is thin,
+    because a thin fit is the version of this that refuses real desk.
     """
     poly = _table_polygon(calib)
     if poly is None:
@@ -298,6 +302,7 @@ def work_region_block_reason(
     *,
     z: float | None = None,
     lift_mm: float = PICK_LIFT_MM,
+    require_camera: bool = True,
 ) -> str | None:
     """The first work-region gate (x, y) fails, in prose, or None.
 
@@ -305,6 +310,19 @@ def work_region_block_reason(
     whether the answer is None, so the two cannot drift into disagreeing
     definitions of the region -- the failure the marker-hull gate had when it
     lived in two files with two different allowances.
+
+    ``require_camera=False`` drops the camera-coverage test and keeps every
+    other one. The distinction is what the gate is *for*: reach, the keep-out,
+    the joint limits and the desk edge say the arm cannot do the thing, while
+    coverage says the arm could do it and would not see the result again.
+    That is worth refusing when the stack is choosing a spot on its own
+    initiative -- a free slot nothing can re-detect is a bad autonomous choice
+    -- and not worth refusing when a person has pointed at the spot. Coverage
+    vetoes 316 cm2 of the 1541 cm2 where the arm can hold a grasp pose at table
+    height, 21% -- measured with a desk polygon fitted, which narrows the 2237
+    cm2 the arm can reach down to that 1541. A calibration carrying no
+    `table_polygon_robot` has no such narrowing, so the share differs; re-measure
+    after `calibrate_table_edge.py`.
     """
     gz = float(calib.table_z) if z is None else float(z)
     r = math.hypot(x, y)
@@ -327,7 +345,7 @@ def work_region_block_reason(
         )
     if not on_table(x, y, calib):
         return "past the edge of the desk -- nothing there to set an object on"
-    if not camera_covers(x, y, calib):
+    if require_camera and not camera_covers(x, y, calib):
         return (
             "outside the camera frame -- an object placed here could not be "
             "seen again, so nothing could pick it up"
@@ -342,9 +360,12 @@ def in_work_region(
     *,
     z: float | None = None,
     lift_mm: float = PICK_LIFT_MM,
+    require_camera: bool = True,
 ) -> bool:
     """True when a pick or place may happen at (x, y). See the block above."""
-    return work_region_block_reason(x, y, calib, z=z, lift_mm=lift_mm) is None
+    return work_region_block_reason(
+        x, y, calib, z=z, lift_mm=lift_mm, require_camera=require_camera
+    ) is None
 
 
 def marker_slots_from_calibration(calib: Calibration) -> list[MarkerSlot]:

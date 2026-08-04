@@ -18,6 +18,7 @@ and both ends of a transfer.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -111,6 +112,34 @@ def _destination_words(obs: I.Observation, action: I.Action) -> str:
     return f"down at image ({px:.0f}, {py:.0f})"
 
 
+_DIGITS = re.compile(r"[-+]?\d*\.?\d+")
+
+
+def _refusal_signature(reason: str) -> str:
+    """A refusal reduced to which gate spoke, with every number removed.
+
+    Two refusals of the same request are the same refusal even when their
+    measurements differ, and they do differ: a box re-measured on a fresh frame
+    moves a few millimetres, so ``r=367mm is beyond the 350mm max reach`` and
+    ``r=373mm is beyond the 350mm max reach`` are one problem written twice.
+    Comparing the prose with the numbers stripped catches that; comparing the
+    strings does not.
+    """
+    return _DIGITS.sub("#", reason.strip().lower())
+
+
+def _place_angle_words(dest_grasp) -> str:
+    """How the object is set down, for a transcript line.
+
+    Two outcomes and they must not read alike: the reply either pointed along
+    an axis to lay the object on, or said nothing and the destination squares
+    to the world axes. Both are decisions the arm carries out.
+    """
+    if dest_grasp.yaw_period_deg == 90.0:
+        return "squared"
+    return f"along {dest_grasp.yaw_deg:.0f}deg"
+
+
 def describe(obs: I.Observation, action: I.Action) -> str:
     bits = [action.kind]
     if action.label:
@@ -158,6 +187,10 @@ class TaskWorker:
         self._state = RunState(max_steps=max_steps, dry_run=dry_run)
         self._view: np.ndarray | None = None
         self._decision: Decision | None = None
+        # Signature of the last refusal within the running instruction, so the
+        # same refusal twice ends the task instead of spending the budget.
+        # Reset per instruction in _run_task.
+        self._last_refusal: str | None = None
         self._last_instruction = ""
         self._last_result: bool | None = None
         # Two levels, because they are two different requests. _stop ends the
@@ -390,26 +423,81 @@ class TaskWorker:
             time.sleep(CAMERA_SETTLE_S)
         return self._stream.fresh(min_advance=2)
 
+    def _declined(self, reason: str, held: str | None) -> None:
+        """Report a STOP the model chose. Terminal, and never retried.
+
+        A STOP is the model's answer to the request, so re-asking is asking the
+        same question again. Live, "open the gripper" -- which names no object
+        to see -- was answered STOP six times running, each time in different
+        words, spending six park-capture-decide cycles to arrive where step 1
+        already was.
+
+        Sameness detection is not the fix. ``_refusal_signature`` strips
+        numbers, which is enough for the fixed wording the gates emit and
+        useless against model prose that rephrases the same judgement every
+        time. The fix is not to re-ask at all.
+
+        Full jaws do not buy a retry here either. The jaws stay as they are and
+        the object stays in them, which is exactly where six more refusals
+        would have left it -- so this says so on the first step instead of the
+        sixth.
+        """
+        self._ui.emit("    -> STOP is the answer to this request, not a bad look at it.")
+        if held is not None:
+            self._ui.emit(
+                f"       Still holding the {held} -- it stays in the jaws; "
+                "/open releases it."
+            )
+        self._ui.set_status(f"stopped: {reason[:60]}")
+
     def _refused(
         self, reason: str, held: str | None, step: int, max_steps: int
     ) -> bool:
         """Report a refusal. True to retry this step, False to give up.
 
-        Stopping strands whatever is in the jaws. With the gripper full the
-        step is worth retrying instead: the next one is a fresh park, a fresh
-        frame and a fresh decision, and a refusal caused by the frame rather
-        than the request goes away on its own. Measured on one run -- step 1 saw
-        ``unknown=1``, a marker whose tag had not decoded, and step 2 saw
-        ``unknown=0``; the desk had not changed, only the exposure. Bounded by
-        ``max_steps`` like everything else, and the arm is parked between
-        tries, so the cost of being wrong is a few seconds rather than a
-        dropped object.
+        For refusals the model did *not* choose: a malformed or missing reply,
+        and the physical gates on a measurement or a pose. A STOP the model
+        chose goes to :meth:`_declined` and never reaches here.
+
+        A refusal caused by the frame rather than by the request goes away on
+        its own: the next step is a fresh park, a fresh frame and a fresh
+        decision. Measured on one run -- step 1 saw ``unknown=1``, a marker
+        whose tag had not decoded, and step 2 saw ``unknown=0``; the desk had
+        not changed, only the exposure. So such a refusal is worth one more
+        look whatever the jaws hold, and a full gripper is called out because
+        stopping there strands the object.
+
+        **The same refusal twice running is not worth a third look.** Nothing
+        has moved between tries, so a reason that recurs is about the request,
+        and repeating it spends the whole step budget arriving where step 1
+        already was. Sameness is judged with the numbers stripped
+        (:func:`_refusal_signature`), because a re-measured object jitters --
+        live, one out-of-reach blob refused at ``r=367mm`` and then ``r=373mm``,
+        two strings for one problem.
         """
-        if held is not None and step < max_steps:
+        signature = _refusal_signature(reason)
+        repeat = signature == self._last_refusal
+        self._last_refusal = signature
+        if repeat:
             self._ui.emit(
-                f"    -> refused, but still holding the {held} -- stopping "
-                "would strand it, so trying again on a fresh look"
+                "    -> refused the same way twice, so the request is the "
+                "problem rather than the photograph. Stopping."
             )
+            if held is not None:
+                self._ui.emit(
+                    f"       Still holding the {held} -- it stays in the jaws; "
+                    "/open releases it."
+                )
+            self._ui.set_status(f"refused twice: {reason[:52]}")
+            return False
+        if step < max_steps:
+            if held is not None:
+                self._ui.emit(
+                    f"    -> refused, and still holding the {held} -- stopping "
+                    "would strand it, so trying again on a fresh look"
+                )
+            else:
+                self._ui.emit("    -> refused, trying again on a fresh look")
             self._ui.set_status(f"refused, retrying: {reason[:48]}")
             return True
         self._ui.emit(
@@ -429,6 +517,10 @@ class TaskWorker:
             dry_run = self._state.dry_run
         client = None if dry_run else self._client
         history: list[str] = []
+        # Per instruction, not per session: the previous task's last refusal
+        # says nothing about this one, and carrying it over would stop a fresh
+        # instruction on its first step.
+        self._last_refusal: str | None = None
         # No object registry: a target is measured from the box the model
         # drew, on the frame it drew it on, and acted on in the same step, so
         # there is nothing to carry between steps and no id that can go stale
@@ -505,6 +597,9 @@ class TaskWorker:
             if action.kind == "DONE":
                 self._ui.set_status(f"done in {step} step(s)")
                 result = True
+                break
+            if action.declined:
+                self._declined(action.reason, held)
                 break
             if not action.ok:
                 if self._refused(action.reason, held, step, max_steps):
@@ -589,7 +684,8 @@ class TaskWorker:
                 if action.kind == "TRANSFER":
                     line = (
                         f"pick ({grasp.x:.0f}, {grasp.y:.0f}) {yaw}"
-                        f"  ->  place ({dest_grasp.x:.0f}, {dest_grasp.y:.0f}) squared"
+                        f"  ->  place ({dest_grasp.x:.0f}, {dest_grasp.y:.0f}) "
+                        f"{_place_angle_words(dest_grasp)}"
                     )
                     self._ui.emit(f"    -> {line}")
                     self._record(obs, action, grasp=line)
@@ -621,7 +717,8 @@ class TaskWorker:
                     self._ui.emit(f"    -> holding the {held}{UNCHECKED}")
                 else:
                     line = (
-                        f"place ({dest_grasp.x:.0f}, {dest_grasp.y:.0f}) squared"
+                        f"place ({dest_grasp.x:.0f}, {dest_grasp.y:.0f}) "
+                        f"{_place_angle_words(dest_grasp)}"
                     )
                     self._ui.emit(f"    -> {line}")
                     self._record(obs, action, grasp=line)
