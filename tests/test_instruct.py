@@ -814,17 +814,62 @@ def test_tag_at_names_a_tag_underfoot_and_nothing_further_off():
 # "Find all the pickable objects" has no answer in prose. Which things the arm
 # can take depends on reach, the J1 keep-out, ground Z, the desk polygon and the
 # jaw width, and a model looking at a photograph can see none of them. So the
-# reply carries one box per object and the stack measures each and runs the real
-# gate. What these pin is that the list survives intact -- boxed, counted, and
-# never quietly shortened.
+# answer is one box per object and the stack measures each and runs the real
+# gate.
+#
+# The list comes from a SECOND call, and that is the load-bearing fact here.
+# Measured on a nine-cube desk (2026-08-04): the decision prompt carrying an
+# `objects` field returned 1 of 9, the same prompt worded harder returned 0, and
+# a prompt that only enumerates returned 9 of 9. What these pin is the split
+# that follows from it, and that the list survives intact once it arrives --
+# boxed, counted, and never quietly shortened.
 
 
-def test_a_report_carries_one_grounding_per_boxed_object():
-    act = _decide_on(
-        '{"action": "REPORT", "objects": ['
-        '{"box_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}, '
-        '{"box_2d": ' + _norm_box(600, 400, 700, 460) + ', "label": "stapler"}], '
-        '"reason": "two things on the desk"}',
+def _listing(*boxes: tuple[str, tuple[float, float, float, float]]) -> str:
+    """An enumeration reply in the shape this model actually writes one.
+
+    Fenced markdown around a JSON array of ``bbox_2d`` -- not the ``box_2d`` the
+    decision schema names, and not bare. ``qwen.parse_regions`` is what reads
+    it, which is why the enumeration call does not impose a schema of its own.
+    """
+    rows = ",\n".join(
+        f'\t{{"bbox_2d": {_norm_box(*box)}, "label": "{label}"}}'
+        for label, box in boxes
+    )
+    return f"```json\n[\n{rows}\n]\n```"
+
+
+def _decide_two_call(decision: str, listing: str, obs, instruction: str) -> Action:
+    """The real ``decide`` against the two canned replies a REPORT draws.
+
+    First the decision, then the enumeration. Anything after that gets an empty
+    string, so a third call would show up as a report of nothing rather than as
+    a silently reused reply.
+    """
+    replies = [decision, listing]
+
+    class _Reply:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    saved = instruct.ask
+    instruct.ask = lambda *a, **k: _Reply(replies.pop(0) if replies else "")
+    try:
+        return instruct.decide(obs, instruction)
+    finally:
+        instruct.ask = saved
+
+
+REPORT_REPLY = '{"action": "REPORT", "reason": "there are two things here"}'
+
+
+def test_a_report_takes_its_list_from_the_enumeration_call():
+    act = _decide_two_call(
+        REPORT_REPLY,
+        _listing(
+            ("red cube", (180, 80, 220, 120)),
+            ("stapler", (600, 400, 700, 460)),
+        ),
         _desk(),
         "find all the pickable objects",
     )
@@ -836,14 +881,38 @@ def test_a_report_carries_one_grounding_per_boxed_object():
     assert act.report_notes == ()
     # A report moves nothing, so it carries neither end of a motion.
     assert act.source is None and act.dest_point_px is None
+    # And the prose answer is still the decision reply's, not the listing's.
+    assert "two things here" in act.reason
+
+
+def test_a_box_in_the_decision_reply_is_not_a_report():
+    """The 1-of-9 failure, pinned. Given an `objects` field the model filled
+    `box_2d` with one object and copied it into the list; whatever it writes
+    there now, the report is what the enumeration call returned."""
+    act = _decide_two_call(
+        '{"action": "REPORT", "box_2d": ' + _norm_box(10, 10, 30, 30) + ', '
+        '"label": "red cube", "objects": [{"box_2d": '
+        + _norm_box(10, 10, 30, 30) + ', "label": "red cube"}], '
+        '"reason": "only the red cube"}',
+        _listing(
+            ("red cube", (180, 80, 220, 120)),
+            ("green cube", (300, 200, 340, 240)),
+            ("blue cube", (600, 400, 640, 440)),
+        ),
+        _desk(),
+        "find all the pickable objects",
+    )
+    assert act.ok, act.reason
+    assert len(act.report) == 3
+    assert not _close(act.report[0].box_px, (10.0, 10.0, 30.0, 30.0))
 
 
 def test_a_report_box_is_read_in_the_same_space_a_pick_box_is():
     """One convention for every box in the protocol. A reader should not have
     to remember which field follows which rule -- see ``box_readings``."""
-    act = _decide_on(
-        '{"action": "REPORT", "objects": [{"box_2d": [200, 300, 260, 360], '
-        '"label": "pen"}], "reason": "one pen"}',
+    act = _decide_two_call(
+        REPORT_REPLY,
+        '[{"bbox_2d": [200, 300, 260, 360], "label": "pen"}]',
         _desk(),
         "what is on the desk?",
     )
@@ -859,8 +928,9 @@ def test_a_report_box_is_read_in_the_same_space_a_pick_box_is():
 def test_an_empty_report_is_a_real_answer_not_a_refusal():
     """"There are none" is what the question asked for, so it is not a failure
     and there is nothing to look at a second time."""
-    act = _decide_on(
-        '{"action": "REPORT", "objects": [], "reason": "the desk is bare"}',
+    act = _decide_two_call(
+        '{"action": "REPORT", "reason": "the desk is bare"}',
+        "[]",
         _desk(),
         "find all the pickable objects",
     )
@@ -870,49 +940,50 @@ def test_an_empty_report_is_a_real_answer_not_a_refusal():
     assert "bare" in act.reason
 
 
-def test_a_report_with_no_objects_list_is_refused_by_name():
-    """The list is REPORT's whole answer, so a reply without one has answered
-    nothing -- and the refusal has to name the field and its shape."""
-    for reply in (
-        '{"action": "REPORT", "reason": "there are three cubes"}',
-        '{"action": "REPORT", "objects": null, "reason": "three cubes"}',
-        '{"action": "REPORT", "objects": "a red cube and a pen", "reason": "x"}',
-    ):
-        act = _decide_on(reply, _desk(), "find all the pickable objects")
-        assert not act.ok, reply
-        assert "objects" in act.reason, reply
-        # Forced, not chosen: a reply that answered badly is worth one more look.
-        assert not act.declined, reply
+def test_a_listing_the_service_could_not_answer_is_a_note_not_a_crash():
+    """The decision is already made and reported by the time the list is asked
+    for. Losing the list to a service error must not lose the reply that came
+    with it, and must not be silent either."""
+    from mt4_vision.qwen import QwenError
+
+    def _boom(*a, **k):
+        raise QwenError("qwen service unreachable at http://127.0.0.1:8766")
+
+    obs = _desk()
+    saved = instruct.ask
+    instruct.ask = _boom
+    try:
+        found, notes = instruct.enumerate_objects(obs, "find all the objects")
+    finally:
+        instruct.ask = saved
+    assert found == ()
+    assert len(notes) == 1 and "unreachable" in notes[0]
 
 
-def test_an_unreadable_report_entry_is_named_and_the_rest_survive():
+def test_an_unreadable_listing_entry_is_named_and_the_rest_survive():
     """A report claims completeness, so a dropped entry is a wrong answer, not
     a smaller one. The readable objects stand and the gap is printed."""
-    act = _decide_on(
-        '{"action": "REPORT", "objects": ['
-        '{"box_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}, '
-        '{"box_2d": null, "label": "thing at the back"}, '
-        '"a pen"], '
-        '"reason": "what I can see"}',
+    act = _decide_two_call(
+        REPORT_REPLY,
+        '[{"bbox_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}, '
+        '{"bbox_2d": [4000, 4000, 4100, 4100], "label": "thing at the back"}]',
         _desk(),
         "find all the pickable objects",
     )
     assert act.ok, act.reason
     assert [g.label for g in act.report] == ["red cube"]
-    assert len(act.report_notes) == 2
+    assert len(act.report_notes) == 1
     assert "thing at the back" in act.report_notes[0]
-    assert "'a pen'" in act.report_notes[1]
 
 
 def test_a_whole_frame_entry_is_rejected_inside_a_report_too():
     """Asked to locate something absent this build returns the whole image
     rather than an empty list, and inside a report that would read as one more
     object. The same threshold a PICK's box faces applies to every entry."""
-    act = _decide_on(
-        '{"action": "REPORT", "objects": ['
-        '{"box_2d": [0, 0, 1000, 1000], "label": "desk"}, '
-        '{"box_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}], '
-        '"reason": "everything"}',
+    act = _decide_two_call(
+        REPORT_REPLY,
+        '[{"bbox_2d": [0, 0, 1000, 1000], "label": "desk"}, '
+        '{"bbox_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}]',
         _desk(),
         "find all the pickable objects",
     )
@@ -921,28 +992,47 @@ def test_a_whole_frame_entry_is_rejected_inside_a_report_too():
     assert "% of the frame" in act.report_notes[0]
 
 
-def test_the_prompt_offers_report_and_forbids_judging_pickability():
-    """The one thing the model must not filter on. Reach, the keep-out, the
-    desk edge and the jaw width decide what can be picked up, and none of them
-    is in the photograph -- an object left out because it looks hard to grasp
-    is gone from the answer with nothing able to notice."""
+def test_the_decision_schema_names_no_object_list():
+    """The regression this design exists to prevent. An ``objects`` field in
+    the decision schema collapsed a report to 1 of 9 objects; moving it to the
+    front of the schema fixed the count and broke TRANSFER instead -- asked to
+    "put a blue cube on marker 2", the reply put marker_2's box in ``box_2d``,
+    which is the field the PICK TARGET is read from. A silent wrong target is
+    worse than a short list, so the decision prompt has no list in it at all."""
+    for task in ("find all the pickable objects", "put a blue cube on marker 2"):
+        prompt = instruct.build_prompt(_desk(), task)
+        assert '"objects"' not in prompt, task
+        assert "box_2d" in prompt, task
+    # REPORT is still offered, and says it needs no box.
     prompt = instruct.build_prompt(_desk(), "find all the pickable objects")
     assert "REPORT" in prompt
-    assert '"objects"' in prompt
-    assert "not yours to judge" in prompt
-    assert "list every candidate" in prompt
+    assert "no box is needed here" in prompt
+
+
+def test_the_enumeration_prompt_carries_the_task_and_forbids_pre_filtering():
+    """The one thing the model must not do here. Reach, the keep-out, the desk
+    edge and the jaw width decide what can be picked up and none is in the
+    photograph -- and the decision prompt's own attempt at a list came back
+    reasoning that "the red cube is the only object ... that can be picked up",
+    which is the model ruling on geometry it cannot see."""
+    prompt = instruct.build_report_prompt("find all the pickable objects")
+    assert 'Task: "find all the pickable objects"' in prompt
+    assert "bbox_2d" in prompt
+    assert "not only the ones you think" in prompt
+    assert "leaving one out" in prompt
 
 
 def test_measure_report_runs_the_pick_gate_on_every_object():
     """Pickability is answered by ``source_entity`` -- the same predicate a PICK
     must satisfy -- so a report cannot advertise a target a pick would refuse,
     nor omit one it would accept. A box that will not segment keeps its row."""
-    act = _decide_on(
-        '{"action": "REPORT", "objects": ['
-        '{"box_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}, '
-        '{"box_2d": ' + _norm_box(600, 400, 700, 460) + ', "label": "stapler"}, '
-        '{"box_2d": ' + _norm_box(900, 600, 940, 640) + ', "label": "smudge"}], '
-        '"reason": "three things"}',
+    act = _decide_two_call(
+        REPORT_REPLY,
+        _listing(
+            ("red cube", (180, 80, 220, 120)),
+            ("stapler", (600, 400, 700, 460)),
+            ("smudge", (900, 600, 940, 640)),
+        ),
         _desk(),
         "find all the pickable objects",
     )
@@ -984,13 +1074,12 @@ def test_measure_report_runs_the_pick_gate_on_every_object():
     assert "beyond the 350mm max reach" in found[1].line()
 
 
-def test_a_report_is_saved_with_its_boxes_and_its_measured_rows():
-    """``/save`` writes the decision; for a report the millimetres and the
-    verdicts are the decision, and the boxes alone are only the question."""
-    act = _decide_on(
-        '{"action": "REPORT", "objects": [{"box_2d": '
-        + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}], '
-        '"reason": "one cube"}',
+def test_a_report_is_saved_with_its_boxes():
+    """``/save`` writes the decision; for a report the boxes are the question
+    and the measured rows (added by the worker) are the answer."""
+    act = _decide_two_call(
+        REPORT_REPLY,
+        _listing(("red cube", (180, 80, 220, 120))),
         _desk(),
         "find all the pickable objects",
     )

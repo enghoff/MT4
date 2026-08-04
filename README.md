@@ -251,11 +251,13 @@ angle in millimetres; reach, the J1 keep-out, ground Z, jaw clearance and the
 desk polygon are all checked before the gripper opens.
 
 A task that asks *what is on the desk* rather than for something to be moved is
-answered the same way, one box per object. Each one is measured and put to those
-same gates, so every row of the answer carries millimetres, a position and
-either "pickable" or the gate that stopped it — the arm's verdict, not the
-model's, because what the arm can reach and how wide its jaws open are not
-visible in a photograph.
+answered the same way, one box per object — from a second call whose only job is
+to enumerate, which on a nine-cube desk returns all nine where asking the
+decision prompt for a list returned one. Each object is measured and put to those
+same gates, so every row carries a position, the width the jaws will close
+across, and either "pickable" or the gate that stopped it — the arm's verdict,
+not the model's, because what the arm can reach and how wide its jaws open are
+not visible in a photograph.
 
 The window shows the exact frame each decision was made from with the model's
 own answer drawn on it, so a wrong answer about a frame the arm was blocking

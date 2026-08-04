@@ -442,41 +442,83 @@ optional field with zeros rather than null (observed live beside a real
 `dest_2d`, where it would otherwise mean "lay it along the line to the frame's
 top-left corner").
 
-**A question about the desk is answered in boxes.** `REPORT` is the action for
-a task whose answer is a list of things rather than a movement — *"find all the
-pickable objects"*, *"what is on the desk"*. The reply carries `objects`, one
-`{"box_2d": [...], "label": "..."}` per thing found, and every box is validated
-exactly as a PICK's single box is: the same two coordinate readings, the same
-whole-frame rejection. Then each one is segmented and put through
-`instruct.source_entity` — reach, the J1 keep-out, ground Z, the desk polygon
-and the jaw-width plan, the same predicate a pick has to satisfy. Each object
-comes back as a numbered row with its millimetres, its robot position and either
-"pickable" or the gate that stopped it, and the same numbers are drawn on the
-frame in green and red. Nothing moves, and nothing is registered — the ids are
-the report's own rows and do not outlive it.
+**A question about the desk is answered in boxes, from a second call.**
+`REPORT` is the action for a task whose answer is a list of things rather than a
+movement — *"find all the pickable objects"*, *"how many cubes are on the
+desk"*. The decision reply only chooses the action; the list comes from
+`instruct.enumerate_objects`, a second call on the same frame whose prompt does
+nothing but enumerate. Every box it returns is validated exactly as a PICK's
+single box is — the same two coordinate readings, the same whole-frame rejection
+— then segmented and put through `instruct.source_entity`: reach, the J1
+keep-out, ground Z, the desk polygon and the jaw-width plan, the same predicate a
+pick has to satisfy. Each object becomes a numbered row with its robot position,
+the width the jaws will close across, and either "pickable" or the gate that
+stopped it, with the same numbers drawn on the frame in green and red. Nothing
+moves and nothing is registered — the ids are the report's own rows and do not
+outlive it.
 
-Prose in `reason` cannot answer that question, and the reason is not about
-writing. Whether the arm can pick something up depends on how far it reaches,
-how close to its own base it can work, where the desk ends and how wide the jaws
-open, and none of those is visible in the photograph the model is looking at. So
-the prompt tells it plainly that pickability is **not** its to judge: list every
-candidate object, and let the gates rule out the ones that fail. An object left
-out because it looked hard to grasp would be gone from the answer with nothing
-able to notice — which is the same argument that keeps the cube list out of the
-prompt in the first place.
+**Why a second call.** Measured on a nine-cube desk (2026-08-04, greedy, one
+frame):
 
-For the same reason the list is never quietly shortened. An entry that will not
-read — a null `box_2d`, a bare string, a box covering the whole frame — is
-reported as a named gap (`Action.report_notes`) rather than dropped, and a box
-that reads but will not segment keeps its row with the segmenter's complaint. A
-report is a claim about a whole desk, so what is missing from it has to be as
-visible as what is in it. An empty `objects` list is a real answer and not a
-refusal: it says there are none.
+| prompt | objects returned |
+|---|---|
+| decision prompt with an `objects` field | **1** of 9 |
+| the same, worded harder | **0** of 9 |
+| the same, `objects` first in the schema | **8** of 9 |
+| a prompt that only enumerates | **9** of 9 |
+
+The mechanism is field order. Greedy decoding writes the keys in the order the
+schema lists them, so with `box_2d` first the reply commits to a single target
+and the list becomes an echo of it — the 1-of-9 reply boxed one red cube in
+`box_2d` and copied it into `objects`, reasoning that it "is the only object
+identified as being on the desk that can be picked up". Putting `objects` first
+fixes the count and **breaks the movement actions instead**: asked to *"put a
+blue cube on marker 2"*, that ordering answered TRANSFER with marker_2's box in
+`box_2d`, which is the field the pick target is read from — the arm would have
+tried to pick up the printed tag. A silent wrong target is worse than a short
+list, so the decision prompt keeps its shape and has no list in it at all.
+
+The model is not the limitation: its own bare grounding phrasing
+(*"Locate all the cubes in the image, output their bbox in JSON format"*)
+returns 9 of 9 on the same pixels, raw or annotated. The enumeration prompt is
+that shape with the task text woven in, and it reads back through
+`qwen.parse_regions` — the model answers in its own convention (`bbox_2d`, in a
+markdown fence), so nothing imposes a schema on it.
+
+On the same nine cubes the reported positions land **0.3-8.2mm** from the HSV
+detector's reading, and every colour label was right.
+
+**Pickability is not the model's to judge**, and the enumeration prompt says so.
+Whether the arm can pick something up depends on how far it reaches, how close
+to its own base it can work, where the desk ends and how wide the jaws open, and
+none of that is in the photograph. List every candidate; the gates rule out the
+failures. An object left out because it looked hard to grasp would be gone from
+the answer with nothing able to notice — the same argument that keeps the cube
+list out of the decision prompt.
+
+**The reported width is `grip_mm`, not the silhouette's extent.** GrabCut from a
+box takes in the object's shadow: on those nine cubes the extent read 38-64mm
+long for 20mm cubes while the planned grip width read 20.5-28.7mm. The position
+is sound either way, but a size column two to three times over is worse in an
+operator's hands than none, and the grip width is what the pick is planned on.
+
+The list is never quietly shortened. A box that will not read — outside the
+frame, or covering it — is reported as a named gap (`Action.report_notes`)
+rather than dropped, and one that reads but will not segment keeps its row with
+the segmenter's complaint. An empty list is a real answer and not a refusal: it
+says there are none. If the service fails on the enumeration call the report
+comes back empty *with the reason as a note*, because the decision has already
+been made and reported by then and losing the list must not lose the reply.
 
 A REPORT ends the instruction, counted as success. The report *is* the answer,
 so another step would put the same question to the same unchanged desk — the
 argument a chosen STOP already runs on. A task that wants something reported
 *and* moved is two instructions.
+
+One wart: `reason` comes from the decision call, which has not enumerated
+anything, so its prose can disagree with the list ("There are two green cubes
+visible" above three rows). The prompt tells it not to count there. The
+authoritative count is the measured one, printed under the rows.
 
 **A STOP the model chose is terminal.** It is the model's answer to the
 request, so re-asking is asking the same question again. Live, `open the

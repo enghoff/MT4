@@ -24,12 +24,16 @@ it.** Three rules follow from that, and every one of them is load-bearing:
   the thing to pick up. With no id to resolve there is no binding, no ambiguity
   refusal and no named-vs-pointed disagreement -- three ways a correct reply
   can be turned into an abandoned task.
-* **An answer about several things is several boxes.** ``REPORT`` carries an
-  ``objects`` list, one box per thing found, and each box is measured and put
-  to the pick gates exactly as a PICK's is (:func:`measure_report`). That is
-  how "find all the pickable objects" gets a true answer: which things the arm
-  can take is a fact about reach, the keep-out, the desk edge and the jaw
-  width, none of which is visible in the photograph the model is looking at.
+* **An answer about several things is a second call.** ``REPORT`` chooses the
+  action; :func:`enumerate_objects` then asks the same frame for one box per
+  object, and each box is measured and put to the pick gates exactly as a
+  PICK's is (:func:`measure_report`). That is how "find all the pickable
+  objects" gets a true answer: which things the arm can take is a fact about
+  reach, the keep-out, the desk edge and the jaw width, none of which is
+  visible in the photograph the model is looking at. The list needs its own
+  call because a schema listing ``box_2d`` first collapses it to one object,
+  and listing the list first sends a TRANSFER's *destination* into the pick
+  field -- both measured; see :func:`build_report_prompt`.
 * **A destination is a point, not an id.** ``dest_2d`` is the only destination
   channel there is, on the same 0-1000 grid the tag positions are printed in.
   Landing on a tag means echoing that tag's listed coordinates back. An id would
@@ -128,7 +132,7 @@ from mt4_vision.instruct_reply import (
     box_readings,
     measure_grounding,
     point_readings,
-    report_groundings,
+    region_groundings,
     to_frame_pixels,
 )
 from mt4_vision.preview import annotate_for_pointing
@@ -139,9 +143,9 @@ __all__ = [
     "ACTIONS", "COORD_SCALE", "MAX_NEW_TOKENS", "MAX_BOX_FRAME_SHARE",
     "ON_TAG_MM", "Action", "Finding", "Grounding", "Observation",
     "box_grounding", "box_readings", "build_prompt", "decide",
-    "destination_grasp", "measure_grounding", "measure_report", "observe",
-    "point_readings", "report_groundings", "tag_at", "to_frame_pixels",
-    "load_calibration",
+    "build_report_prompt", "destination_grasp", "enumerate_objects",
+    "measure_grounding", "measure_report", "observe", "point_readings",
+    "region_groundings", "tag_at", "to_frame_pixels", "load_calibration",
 ]
 
 # A decision is an action, a box, a destination and whatever the model has to
@@ -152,21 +156,25 @@ __all__ = [
 # a few dozen tokens of it. A cap is a ceiling, not a target: a short reply
 # still decodes short.
 #
-# A REPORT spends it on boxes rather than on prose -- one
-# ``{"box_2d": [x, y, x, y], "label": "..."}`` entry is about 30 tokens of
-# JSON, so this holds a list far longer than any desk this arm works over.
-# Running out is not silent: a reply cut off mid-array has no balanced
-# ``{...}`` for ``_first_json_object`` to find, so it refuses as "no JSON object
-# in the reply" rather than reporting the objects that fit and losing the rest.
+# The enumeration call (``build_report_prompt``) shares the cap and spends it
+# on boxes -- one ``{"bbox_2d": [x, y, x, y], "label": "..."}`` entry is about
+# 30 tokens, so nine cubes cost ~280 and this holds far more than any desk this
+# arm works over. Running out there DOES cost objects, because that reply is a
+# list and ``parse_regions`` keeps the entries that completed; a report short
+# of the desk is the failure this whole path exists to avoid, so the cap has to
+# stay well clear.
 #
 # It does not cost the service's fast path, because this prompt never had it.
 # ``server.py`` takes the reused StaticCache when ``prompt_len + max_new_tokens
-# <= CACHE_LEN`` (1664), and this prompt measures **2057 tokens** on a 1280x720
-# frame with no tags listed -- over the cache on its own, so every decision
-# already runs on the dynamic cache and eager decode whatever this number is.
-# Restoring the fast path means raising ``QWEN_VL_CACHE_LEN`` past prompt +
-# reply, which slows every other request the service serves; that is a
+# <= CACHE_LEN`` (1664), and the decision prompt measures **1913 tokens** on a
+# 1280x720 frame with five tags listed -- over the cache on its own, so every
+# decision already runs on the dynamic cache and eager decode whatever this
+# number is. Restoring the fast path means raising ``QWEN_VL_CACHE_LEN`` past
+# prompt + reply, which slows every other request the service serves; that is a
 # service-level call, not one this constant can make.
+#
+# The enumeration prompt is **1007 tokens** on the same frame and would fit the
+# cache with a reply of up to 657, which is more than nine objects need.
 MAX_NEW_TOKENS = 640
 
 # The retry decode in `decide`, and the only sampled call in this loop. Low
@@ -186,11 +194,13 @@ RETRY_TEMPERATURE = 0.6
 #
 # REPORT is the answer channel for a task whose answer is a list of things
 # rather than a sentence -- "find all the pickable objects", "what is on the
-# desk". It moves nothing. Prose in ``reason`` cannot answer it, for a reason
-# that is not about writing: whether the arm can pick a thing up depends on
-# reach, the J1 keep-out, ground Z, the desk polygon and the width of the jaws,
-# and a model looking at a photograph can see none of those. Boxes can be
-# measured and put to the real gates; a sentence cannot.
+# desk". It moves nothing, and it is the one action whose answer is not in this
+# reply: the boxes come from a second call, ``enumerate_objects``. Prose in
+# ``reason`` cannot answer it, for a reason that is not about writing: whether
+# the arm can pick a thing up depends on reach, the J1 keep-out, ground Z, the
+# desk polygon and the width of the jaws, and a model looking at a photograph
+# can see none of those. Boxes can be measured and put to the real gates; a
+# sentence cannot.
 ACTIONS = ("TRANSFER", "PICK", "PLACE", "REPORT", "DONE", "STOP")
 
 
@@ -285,9 +295,10 @@ class Action:
     # Optional: absent means the reply had no orientation opinion and the
     # destination is squared to the world axes. See ``instruct._place_grasp``.
     dest_axis_px: tuple[float, float] | None = None
-    # What a REPORT boxed: one grounding per object, in the order the reply
-    # wrote them, and empty for every other action. An empty report with no
-    # notes is a real answer -- the reply saying there is nothing to list.
+    # What a REPORT found: one grounding per object, in the order the
+    # enumeration call listed them, and empty for every other action. This
+    # comes from ``enumerate_objects``, not from ``raw`` -- see decide. An
+    # empty report with no notes is a real answer: there is nothing to list.
     report: tuple[Grounding, ...] = ()
     # Entries of that list that would not read, one line each. Carried rather
     # than dropped because a report is a claim of completeness: "found 4" with a
@@ -521,16 +532,15 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         f"{actions}"
         "  PLACE    - put down what is held. dest_2d says where\n"
         "  REPORT   - the task asks what is on the desk rather than for "
-        "something to be moved. Answer it by boxing the things it asks about: "
-        "objects carries one box each. Nothing moves\n"
+        "something to be moved: what is there, how many, which ones are a "
+        "certain colour. Nothing moves, and you will be asked separately to "
+        "point out the objects, so no box is needed here\n"
         "  DONE     - the task is complete\n"
         "  STOP     - the task cannot be done, or you cannot tell which thing "
         "is meant\n\n"
         "Reply with ONLY a JSON object, no prose, no markdown fence:\n"
         '{"action": "...", "box_2d": [x1, y1, x2, y2], "label": "...", '
-        '"dest_2d": [x, y], "dest_axis_2d": [x, y], '
-        '"objects": [{"box_2d": [x1, y1, x2, y2], "label": "..."}], '
-        '"reason": "..."}\n\n'
+        '"dest_2d": [x, y], "dest_axis_2d": [x, y], "reason": "..."}\n\n'
         "Every coordinate you give is on a 0-1000 scale across the image: 0 is "
         "the left edge, 1000 the right edge, and the same top to bottom. The "
         "tag positions above are written that way too, and the numbered "
@@ -542,8 +552,11 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "label is a short noun for whatever you boxed.\n"
         "reason is the only thing you can say to the person who set the task. "
         "A sentence or two, more when there is more to say. If the task asked "
-        "a question rather than for a movement, answer it there and pick "
-        "DONE.\n"
+        "a question rather than for a movement, answer it there -- and pick "
+        "REPORT when the answer is about the things on the desk, DONE when it "
+        "is not. On a REPORT, say what you are reporting on but do NOT count "
+        "or list the objects in reason: the separate pass does the counting, "
+        "and a number here that disagrees with it is worse than no number.\n"
         "dest_2d says where something goes, and it is always a point on the "
         "image -- there is no way to name a destination, only to point at one. "
         "Required for TRANSFER and PLACE. Three cases, all the same field:\n"
@@ -559,18 +572,6 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "the line from dest_2d to it is the direction the object should lie "
         "in. Give it only when the task says something about direction; null "
         "otherwise, and the object goes down square to the desk.\n"
-        "objects is REPORT's answer, and the only way to answer about more "
-        "than one thing: a list with one entry per thing you found, each "
-        '{"box_2d": [x1, y1, x2, y2], "label": "..."}, every box drawn the '
-        "same way box_2d is. Required for REPORT, and an empty list [] is a "
-        "real answer -- it says there are none. Whether the arm can actually "
-        "pick a thing up is not yours to judge and not something the image "
-        "shows: how far it can reach, how close to its own base it can work, "
-        "where the desk ends and how wide the jaws open decide that, and every "
-        "box you list gets measured and put to those tests after you answer. "
-        "So list every candidate object, and let the tests rule out the ones "
-        "that fail. Leaving something out because it looks hard to grasp "
-        "deletes it from the answer, and nobody can tell that it was there.\n"
         # The one text-derived rule left, and it is about the one datum we
         # supply rather than about the model's own grounding. Measured live
         # 2026-08-03, "place it on marker 0" on a desk of markers 1-4: the model
@@ -584,6 +585,53 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "neither is a point near where you expect it to be.\n"
         "Use null for every field the chosen action does not need.\n"
         "Begin your reply with { and end it with }."
+    )
+
+
+def build_report_prompt(instruction: str) -> str:
+    """The enumeration prompt: one box per object, and nothing else to decide.
+
+    A REPORT's list comes from its own call rather than from the decision
+    reply, because one prompt cannot do both jobs. Measured on a nine-cube desk
+    (2026-08-04, greedy, one frame):
+
+    ==========================================  ================
+    prompt                                      objects returned
+    ==========================================  ================
+    decision prompt with an ``objects`` field   1 of 9
+    the same, worded harder                     0 of 9
+    the same, ``objects`` first in the schema   8 of 9
+    this prompt                                 **9 of 9**
+    ==========================================  ================
+
+    The mechanism is field order. Greedy decoding writes the keys in the order
+    the schema lists them, so with ``box_2d`` first the reply commits to a
+    single target and the list becomes an echo of it -- the 1-of-9 reply boxed
+    one red cube in ``box_2d`` and copied it into ``objects``. Putting
+    ``objects`` first fixes the count and breaks the movement actions instead:
+    asked to "put a blue cube on marker 2" that ordering answered TRANSFER with
+    the *destination* in ``box_2d``, which is the field the pick target is read
+    from. A silent wrong target is worse than a short list, so the decision
+    prompt keeps its shape and enumeration gets a call of its own.
+
+    What is in here is what the count survives. The task text is carried so the
+    list is about what was asked, and the refusal to pre-filter is spelled out
+    because the decision prompt's own attempt at a list came back reasoning
+    that "the red cube is the only object ... that can be picked up" -- the
+    model deciding pickability, which it cannot see. Nothing else earned its
+    place: a line telling it the printed tags are not objects changed no count
+    and is not here.
+    """
+    return (
+        "Locate every object on the desk that this task asks about, and output "
+        "one JSON entry per object with its bbox_2d and a short label.\n\n"
+        f'Task: "{instruction}"\n\n'
+        "List every separate object you can see, not only the ones you think "
+        "the arm could pick up. How far it reaches, how close to its base it "
+        "can work and how wide its jaws open are not visible in this image, "
+        "and every box you list is measured and tested against them afterwards "
+        "-- so leaving one out is the only mistake you can make here that "
+        "nothing can catch."
     )
 
 
@@ -854,13 +902,24 @@ class Finding:
         return self.entity.reason or "not pickable"
 
     def line(self) -> str:
-        """The transcript row, in the column layout ``Snapshot.table`` uses."""
+        """The transcript row, in the column layout ``Snapshot.table`` uses.
+
+        The width quoted is ``grip_mm``, what the jaws will actually close
+        across at the planned grasp point -- **not** the silhouette's extent.
+        GrabCut from a box takes in the object's shadow, so on the nine-cube
+        desk of 2026-08-04 the extent read 38-64mm long for 20mm cubes while
+        ``grip_mm`` read 20.5-28.7mm. The position is sound either way (0.3-8.2
+        mm from the HSV detector's reading on those nine), but a size column
+        two to three times over is worse in an operator's hands than no size
+        column, and the grip width is the number the pick is planned on.
+        """
         head = f"{self.index}. {self.label:<14}"
-        if self.entity is None or self.obj is None:
+        if self.entity is None:
             return f"{head} could not be measured: {self.trouble}"
+        grip = "" if self.entity.grip_mm is None else f"grip {self.entity.grip_mm:.0f}mm  "
         return (
             f"{head} ({self.entity.x:>6.1f},{self.entity.y:>7.1f})  "
-            f"{self.obj.long_mm:.0f}x{self.obj.short_mm:.0f}mm  {self.note}"
+            f"{grip}{self.note}"
         )
 
 
@@ -929,6 +988,42 @@ def source_entity(obs: Observation, obj: Any, *, eid: str = "obj_1") -> Entity:
     return object_entity(obj, eid, scene=obs.scene, require_clearance=False)
 
 
+def enumerate_objects(
+    obs: Observation,
+    instruction: str,
+    *,
+    url: str = DEFAULT_URL,
+    max_new_tokens: int = MAX_NEW_TOKENS,
+) -> tuple[tuple[Grounding, ...], tuple[str, ...]]:
+    """Every object the task asks about, as boxes on this frame.
+
+    The second half of a REPORT: :func:`build_report_prompt` asks, and
+    ``qwen.parse_regions`` reads the boxes back out of whatever the reply
+    wrapped them in. That parser rather than a schema of our own, because this
+    prompt is phrased the way the model's own grounding examples are and the
+    reply comes back in the model's own shape -- ``bbox_2d``, usually inside a
+    markdown fence.
+
+    The same frame the decision was made on, so the boxes describe the desk the
+    report is about. Greedy, like every non-retry call in this loop.
+
+    A service error is not an exception here: it comes back as a note, and the
+    report says it found nothing and why. The decision has already been made and
+    reported by the time this runs, and losing the list is not worth losing the
+    reply that came with it.
+    """
+    from mt4_vision.qwen import parse_regions
+
+    try:
+        reply = ask(
+            build_report_prompt(instruction), obs.annotated, url=url,
+            max_new_tokens=max_new_tokens, do_sample=False,
+        )
+    except QwenError as exc:
+        return (), (f"listing the objects failed: {exc}",)
+    return region_groundings(parse_regions(reply.text), obs.size)
+
+
 def decide(
     obs: Observation,
     instruction: str,
@@ -941,14 +1036,18 @@ def decide(
     Every failure path produces ``ok=False`` with prose, never an exception.
 
     What this checks is that the reply is *well formed for the action it
-    chose*: a known action, a usable box where a box is required, a destination
-    where one is required, and a list where a REPORT's answer belongs. What it
-    does not do is measure any of it -- a REPORT's boxes go to
-    :func:`measure_report` after this returns, for the same reason a pick's
-    single box goes to :func:`measure_source`. What it does not check is
-    whether the model was right about what it boxed -- there is nothing here to
-    check that against, which is the point. Nor does it check the gripper:
-    ``held`` is a belief a person typed in, not a reading.
+    chose*: a known action, a usable box where a box is required, and a
+    destination where one is required. What it does not do is measure any of it
+    -- boxes go to :func:`measure_source` or :func:`measure_report` after this
+    returns. What it does not check is whether the model was right about what
+    it boxed -- there is nothing here to check that against, which is the
+    point. Nor does it check the gripper: ``held`` is a belief a person typed
+    in, not a reading.
+
+    **REPORT costs a second call**, :func:`enumerate_objects`, because its
+    answer is a list and this prompt cannot produce one -- 1 of 9 objects on a
+    nine-cube desk, against 9 of 9 from a prompt that only enumerates. See
+    :func:`build_report_prompt`.
 
     A reply carrying no JSON at all is asked once more, **sampled**. Re-asking
     greedily would be pointless -- same prompt, same weights, same reply -- so
@@ -999,20 +1098,17 @@ def decide(
         )
 
     if kind == "REPORT":
-        # ok=True whatever the list holds, including empty: a report moves
+        # A second call, on the same frame, with a prompt whose only job is
+        # the list -- see build_report_prompt for the 1-of-9 against 9-of-9
+        # that puts it here rather than in the reply above.
+        #
+        # ok=True whatever comes back, including nothing: a report moves
         # nothing, so there is no pose to be wrong about, and "there are none"
         # is an answer to the question that was asked. What the list is worth
         # is settled by ``measure_report``, object by object, against the gates.
-        said = got.get("objects")
-        if not isinstance(said, list):
-            return Action(
-                "STOP", False,
-                "REPORT answers with objects, a list of "
-                '{"box_2d": [x1, y1, x2, y2], "label": "..."} entries -- one '
-                f"per thing found, [] when there are none -- and gave {said!r}",
-                raw=raw,
-            )
-        found, notes = report_groundings(said, obs.size)
+        found, notes = enumerate_objects(
+            obs, instruction, url=url, max_new_tokens=max_new_tokens
+        )
         return Action(
             kind, True, why or "report",
             report=found, report_notes=notes, raw=raw,

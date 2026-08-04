@@ -11,7 +11,7 @@ works. Two jobs live here:
   convention is applied, and they order their two readings identically.
 * **Turning the box the model drew into something measurable.**
   :func:`box_grounding` validates it, :func:`measure_grounding` segments it
-  into a ``LocatedObject`` with real millimetres. :func:`report_groundings`
+  into a ``LocatedObject`` with real millimetres. :func:`region_groundings`
   does the first of those for a REPORT's whole list at once.
 
 There is **one** grounding call per decision, and it is the decision itself:
@@ -287,18 +287,21 @@ def _grounding(
     )
 
 
-def report_groundings(
-    entries: Sequence[Any], size: tuple[int, int]
+def region_groundings(
+    regions: Sequence[Any], size: tuple[int, int]
 ) -> tuple[tuple[Grounding, ...], tuple[str, ...]]:
-    """A REPORT reply's ``objects`` list as groundings, and what would not read.
+    """An enumeration reply's boxes as groundings, and what would not read.
 
-    One entry is ``{"box_2d": [x1, y1, x2, y2], "label": "..."}`` and goes
-    through :func:`box_grounding`, so a box inside a report is validated exactly
-    as a PICK's single box is: the same two coordinate readings, the same
-    whole-frame rejection.
+    Takes ``qwen.Region``\\ s -- ``parse_regions`` has already dug the JSON out
+    of whatever the reply wrapped it in and accepts every box key this model
+    family writes (``bbox_2d`` in practice). Each box then goes through
+    :func:`box_grounding`, so a box in a report is validated exactly as a PICK's
+    single box is: the same two coordinate readings, the same whole-frame
+    rejection. Point regions are skipped -- a point cannot be measured or
+    size-checked, which is the whole argument for asking for boxes.
 
-    An entry that will not read comes back as a note rather than as a refusal of
-    the whole reply. A report answers "what is on this desk", and four objects
+    A box that will not read comes back as a note rather than as a refusal of
+    the whole reply. A report answers "what is on this desk", and eight objects
     plus a named gap is a better answer than none at all. The gap has to be
     *named*, though, which is why the notes are returned alongside: a report
     that quietly dropped an entry would under-count while looking complete, and
@@ -306,19 +309,18 @@ def report_groundings(
     """
     found: list[Grounding] = []
     notes: list[str] = []
-    for i, entry in enumerate(entries, start=1):
-        if not isinstance(entry, dict):
-            notes.append(
-                f"entry {i} is {entry!r}, not an object with box_2d and label"
-            )
+    n = 0
+    for region in regions:
+        if getattr(region, "kind", "") != "box":
             continue
-        label = str(entry.get("label") or "").strip() or "object"
+        n += 1
+        label = str(getattr(region, "label", "") or "").strip() or "object"
         g, bad = box_grounding(
-            entry.get("box_2d"), size,
+            getattr(region, "coords", None), size,
             label=label, around="each thing you found",
         )
         if g is None:
-            notes.append(f"entry {i} ({label}): {bad}")
+            notes.append(f"entry {n} ({label}): {bad}")
             continue
         found.append(g)
     return tuple(found), tuple(notes)

@@ -81,18 +81,26 @@ moves, so the measurement taken from the box is still true when the jaws
 arrive.
 
 **A question about the desk is answered in boxes, not in prose.** "Find all the
-pickable objects" gets a ``REPORT``: the model draws one box round each thing it
-found, and every box is then segmented and put through the same gates a pick
-goes through -- reach, the keep-out, ground, the jaw-width plan, the desk
-polygon. Each object comes back as a row with its millimetres, its position and
-either "pickable" or the gate that stopped it, and the same numbered boxes are
-drawn on the frame in green and red. Nothing moves.
+pickable objects" gets a ``REPORT``, and its list comes from a second call on
+the same frame whose only job is to enumerate. Every box it returns is segmented
+and put through the same gates a pick goes through -- reach, the keep-out,
+ground, the jaw-width plan, the desk polygon. Each object comes back as a
+numbered row with its position, the width the jaws will close across, and either
+"pickable" or the gate that stopped it, with the same numbers drawn on the frame
+in green and red. Nothing moves.
 
-The model is told plainly not to decide that part for itself, because it cannot
-see it: what the arm can reach, how close to its own base it can work, where the
-desk ends and how wide the jaws open are facts about the machine, not about the
-photograph. So it lists every candidate and the gates rule out the ones that
-fail. An object the model left out because it looked hard to grasp would be
+Enumeration needs its own call because the decision prompt cannot do both jobs.
+Measured on a nine-cube desk: asked for a list alongside its usual single-target
+fields it returned **1 of 9** objects, having boxed one cube and copied it into
+the list; the enumeration prompt returns **9 of 9**. Reordering the decision
+schema to fix the count instead sent a transfer's *destination* into the pick
+field, which is a silently wrong target -- so the two stay apart.
+
+The model is told plainly not to decide pickability for itself, because it
+cannot see it: what the arm can reach, how close to its own base it can work,
+where the desk ends and how wide the jaws open are facts about the machine, not
+about the photograph. So it lists every candidate and the gates rule out the
+ones that fail. An object left out because it looked hard to grasp would be
 missing from the answer with nothing able to notice.
 
 **What the gripper holds outlives an instruction.** The jaws are physical and
