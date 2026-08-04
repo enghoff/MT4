@@ -198,12 +198,21 @@ def test_markers_are_the_only_model_facing_entities():
     assert [e.kind for e in obs.markers] == ["marker", "marker"]
 
 
-def test_the_overlay_circles_only_tags(monkeypatch):
-    """A circled cube is the picture-shaped version of a cube list."""
+def test_the_overlay_circles_only_tags_over_a_0_1000_grid(monkeypatch):
+    """A circled cube is the picture-shaped version of a cube list.
+
+    The grid mode is pinned because the drawn numbers have to name the space the
+    reply is read in: 0-1000 per axis, not pixels. Measured across five live
+    layouts the three overlays score the same, so nothing here rests on a
+    performance claim -- it rests on the labels not contradicting the prompt.
+    ``mt4_camera_view`` still wants "pixel"; this caller does not.
+    """
     drawn: list[list[str]] = []
+    modes: list[str] = []
 
     def _fake_annotate(frame, entities=None, **kw):
         drawn.append([e.id for e in (entities or ())])
+        modes.append(kw.get("grid"))
         return frame
 
     snap = _desk().snapshot
@@ -213,6 +222,13 @@ def test_the_overlay_circles_only_tags(monkeypatch):
     monkeypatch.setattr(instruct, "build_snapshot", lambda sc, token: snap)
     instruct.observe(frame=np.zeros((FRAME_H, FRAME_W, 3), np.uint8))
     assert drawn == [["marker_3", "marker_2"]]
+    assert modes == ["norm"]
+
+
+def test_the_prompt_says_the_gridlines_are_the_0_1000_scale():
+    """The drawn numbers and the requested space have to be the same space."""
+    prompt = instruct.build_prompt(_desk(), "pick up the pen")
+    assert "gridlines drawn on the image are that same scale" in prompt
 
 
 # -- the reply is read faithfully ------------------------------------------ #

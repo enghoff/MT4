@@ -492,21 +492,57 @@ ENTITY_BLOCKED_BGR = (120, 120, 120)
 POINTING_GRID_PX = 100
 
 
+# Spacing of the normalized grid, in units of the 0-1000 scale.
+POINTING_GRID_NORM = 100
+
+
 def annotate_for_pointing(
     frame: np.ndarray,
     entities: list | None = None,
     *,
     grid_px: int = POINTING_GRID_PX,
+    grid: str = "pixel",
 ) -> np.ndarray:
-    """Frame with a labelled pixel grid and any known entity ids drawn on it.
+    """Frame with any known entity ids circled, over a numbered grid.
 
-    Built for handing a frame to a vision-capable model and asking "which pixel
-    is the pen". The grid is the point: a model reading coordinates off drawn,
-    numbered gridlines is self-correcting about the coordinate space, whereas one
-    estimating them from the image alone can be confidently off by a wide margin
-    and there is no way to tell from the answer. Drawing the ids of what is
-    already detected does the other half -- it stops the model pointing at a cube
-    the entity table already covers.
+    Built for handing a frame to a viewer that has to name a position. Circling
+    the ids is what ties a printed ArUco number, which cannot be read off an
+    image, to the tag the viewer can see.
+
+    ``grid`` picks which space the gridlines are labelled in, and the two
+    readers of this frame do not want the same one:
+
+    * ``"pixel"`` -- lines every ``grid_px`` pixels, labelled with the pixel
+      column/row. ``mt4_camera_view``'s documented workflow is to read a
+      coordinate off these and pass it to ``mt4_locate_at_pixel``.
+    * ``"norm"`` -- lines every ``POINTING_GRID_NORM`` units of the 0-1000
+      scale, labelled with that unit. This is what Qwen gets: it answers 0-1000
+      per axis whatever the prompt asks, which is the documented convention for
+      the model family, so a grid labelled in pixels names a space its reply is
+      not in.
+    * ``"none"`` -- circles only.
+
+    **"norm" is chosen for coherence, not for a measured win.** Across five
+    distinct cube layouts on the live desk, 9 action choices and 2 box targets
+    per layout per overlay, the three are indistinguishable:
+
+    ====================  ==================  ==================  ============
+    overlay               correct action      mean box error      wrong cube
+    ====================  ==================  ==================  ============
+    pixel grid            34/45               6.6 / 11.6 px       0
+    no grid               36/45               4.0 / 11.0 px       0
+    0-1000 grid           34/45               5.0 / 11.7 px       0
+    ====================  ==================  ==================  ============
+
+    Nothing there separates them, so the tie is broken on the one argument that
+    does not depend on a sample size: a grid labelled 100-1200 tells the model
+    the frame is 1280 wide while the prompt tells it the right edge is 1000, and
+    only one of those can be the space the reply is read in.
+
+    Do not read a performance claim into this either way. An earlier round that
+    photographed one static layout three times appeared to show large effects in
+    both directions; three captures of the same desk are one trial repeated, and
+    none of it survived five real layouts.
 
     ``entities`` is any sequence of objects with ``id``, ``pixel`` and
     ``pickable`` (i.e. ``mt4_vision.entities.Entity``); entities without a pixel
@@ -521,15 +557,30 @@ def annotate_for_pointing(
     h, w = out.shape[:2]
 
     # Grid first, so labels and ids sit on top of it.
-    for x in range(grid_px, w, grid_px):
-        cv2.line(out, (x, 0), (x, h), GRID_BGR, 1)
-        draw_outlined_text(out, str(x), (x + 3, 14), scale=0.4, color=GRID_BGR)
-    for y in range(grid_px, h, grid_px):
-        cv2.line(out, (0, y), (w, y), GRID_BGR, 1)
-        draw_outlined_text(out, str(y), (3, y - 3), scale=0.4, color=GRID_BGR)
-    draw_outlined_text(
-        out, f"{w}x{h}  grid {grid_px}px", (3, h - 8), scale=0.45, color=GRID_BGR
-    )
+    if grid == "pixel":
+        for x in range(grid_px, w, grid_px):
+            cv2.line(out, (x, 0), (x, h), GRID_BGR, 1)
+            draw_outlined_text(out, str(x), (x + 3, 14), scale=0.4, color=GRID_BGR)
+        for y in range(grid_px, h, grid_px):
+            cv2.line(out, (0, y), (w, y), GRID_BGR, 1)
+            draw_outlined_text(out, str(y), (3, y - 3), scale=0.4, color=GRID_BGR)
+        draw_outlined_text(
+            out, f"{w}x{h}  grid {grid_px}px", (3, h - 8), scale=0.45, color=GRID_BGR
+        )
+    elif grid == "norm":
+        for k in range(POINTING_GRID_NORM, 1000, POINTING_GRID_NORM):
+            x = int(k * w / 1000)
+            cv2.line(out, (x, 0), (x, h), GRID_BGR, 1)
+            draw_outlined_text(out, str(k), (x + 3, 14), scale=0.4, color=GRID_BGR)
+            y = int(k * h / 1000)
+            cv2.line(out, (0, y), (w, y), GRID_BGR, 1)
+            draw_outlined_text(out, str(k), (3, y - 3), scale=0.4, color=GRID_BGR)
+        draw_outlined_text(
+            out, f"grid = 0-1000 scale, {POINTING_GRID_NORM} units",
+            (3, h - 8), scale=0.45, color=GRID_BGR,
+        )
+    elif grid != "none":
+        raise ValueError(f"grid must be 'pixel', 'norm' or 'none', not {grid!r}")
 
     for ent in entities or []:
         pixel = getattr(ent, "pixel", None)

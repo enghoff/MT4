@@ -127,7 +127,7 @@ def decision_view(
 ) -> np.ndarray:
     """What the model just answered, drawn on the frame it answered about.
 
-    ``obs.annotated`` and not a fresh capture: the grid and the tag circles are
+    ``obs.annotated`` and not a fresh capture: the tag circles are
     what the model was looking at when it produced these coordinates, so they
     are the only backdrop against which the answer means anything.
 

@@ -1807,6 +1807,73 @@ gate first.
 
 ---
 
+### 2ab. The overlay grid is labelled in 0-1000, not pixels
+
+**The inconsistency.** `annotate_for_pointing` drew gridlines every 100 **pixels**,
+labelled 100–1200 across a 1280-wide frame, while the prompt asked for and the
+code read a **0-1000** scale. The drawn numbers described a space the reply was
+never in. The grid's stated purpose was to make the model "self-correcting about
+the coordinate space", which it cannot do with labels in the wrong space.
+
+**0-1000 is the documented convention, and the code already matched it.**
+Qwen3-VL outputs normalized 0-1000 per axis; Qwen2.5-VL used absolute pixels and
+Qwen3-VL reverted. The official `cookbooks/spatial_understanding.ipynb` converts
+with `int(p[0])/1000 * width` and `int(p[1])/1000 * height` — per axis, denominator
+1000 — which is exactly `to_frame_pixels`. (A DeepWiki summary of the same repo
+claims 999 "for backward compatibility"; the notebook source uses 1000. The gap
+is 1.28 px on this frame.) No grid appears anywhere in Qwen's documentation. The
+technique belongs to the Set-of-Mark family, where published results are mixed
+and Qwen-family models specifically are reported to *degrade* under a grid overlay.
+
+**Measured across five distinct cube layouts, arm parked at (200, 0, 260)
+between each.** Nine action choices per layout (six pick-only tasks, three
+transfers) and two box targets, ground truth from the HSV detector on the same
+frame. Layouts were made by moving the real cubes with the arm, not by
+re-photographing one desk:
+
+| overlay | correct action | mean box error (green / red) | wrong cube |
+|---|---|---|---|
+| pixel grid, labelled 100–1200 | 34/45 | 6.6 / 11.6 px | 0 |
+| no grid, circles only | 36/45 | 4.0 / 11.0 px | 0 |
+| 0-1000 grid, labelled 100–900 | 34/45 | 5.0 / 11.7 px | 0 |
+
+**Nothing separates them.** No overlay wins action choice, none wins box
+accuracy, and none ever boxed the wrong cube. So `grid="norm"` is chosen on the
+one argument that does not depend on sample size: a grid labelled 100–1200 tells
+the model the frame is 1280 wide while the prompt tells it the right edge is
+1000, and only one of those can be the space the reply is read in.
+`mt4_camera_view` keeps `grid="pixel"` — its documented workflow is a human
+reading a pixel off those lines for `mt4_locate_at_pixel`.
+
+**A retracted result, kept because the mistake is the lesson.** An earlier round
+photographed a *single* static layout three times and appeared to show large
+effects: dropping the grid turning `PICK` into `TRANSFER` (20/27 against 26/27),
+and the pixel grid putting the red cube's box 40–51 px out. Three captures of one
+desk with greedy decoding are one trial repeated, not three samples. None of it
+reproduced across five real layouts. The one case still unverified is two cubes
+57 px apart, the adjacency that layout had and none of the five reproduced; if a
+wrong-cube grab ever shows up, that is where to look first.
+
+**The circles stay.** Copying a listed coordinate back cannot test them: the model
+can do that without looking at the image. On fourteen tasks that name a tag by
+something only visible in the frame ("the marker the blue stone is resting on"),
+circles resolved 9/14 against 7/14 bare, winning 4 of the 6 disagreements. That
+is weak — not significant at that n — but it points the same way as their purpose
+and they cost nothing measurable on box accuracy (2.3 px circled, 2.0 px bare,
+inside the run-to-run spread). The wider finding is that *both* are unreliable
+here: a task naming a tag by number echoes exactly, every time, while a task
+describing a tag some other way is close to a coin flip.
+
+**Side finding: the HSV detector reports non-cubes as cubes.** On this desk it
+listed a red ladybird toy on marker_2, a blue stone on marker_3 and a teal
+figurine on marker_1 as `cube_N`, all `pickable: true`. A pick issued against the
+ladybird reported `ok` and moved nothing — there is no grip sensing, so a closed
+jaw on a domed toy is indistinguishable from a grasp. Qwen refused "the blue
+cube" on every one of those frames, correctly, and was the only part of the stack
+that noticed.
+
+---
+
 ## 3. Are we cube-agnostic? The policy layer is; enumeration still is not
 
 Rewritten after §2v. The previous verdict was "2 of 3, and the missing one is

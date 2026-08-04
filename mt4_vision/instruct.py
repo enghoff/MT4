@@ -255,10 +255,22 @@ def observe(
     """One frame -> snapshot and pointing overlay built from the same pixels.
 
     **Only the ArUco tags are drawn on the overlay.** The frame the model is
-    given carries the numbered grid it reads coordinates off, and a circled id
-    beside each decoded tag, and nothing else. Circling the detected cubes would
-    tell it where the stack believes the interesting things are, which is the
-    picture-shaped version of handing it a cube list.
+    given carries a circled id beside each decoded tag, and nothing else.
+    Circling the detected cubes would tell it where the stack believes the
+    interesting things are, which is the picture-shaped version of handing it a
+    cube list.
+
+    The grid over it is labelled in the **0-1000 scale the reply is read in**,
+    not in pixels, so the drawn numbers and the requested space agree. That is
+    the whole argument for it. Measured across five live cube layouts, a pixel
+    grid, no grid and a 0-1000 grid are indistinguishable on action choice
+    (34, 36 and 34 of 45), on box error and on picking the wrong cube (never,
+    in any of them) -- so the choice rests on the labels naming a real space,
+    not on a score. See ``preview.annotate_for_pointing``.
+
+    The circles stay regardless: they are the only thing tying a printed tag
+    number to the tag in the image, and on tasks that name a tag by what is
+    sitting on it they resolve 9 of 14 against 7 of 14 on a bare frame.
 
     ``frame`` lets a caller supply pixels it already holds instead of opening
     the camera here. That is not an optimisation but a requirement for any
@@ -281,7 +293,7 @@ def observe(
     scene = capture_scene(calib, frame)
     snapshot = build_snapshot(scene, token=token)
     annotated = annotate_for_pointing(
-        frame, [e for e in snapshot.entities if e.kind == KIND_MARKER]
+        frame, [e for e in snapshot.entities if e.kind == KIND_MARKER], grid="norm"
     )
     return Observation(
         frame=frame, annotated=annotated, snapshot=snapshot, calib=calib,
@@ -388,7 +400,8 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         '"dest_2d": [x, y], "reason": "<one short clause>"}\n\n'
         "Every coordinate you give is on a 0-1000 scale across the image: 0 is "
         "the left edge, 1000 the right edge, and the same top to bottom. The "
-        "tag positions above are written that way too.\n"
+        "tag positions above are written that way too, and the numbered "
+        "gridlines drawn on the image are that same scale, every 100 units.\n"
         "box_2d is a tight box around the WHOLE of the object to pick up. The "
         "jaws are aimed using that box, so it must contain that object and as "
         "little else as possible -- not the desk around it, and not a "
