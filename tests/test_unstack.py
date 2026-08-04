@@ -9,16 +9,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
-from mt4_vision.landing import landing_ok
 from mt4_vision.stackpath import StackPlanner
 from mt4_vision.workspace import (
     MARKER_PAPER_CLEARANCE_MM,
     dist_mm,
     is_mp_reachable_xy,
-    marker_slots_from_calibration,
+    work_region_block_reason,
 )
-from rig import CALIB
+from rig import CALIB, MARKERS
 from unstack_cubes import (
     SCATTER_MAX_RADIUS_MM,
     SCATTER_MIN_RADIUS_MM,
@@ -30,10 +28,16 @@ from unstack_cubes import (
 
 
 def _calib_and_markers():
-    calib = load_calibration(DEFAULT_CALIB_PATH)
-    markers = marker_slots_from_calibration(calib)
-    site = next(m for m in markers if m.marker_id == 4)
-    return calib, markers, site
+    """The frozen rig, not the live calibration.
+
+    Every landing predicate here is drawn from the camera nadir and the desk
+    polygon, so reading ``vision_calibration.json`` would make these tests
+    re-derive their own expectations from whatever the last recalibration
+    wrote -- and a red test would then be ambiguous between "the code broke"
+    and "the camera moved". See ``rig``.
+    """
+    site = next(m for m in MARKERS if m.marker_id == 4)
+    return CALIB, MARKERS, site
 
 
 def test_random_landing_respects_reach_and_spacing():
@@ -128,18 +132,34 @@ def test_landing_gates_alone_approve_a_spot_the_column_makes_unusable():
     -- and the arm still cannot serve it while the column stands, because the
     forearm crosses over the stack on the way. StackPlanner.column_shadow is
     the only thing that knows, and it has to fire before the cube is picked up
-    rather than as a routing failure afterwards."""
-    calib = load_calibration(DEFAULT_CALIB_PATH)
-    markers = marker_slots_from_calibration(calib)
+    rather than as a routing failure afterwards.
+
+    Field case 2026-08-03, ``unstack_cubes.py --marker 3``: the landing is
+    93mm further from the base than the site and 16mm off its bearing. Frozen
+    against ``rig`` rather than the live calibration, because the corridor is
+    drawn from the camera nadir -- read live, the case evaporates on the next
+    camera refit, which says nothing about whether the veto still works.
+
+    **The premise is the gates that say the arm can serve the point, and
+    camera coverage is not one of them.** Coverage says the result could not
+    be re-detected, a different claim (see
+    ``workspace.work_region_block_reason``), and on the frozen rig it refuses
+    this landing by 5px of frame margin. Five pixels of camera pose is no
+    basis for a test about where the forearm goes, and the real run reached
+    this landing at all only because coverage admitted it that day.
+    """
+    calib = CALIB
+    markers = MARKERS
     site = next(m for m in markers if m.marker_id == 3)
     planner = StackPlanner(calib, site.x, site.y)
 
     behind = (202.0, 239.0)
-    assert landing_ok(
-        behind[0], behind[1], calib, markers=markers,
-        marker_clearance_mm=MARKER_PAPER_CLEARANCE_MM,
-        site_xy=(site.x, site.y), site_avoid_mm=SITE_AVOID_MM,
-        min_radius_mm=SCATTER_MIN_RADIUS_MM, max_radius_mm=SCATTER_MAX_RADIUS_MM,
+    assert is_mp_reachable_xy(*behind)
+    assert SCATTER_MIN_RADIUS_MM <= math.hypot(*behind) <= SCATTER_MAX_RADIUS_MM
+    assert work_region_block_reason(*behind, calib, require_camera=False) is None
+    assert dist_mm(*behind, site.x, site.y) >= SITE_AVOID_MM
+    assert all(
+        dist_mm(*behind, m.x, m.y) >= MARKER_PAPER_CLEARANCE_MM for m in markers
     )
     assert planner.route((154.0, 97.0, 216.0), (*behind, calib.safe_z), 3) is None
     assert planner.column_shadow(3)(*behind)
@@ -148,8 +168,8 @@ def test_landing_gates_alone_approve_a_spot_the_column_makes_unusable():
 
 
 def test_find_landing_never_returns_a_spot_in_the_column_shadow():
-    calib = load_calibration(DEFAULT_CALIB_PATH)
-    markers = marker_slots_from_calibration(calib)
+    calib = CALIB
+    markers = MARKERS
     site = next(m for m in markers if m.marker_id == 3)
     planner = StackPlanner(calib, site.x, site.y)
     rng = random.Random(7)

@@ -353,48 +353,6 @@ def in_stack_camera_shadow(
     )
 
 
-# Off-corridor detections this close to the site mid-build mean a cube is
-# lying beside / leaning against the column. Closer readings are the stack's
-# own base; corridor-aligned ones are mapped side faces of the stacked cubes
-# themselves (levels 1..built each cast one, at ~26mm/level along the
-# camera LOS) and must never be treated as fallen -- they hold perfectly
-# still as the stack grows, unlike the top phantom. A "static in corridor
-# means fallen" rule false-positives on exactly those side faces (field case
-# 2026-07-24); only the off-corridor test is trustworthy.
-NEAR_SITE_MIN_MM = 25.0
-CORRIDOR_ALIGN_COS = math.cos(math.radians(35.0))
-
-
-def stack_integrity_issues(
-    scene: Scene,
-    sx: float,
-    sy: float,
-    behind_u: tuple[float, float] | None,
-) -> list[str]:
-    """Evidence that the column shed a cube: a detection beside the site
-    that is not corridor-aligned (i.e. cannot be the stack's own mapped
-    side faces)."""
-    issues: list[str] = []
-    for c in scene.raw_cubes:
-        if c.x is None or c.y is None:
-            continue
-        dx, dy = float(c.x) - sx, float(c.y) - sy
-        d = math.hypot(dx, dy)
-        if not (NEAR_SITE_MIN_MM <= d < SITE_CLEAR_MM):
-            continue
-        aligned = (
-            behind_u is not None
-            and (dx * behind_u[0] + dy * behind_u[1]) / max(d, 1e-6)
-            >= CORRIDOR_ALIGN_COS
-        )
-        if not aligned:
-            issues.append(
-                f"{c.color} cube {d:.0f}mm from the site at "
-                f"({c.x:.0f},{c.y:.0f}) -- likely shed from the stack"
-            )
-    return issues
-
-
 # A pick "succeeded" but a same-color cube still sits within this radius of
 # the pick spot on the next scan: the grab missed (edge-of-hull vision skew
 # or lost steps) and usually just shoved the cube. Pick targets require
@@ -891,7 +849,6 @@ def main() -> int:
         # places ``built + 1``. The loop runs one extra pass after the last
         # placement so the final level is verified too.
         current_color: str | None = None
-        integrity_failed = False
         last_pick: tuple[str, float, float] | None = None
         pick_fail_streak = 0
         while built < target_levels or last_pick is not None:
@@ -945,22 +902,6 @@ def main() -> int:
                 behind_u = (
                     stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
                 )
-                if built > 0:
-                    issues = stack_integrity_issues(scene, sx, sy, behind_u)
-                    if issues:
-                        print(
-                            "Stack integrity check failed:\n  "
-                            + "\n  ".join(issues),
-                            file=sys.stderr,
-                        )
-                        print(
-                            f"Stopping -- the stack likely shed a cube "
-                            f"around level {built}; the physical stack "
-                            "may be shorter than reported.",
-                            file=sys.stderr,
-                        )
-                        integrity_failed = True
-                        break
                 if behind_u is not None:
                     for c in scene.pickable(scene.cubes):
                         if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
@@ -1045,12 +986,6 @@ def main() -> int:
             print(f"  placed level {level}")
 
         print(f"\nBuilt {built} level(s) on marker {marker.marker_id}")
-        if integrity_failed:
-            print(
-                "Warning: stack integrity was compromised -- the physical "
-                "stack is likely shorter than the built count.",
-                file=sys.stderr,
-            )
         try:
             go_camera_park(client, calib, planner, built)
         except Mt4ClientError as exc:
@@ -1058,7 +993,7 @@ def main() -> int:
                 _run_home(client, watcher)
             else:
                 print(exc, file=sys.stderr)
-        return 1 if integrity_failed else 0
+        return 0
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
         return 1

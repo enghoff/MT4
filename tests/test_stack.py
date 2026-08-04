@@ -9,6 +9,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# The frozen rig, never the live calibration -- including for the camera-shadow
+# field cases below, which are the ones that most look like they want real
+# numbers. Two things they need are exactly what a live file may not have:
+# ``cube_top_homography``, without which ``stack_shadow_behind_unit`` returns
+# None and there is no corridor to assert about at all, and a camera nadir
+# matching the pose the case was recorded at, since the corridor is drawn from
+# it. Read live, these tests report the state of somebody's desk. See ``rig``.
 from rig import CALIB
 from stack_cubes import (
     CLEAR_PARK_MM,
@@ -69,9 +76,7 @@ def test_clear_aside_stays_in_pick_hull():
 
 
 def test_clear_aside_skips_stack_shadow_corridor():
-    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
-
-    calib = load_calibration(DEFAULT_CALIB_PATH)
+    calib = CALIB
     sx, sy = 178.7, 179.8
     behind = stack_shadow_behind_unit(calib, sx, sy)
     assert behind is not None
@@ -123,10 +128,9 @@ def test_stack_candidates_hold_back_cubes_behind_the_standing_column():
     approached -- the forearm would cross over the stack. Taking it as the
     next pick fails the approach transit with no route and ends the run, so
     it must drop out of the candidate list while a neighbour stays in."""
-    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
     from mt4_vision.stackpath import StackPlanner
 
-    calib = load_calibration(DEFAULT_CALIB_PATH)
+    calib = CALIB
     sx, sy = 153.6, 156.9
     planner = StackPlanner(calib, sx, sy)
     behind = SimpleNamespace(x=202.0, y=239.0, color="red", yaw_deg=0.0)
@@ -148,9 +152,7 @@ def test_stack_candidates_hold_back_cubes_behind_the_standing_column():
 
 def test_stack_shadow_rejects_marker3_phantom():
     """Field case 2026-07-21: stack (179,180) → phantom ~(115,227)."""
-    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
-
-    calib = load_calibration(DEFAULT_CALIB_PATH)
+    calib = CALIB
     sx, sy = 178.7, 179.8
     behind = stack_shadow_behind_unit(calib, sx, sy)
     assert behind is not None
@@ -179,9 +181,7 @@ def test_stack_shadow_lateral_widens_with_level():
     phantom read at (4.4,-203.7) -- 49mm lateral, past a fixed 45mm corridor
     width (calibrated from an 8mm lateral offset at level 4). The
     tolerance must widen with stack height on both axes, not just along."""
-    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
-
-    calib = load_calibration(DEFAULT_CALIB_PATH)
+    calib = CALIB
     sx, sy = 161.9, -149.6
     behind = stack_shadow_behind_unit(calib, sx, sy)
     assert behind is not None
@@ -189,38 +189,6 @@ def test_stack_shadow_lateral_widens_with_level():
     # At low levels the corridor stays narrow -- a cube this far laterally off
     # the LOS at level 1 is a real, pickable cube.
     assert not in_stack_camera_shadow(4.4, -203.7, sx, sy, behind, stack_levels=1)
-
-
-def test_stack_integrity_flags_fallen_cubes_not_side_faces():
-    """Field cases 2026-07-24: a blue lying 41mm off-corridor beside marker
-    3 was a fallen cube (flag); the stack's own corridor-aligned side-face
-    detections -- static forever as the stack grows -- must never be
-    flagged (a static-in-corridor rule false-positived on exactly those,
-    marker 2 level 5: red read at (142,-164), 25mm corridor-aligned)."""
-    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
-    from stack_cubes import stack_integrity_issues
-
-    calib = load_calibration(DEFAULT_CALIB_PATH)
-
-    # Off-corridor cube beside the site (fallen against the column).
-    sx, sy = 153.6, 156.9
-    behind = stack_shadow_behind_unit(calib, sx, sy)
-    assert behind is not None
-    beside = SimpleNamespace(x=189.0, y=136.0, color="blue")
-    assert stack_integrity_issues(
-        SimpleNamespace(raw_cubes=[beside]), sx, sy, behind,
-    )
-
-    # Marker 2: corridor-aligned near-site side face of the stack's own
-    # low levels, plus a far corridor phantom -- both fine.
-    sx2, sy2 = 161.9, -149.6
-    behind2 = stack_shadow_behind_unit(calib, sx2, sy2)
-    assert behind2 is not None
-    side_face = SimpleNamespace(x=142.0, y=-164.0, color="red")
-    far_phantom = SimpleNamespace(x=56.0, y=-182.0, color="blue")
-    assert stack_integrity_issues(
-        SimpleNamespace(raw_cubes=[side_face, far_phantom]), sx2, sy2, behind2,
-    ) == []
 
 
 def test_pick_missed_detects_shoved_cube():

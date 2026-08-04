@@ -58,6 +58,44 @@ Same rule for docstrings and for comments in firmware, tests and config. It does
 **not** apply to project docs like this file, `docs/`, or commit messages, where
 recording why a decision was made is the point.
 
+## Checks, guards and gates need a reason (required)
+
+Add a check, guard, gate, clamp, retry, fallback or validation for exactly two
+reasons:
+
+1. **The user asked for it.**
+2. **There is empirical evidence it resolves an identified scenario** — an
+   observed failure, a log, a failing test, a measurement, a field case. The
+   scenario has to be nameable: which input, which pose, which state, and what
+   went wrong.
+
+Nothing else qualifies. Do not add one because a failure seems possible, because
+the input "could" be `None`, because a caller "might" pass the wrong type,
+because defensive code feels safer, or because a boundary is untested. A guard
+against an imagined case costs the same as a guard against a real one — a branch
+to read, a path that never runs, and a claim of protection nobody verified — and
+it hides the real failure when it finally arrives.
+
+- **Let unhandled cases fail loudly at the place they occur.** A traceback from
+  the actual line names the scenario for you. A swallowed exception, a silent
+  `return None`, or a clamp to a plausible default destroys that evidence and
+  turns a five-minute fix into a hunt.
+- **No second gate for something already gated.** One predicate, one place —
+  see "Where pick/place is allowed" above, where two convex hulls with different
+  allowances in two files cost 1409 cm² of usable table and dropped three
+  visible cubes from `mt4_scene`.
+- **When a guard is warranted, document the scenario it answers**, in the
+  present tense, with the number or date that established it. A guard whose
+  scenario cannot be stated is a candidate for deletion, not for keeping "just
+  in case".
+- **If you are unsure whether a case is real, say so in the reply** and leave
+  the code assuming the invariant holds. Raising the question costs a sentence;
+  a speculative guard costs a permanent branch and a false sense of coverage.
+
+This does not license removing existing guards. The envelope limits, the work
+region predicate and the column shadow veto all trace to measured failures and
+stay. It governs what gets *added*.
+
 ## Reporting task completion (required)
 
 This governs the reply once you've *finished doing* something — not planning, analysis, or investigation replies, which follow "Explaining your work" above.
