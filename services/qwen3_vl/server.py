@@ -75,8 +75,8 @@ INT4_SKIP = [m for m in os.environ.get("QWEN_VL_INT4_SKIP", "visual").split(",")
 
 # Decode, not prefill, is what a request's time goes on: measured here, one
 # 1280x720 frame prefills in 0.65s (912 prompt tokens) and then decodes at
-# 82 ms/token. A 350-token /objects reply is therefore ~29s, essentially all
-# of it in the token loop. The two knobs below target that loop.
+# 82 ms/token. A 350-token reply is therefore ~29s, essentially all of it in
+# the token loop. The two knobs below target that loop.
 #
 # A reused StaticCache instead of the default DynamicCache: dynamic reallocates
 # and torch.cat's the whole K/V of all 36 layers on every single token, static
@@ -88,12 +88,12 @@ INT4_SKIP = [m for m in os.environ.get("QWEN_VL_INT4_SKIP", "visual").split(",")
 # of how much of it is real, so an oversized cache is pure waste: measured on
 # the same 912-token request, 4096 gave 23.6 tok/s, 2048 gave 34 and 1664 gave
 # 43. 1664 is the smallest that still fits one image (912 prompt tokens) plus a
-# full 700-token reply, which is the harness's normal shape.
+# full 700-token reply, which covers the single-frame request this service
+# normally serves.
 # A request that would overrun it falls back to the dynamic cache and therefore
-# to eager -- correct, just slow -- which is the case for `images` mode with
-# several frames (6 measured at 5310 prompt tokens) and for the before/after
-# pair that an explicit `/watch <question>` sends. Raise it if that is your
-# normal workload, and expect the single-frame case to get slower for it.
+# to eager -- correct, just slow -- which is the case for any multi-frame send,
+# `images` mode with 6 frames measuring 5310 prompt tokens. Raise it if that is
+# your normal workload, and expect the single-frame case to get slower for it.
 CACHE_LEN = int(os.environ.get("QWEN_VL_CACHE_LEN", "1664"))
 # Compile the decode step (transformers wraps only that; prefill stays eager,
 # which is what keeps a variable-size vision input from recompiling per image).
@@ -112,8 +112,9 @@ COMPILE = os.environ.get("QWEN_VL_COMPILE", "0") not in ("0", "false", "False")
 # from dynamic-cache-eager on 3 of 4 probe prompts). Both are the ordinary
 # consequence of changed floating-point reduction order: one near-tied argmax
 # goes the other way and the rest of the sequence follows. Greedy stays
-# reproducible run-to-run, which is what /freeze and /again rely on; only
-# comparisons against answers recorded under the other setting are affected.
+# reproducible run-to-run, so re-asking the same prompt on the same frame gives
+# the same answer; only comparisons against answers recorded under the other
+# setting are affected.
 FORCE_COMPILE = os.environ.get("QWEN_VL_FORCE_COMPILE", "0") not in ("0", "false", "False")
 
 # The vision encoder pairs adjacent frames into one temporal patch (config

@@ -10,8 +10,7 @@ keeps moving through a multi-second arm move:
   believed to hold, what has been done;
 * a live inset, so the desk stays visible while the stale main pane is up.
 
-The palette and metrics match ``ask_qwen.py`` so the two harnesses read as one
-family. ``worker`` is duck-typed (it needs ``snapshot()``) and ``ui`` needs
+``worker`` is duck-typed (it needs ``snapshot()``) and ``ui`` needs
 ``emit``/``set_status``, so nothing here imports the modules that import it.
 """
 
@@ -49,8 +48,7 @@ CAPTION_BGR = (255, 255, 255)
 CAPTION_DIM_BGR = (190, 190, 190)
 
 
-# Panel palette and metrics, matching ask_qwen.py so the two harnesses read as
-# one family rather than two unrelated windows.
+# Panel palette and metrics.
 PANEL_W = 460
 
 

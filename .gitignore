@@ -25,7 +25,7 @@ Desktop.ini
 vision_calibration.json
 
 # ask_qwen.py /save records (frames + JSON transcripts)
-qwen_probes/
+instruction_runs/
 
 # demonstration collection + converted dataset output (images -- not for git)
 data/

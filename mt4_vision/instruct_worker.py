@@ -74,7 +74,7 @@ class Job:
 class PlainUI:
     """``BottomUI``'s surface, printing straight to stdout.
 
-    The one-shot form (``run_instruction.py "..."``) is scripted, piped and
+    The one-shot form (``ask_qwen.py "..."``) is scripted, piped and
     quoted in the docs, so its output has to stay plain lines in order: no
     pinned footer, no escape sequences, nothing that assumes a terminal.
     Status is transient by definition and every durable thing is emitted, so
@@ -132,9 +132,9 @@ class TaskWorker:
     reason this is a thread rather than a loop in ``main``.
 
     One at a time, FIFO, because two instructions cannot share an arm. The
-    backlog is a real queue rather than a single slot for the same reason
-    ``ask_qwen``'s is: a silently dropped instruction and an instruction the
-    model refused look identical afterwards.
+    backlog is a real queue rather than a single slot because a silently
+    dropped instruction and an instruction the model refused look identical
+    afterwards.
     """
 
     def __init__(

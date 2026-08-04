@@ -3,7 +3,7 @@
 Every bug this file pins was found by driving the arm, which is an expensive
 way to discover an arithmetic error. The one that motivated the file:
 
-    python run_instruction.py "pick up the stapler and place it on marker 0"
+    python ask_qwen.py "pick up the stapler and place it on marker 0"
     -> found a stapler but could not measure it: could not segment an object
        at (700, 687)
 

@@ -228,21 +228,32 @@ supervision, remote access, HTTP API, troubleshooting:
 [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md). Everything else in this repo
 works without it.
 
-### Asking a VLM about the scene
+### Telling the arm what to do in English
 
-A second, optional GPU service wraps `Qwen/Qwen3-VL-4B-Instruct` and answers
-questions about a frame in free text — describing, counting, reading labels,
-judging graspability — rather than returning boxes. Nothing in the arm stack
-depends on it; it exists to find out what a VLM can and cannot see on this desk.
+A second, optional GPU service wraps `Qwen/Qwen3-VL-4B-Instruct`. `ask_qwen.py`
+hands it one frame and one typed instruction, and it answers with the single
+next action and a box around the thing to act on. Cube pick/place, calibration,
+stacking and the MCP tools all work with this service absent.
 
 ```powershell
-python ask_qwen.py --camera 1        # interactive: ask, see the answer on the sent frame
+python ask_qwen.py                                  # interactive prompt + window
+python ask_qwen.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
+python ask_qwen.py --dry-run "pick up the stapler"  # decide, never move
 ```
 
-The harness shows the answer next to *the exact frame that was POSTed*, draws
-any coordinates the model returned, and can freeze a frame to re-ask the same
-question on identical pixels. Setup, commands, and the measured coordinate-space
-and accuracy findings: [docs/QWEN3-VL.md](docs/QWEN3-VL.md).
+The model is the eyes and nothing else. It gets the frame and the decoded ArUco
+tag numbers — a tag's printed number is the one thing no vision-language model
+can read off an image — and every other object on the desk is its job to see.
+No cube list, no object registry, no preprocessing of what you type. A target
+comes back as a box, which GrabCut turns into a position, a size and a wrist
+angle in millimetres; reach, the J1 keep-out, ground Z, jaw clearance and the
+desk polygon are all checked before the gripper opens.
+
+The window shows the exact frame each decision was made from with the model's
+own answer drawn on it, so a wrong answer about a frame the arm was blocking
+looks different from a wrong answer about a clean one. Setup, commands, and the
+measured coordinate-space and accuracy findings:
+[docs/QWEN3-VL.md](docs/QWEN3-VL.md).
 
 ## MCP server
 

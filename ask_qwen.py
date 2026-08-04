@@ -1,37 +1,97 @@
 #!/usr/bin/env python3
-"""Interactive Qwen3-VL harness: ask questions about what the camera sees.
+"""Type an instruction in English; the arm carries it out.
 
-Same shape as ``move_object_to_marker.py`` -- a pinned prompt line, a
-background worker, a live annotated preview -- but the worker asks a
-vision-language model instead of moving the arm, and the answer is text
-rather than a box. Nothing here touches the arm unless you pass ``--park``.
+    python ask_qwen.py                       # interactive prompt + window
+    python ask_qwen.py "put the red cube on marker 3"
+    python ask_qwen.py --dry-run "pick up the green cube"
+    python ask_qwen.py --no-preview "..."    # no window (headless, CI)
 
-The window is split: the submitted frame on the left (with any boxes/points
-Qwen named drawn on it), an answer panel on the right, and a small live inset
-so you can still aim the camera while an answer is on screen. What you see on
-the left is always *the exact image that was POSTed* -- which is the point.
-A wrong answer about a frame the arm was blocking is a different problem from
-a wrong answer about a clean frame, and no amount of reading the text alone
-tells you which happened.
+Interactive is the default: a prompt line pinned to the bottom of the terminal,
+a background worker doing the slow thing, and a window that keeps redrawing
+while it does.
 
-Coordinates come back in whichever space this model build uses (see
-``parse_regions``); ``/coords`` flips the interpretation so you can settle it
-by eye in two keystrokes rather than guessing.
+Type an instruction and it starts. Type another while one is running and it
+queues behind it. ``/`` commands (``/help``) inspect and steer without
+disturbing the run: ``/stop`` ends it after the current step, ``/abort`` stops
+the arm where it stands, ``/scene`` and ``/status`` ask the camera and the arm
+what they currently see and where they are.
 
-It is a monitor by default: the desk is watched from startup, and anything
-that moves gets boxed and described (JSON, one box per object) until you type
-something, which replaces that as the standing question. ``--no-watch`` makes
-it request/response only.
+The window is split three ways. The left pane is the frame the model last
+decided on with its own answer drawn over it (see
+``mt4_vision.preview.annotate_qwen``); the right is a state panel; and the
+corner inset is the live feed, so the desk stays visible while a multi-second
+move plays out. The left pane is deliberately **not** live: those are the exact
+pixels a decision was made from, and re-capturing them would quietly answer a
+different question than the one worth asking. q or Esc in that window stops the
+run; the arm is still parked on the way out.
+
+Each step is one capture, one decision, one motion:
+
+    park clear of the camera
+        -> one frame -> pixel grid + the decoded ArUco ids drawn on it
+        -> Qwen3-VL picks an action and draws a box round what it means
+        -> GrabCut inside that box -> position, size and angle in millimetres
+        -> the physical gates: reach, keep-out, ground, jaw clearance, desk
+        -> motion.transfer / pick_at / place_at, off that same frame
+        -> park clear of the camera again
+
+then round again, until the model says DONE or anything refuses.
+
+**Qwen is the eyes.** It is handed the frame and the ArUco tag numbers, and
+nothing else. Not a list of cubes, not a list of objects, not a list of free
+slots -- a tag is named only because its printed number is a code no
+vision-language model can read off an image, and everything else on the desk is
+the model's job to see. Nor is the instruction preprocessed: no noun
+extraction, no stopword list, no question detection. What you type is what it
+reads.
+
+That is why a target is a **box** rather than an id. There is no list to hold
+ids, so there is nothing to bind a point to, nothing to disagree about and
+nothing to refuse over a name. The box goes straight to the segmenter that
+turns pixels into millimetres.
+
+**Every object is gripped at table height.** The jaws close at ``table_z``, as
+low as they go, oriented by the GrabCut mask's long axis. Nothing on this desk
+is taller than the jaws' vertical clearance, so the lowest grip is always
+available and no pick has to know how tall a thing is to decide its Z.
+
+*Where* the jaws go does need the height. The camera views the desk from a
+steep angle, so a tall object images smeared outward and the middle of that
+smear is not above its footprint -- 18.1-22.4mm outward on 20mm cubes, against
+the ~10mm the jaws tolerate. The measurement infers the height from the
+silhouette and unprojects; see ``locate._height_corrected``.
+
+**Moving something somewhere is ONE step.** ``TRANSFER`` names the object and
+its destination together and the arm carries out both halves without stopping,
+because the intervening park-look-decide answered a question that has no
+answer: whether the jaws actually have the thing. There is no sensor in them,
+and the vision test that stood in for one was measured misreading an ArUco tag
+beside a stapler as the stapler itself -- reporting a completed pick as a
+failure. So nothing here is verified after the fact; outcome lines say
+"commanded, not checked" and mean it. What IS still checked is everything
+before the move: reach, keep-out, ground, finger clearance, the desk polygon,
+and both ends of a transfer, all before the gripper opens.
+
+**One frame, one decision, one motion.** The script owns the frame it decides
+over and executes against, rather than deciding over its own and then calling
+the MCP server's ``mt4_pick``, which would resolve a target in a *different*
+capture. The arm is parked while the model thinks and nothing else on this desk
+moves, so the measurement taken from the box is still true when the jaws
+arrive.
+
+**What the gripper holds outlives an instruction.** The jaws are physical and
+one line of typing does not empty them, so ``held`` is session state, not
+per-task: stop a transfer halfway and the next instruction is told the arm is
+still carrying something. Nothing can sense this, so ``/held`` exists to
+correct it by hand and ``/open`` to let go.
+
+Nothing here computes a coordinate or a wrist angle. Target selection is the
+only thing the model does; every millimetre and every safety gate is the
+existing stack's.
 
 Prereqs:
-  * The service running, and ``.\\scripts\\start_qwen_tunnel.ps1`` if remote
-  * A camera. No calibration, no serial, no arm (unless ``--park``)
-
-Example::
-
-    python ask_qwen.py --camera 1
-    python ask_qwen.py --camera 1 --no-watch
-    python ask_qwen.py --prompt "how many cubes are on the desk?" --save
+  * the Qwen3-VL service reachable (``.\\scripts\\start_qwen_tunnel.ps1``)
+  * arm free on the serial port, vision calibration present
 """
 
 from __future__ import annotations
@@ -40,186 +100,53 @@ import argparse
 import json
 import os
 import sys
-import threading
-import time
 from pathlib import Path
 
-import cv2
-import numpy as np
-
-from mt4_vision.camera import DEFAULT_CAMERA_INDEX, CameraError, FrameStream, capture_frame
+from mt4_jog.client import Mt4Client, Mt4ClientError
+from mt4_vision import instruct as I
+from mt4_vision.camera import DEFAULT_CAMERA_INDEX, CameraError, FrameStream
 from mt4_vision.console import BottomUI
-from mt4_vision.preview import LivePreview, PreviewStopped, annotate_for_pointing
-from mt4_vision.qwen import DEFAULT_URL, QwenError, ask, health, parse_regions
-from mt4_vision.qwen_panel import (
-    Answer,
-    DEFAULT_TOKENS,
-    Options,
-    SEND_MODES,
-    compose,
-    draw_regions,
-    montage,
-)
-from mt4_vision.qwen_prompts import IDENTIFY_PROMPT, OBJECTS_PROMPT, PRESETS, TRACK_PROMPT
-from mt4_vision.qwen_watch import (
-    DEFAULT_WATCH_QUESTION,
-    MOTION_THRESHOLD,
-    MotionWatcher,
-)
-from mt4_vision.qwen_worker import QwenWorker, format_region
+from mt4_vision.instruct_view import MAX_STEPS, RunPreview
+from mt4_vision.instruct_worker import PlainUI, TaskWorker, save_record
+from mt4_vision.pickplace import ensure_homed, home_arm, retreat_for_camera
+from mt4_vision.preview import gui_available
+from mt4_vision.qwen import DEFAULT_URL, QwenError, health
 
-HELP = """commands (anything else is asked verbatim):
-  <text>            ask it now, and keep answering it on every scene change
-  <Enter>           back to the live feed
-  /help             this list
-  /freeze  /thaw    pin the current frame, so repeat asks use one identical image
-  /again            re-ask the last question (on the pinned frame if frozen)
-  /cancel           drop queued questions that have not started yet
-  /grid             toggle the labelled pixel grid drawn on the sent image
-  /coords abs|norm  reinterpret returned coords as pixels or 0-1000 normalized
-  /tokens N         max_new_tokens (default 700)
-  /frames N [gap]   capture N frames, gap seconds apart (N=1 for one still)
-  /mode M           how they reach the model: single|montage|images|video
-                      images = N separate images; direction right, ~2x tokens
-                      video  = one sequence; change right, direction not, ~1x
-                      montage= tiled into one picture; needs no server support
-  /sample           toggle greedy (default) vs sampling at temperature 0.7
-  /objects [watch]  JSON list of every object with boxes ("identify all objects"
-                      alone returns prose -- the schema has to be named).
-                      Add 'watch' to re-list on every change
-  /identify <what> [watch]  JSON list of <what> with boxes AND a one-sentence
-                      description each, e.g. /identify paintings. Add 'watch'
-                      to re-identify on every change
-  /track <object>   locate that object on each NEW frame after movement, box
-                      drawn on it
-  /watch            ON BY DEFAULT. Anything you type becomes the standing
-                      question, re-asked on the NEW frame after every change.
-                      /watch off to stop; /watch <q> uses the before/after
-                      PAIR instead, for explicitly comparative questions
-  /once <question>  ask without changing what the watcher is watching for
-  /sens X           motion trigger threshold (default 0.0005; noise floor is
-                      0.00016, a 25px object moving is ~0.0014)
-  /noimage          ask the next question text-only (no frame)
-  /preset [N]       list capability probes, or run one
-  /save [name]      write the sent image, the view and a JSON record
-  /health           re-query the service
-  Ctrl+C / Ctrl+Z   quit"""
-
-
-# --------------------------------------------------------------------------- #
-# worker
-
-
-class HarnessPreview:
-    """Composites the live feed, the submitted frame and the answer panel."""
-
-    def __init__(
-        self, stream: FrameStream, worker: QwenWorker, *, svc: str, ui: BottomUI,
-        watcher: MotionWatcher | None = None,
-    ) -> None:
-        self._stream = stream
-        self._worker = worker
-        self._svc = svc
-        self._ui = ui
-        self._watcher = watcher
-        self._draw_errors: set[str] = set()
-        self._preview = LivePreview("qwen probe (q or Esc to stop)")
-        self._latest: np.ndarray | None = None
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._user_quit = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="qwen-view", daemon=True)
-        self._thread.start()
-
-    def stopped_by_user(self) -> bool:
-        return self._user_quit.is_set()
-
-    def latest_canvas(self) -> np.ndarray | None:
-        with self._lock:
-            return None if self._latest is None else self._latest.copy()
-
-    def _loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                live = self._stream.fresh(min_advance=1)
-            except CameraError:
-                time.sleep(0.2)
-                continue
-            answer, pending, elapsed = self._worker.snapshot()
-            watch = self._watcher.snapshot() if self._watcher is not None else None
-            try:
-                canvas = compose(
-                    live, answer=answer, pending=pending, elapsed=elapsed,
-                    opts=self._worker.opts, svc=self._svc, watch=watch,
-                )
-            except Exception as exc:  # noqa: BLE001 -- a draw bug must not kill the feed
-                # ...but it must not be invisible either. Swallowing this
-                # silently is how a compose() crash presented as "the preview
-                # feature just doesn't work": no window, no error, nothing to
-                # search for. Report the first one (and each new kind after it)
-                # while still keeping the feed alive.
-                sig = f"{type(exc).__name__}: {exc}"
-                if sig not in self._draw_errors:
-                    self._draw_errors.add(sig)
-                    self._ui.emit(f"  preview draw failed -- {sig}")
-                time.sleep(0.2)
-                continue
-            with self._lock:
-                self._latest = canvas
-            try:
-                self._preview.show(canvas)
-            except PreviewStopped:
-                self._user_quit.set()
-                break
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=2.0)
-        self._preview.close()
+HELP = """commands (anything else is run as an instruction):
+  <text>          carry it out now, or queue it behind what is running
+  /help           this list
+  /stop           finish the current step, then stop; drops the queue
+  /abort          /stop, and interrupt the move in flight -- the arm halts
+                    wherever it is, jaws as they are
+  /cancel         drop queued instructions; the running one continues
+  /again          re-run the last instruction
+  /steps N        give up after N steps per instruction (default 6)
+  /dry [on|off]   decide and validate, never move
+  /scene          what the camera sees now: ids, labels, why each is blocked
+  /status         arm status: homed, TCP, gripper
+  /park           retreat to the camera park pose
+  /home           home the arm
+  /open           open the jaws (what /abort mid-carry leaves you needing)
+  /held [thing]   what the loop believes is in the jaws; /held none to clear
+  /save [name]    write the frame the model saw, the window, and a JSON record
+  /health         re-query the Qwen service
+  Ctrl+C / Ctrl+Z quit"""
 
 
 # --------------------------------------------------------------------------- #
 # commands
 
 
-def save_probe(
-    outdir: Path, answer: Answer, canvas: np.ndarray | None, name: str = "",
-) -> Path:
-    outdir.mkdir(parents=True, exist_ok=True)
-    stem = time.strftime("%Y%m%d-%H%M%S")
-    if name:
-        stem = f"{stem}_{name}"
-    cv2.imwrite(str(outdir / f"{stem}_sent.jpg"), answer.sent)
-    if canvas is not None:
-        cv2.imwrite(str(outdir / f"{stem}_view.jpg"), canvas)
-    record = {
-        "prompt": answer.prompt,
-        "sent_prompt": answer.sent_prompt,
-        "response": answer.text,
-        "error": answer.error,
-        "latency_s": round(answer.latency_s, 3),
-        "max_new_tokens": answer.tokens,
-        "had_image": answer.had_image,
-        "sent_size": [answer.sent.shape[1], answer.sent.shape[0]],
-        "send_mode": answer.send_mode,
-        "sent_label": answer.sent_label(),
-        "service": answer.reply.raw if answer.reply is not None else None,
-        "regions": [
-            {
-                "label": r.label, "kind": r.kind, "coords": list(r.coords),
-                **({"description": r.description} if r.description else {}),
-            }
-            for r in answer.regions
-        ],
-    }
-    path = outdir / f"{stem}.json"
-    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    return path
-
-
 def handle_command(
-    line: str, *, worker: QwenWorker, ui: BottomUI, view: HarnessPreview | None,
-    url: str, outdir: Path, watcher: MotionWatcher | None = None,
+    line: str,
+    *,
+    worker: TaskWorker,
+    ui: BottomUI | PlainUI,
+    view: RunPreview | None,
+    client: Mt4Client | None,
+    camera: int,
+    url: str,
+    outdir: Path,
 ) -> bool:
     """Run a ``/command``. Returns False if the line was not a command."""
     if not line.startswith("/"):
@@ -227,227 +154,145 @@ def handle_command(
     parts = line[1:].split()
     cmd = parts[0].lower() if parts else ""
     rest = parts[1:]
-    opts = worker.opts
 
     if cmd in ("help", "h", "?"):
         ui.emit("")
         for row in HELP.split("\n"):
             ui.emit(row)
         ui.set_status("ready")
-    elif cmd == "freeze":
-        if opts.frames > 1:
-            ui.set_status("/frames is >1 -- /frames 1 first (a pinned frame is not a sequence)")
-            return True
-        try:
-            frame = worker.grab()
-        except CameraError as exc:
-            ui.set_status(f"camera: {exc}")
-            return True
-        opts.pinned = frame
-        ui.set_status("frame frozen -- asks now reuse this exact image (/thaw to release)")
-    elif cmd == "thaw":
-        opts.pinned = None
-        ui.set_status("thawed -- asks capture a fresh frame")
-    elif cmd == "again":
-        prev = worker.last_submitted()
-        if prev is None:
-            ui.set_status("nothing asked yet")
+    elif cmd in ("stop", "abort"):
+        abort = cmd == "abort"
+        running = worker.request_stop(abort=abort)
+        if not running:
+            ui.set_status("nothing was running")
+        elif abort:
+            ui.set_status("aborting -- the arm halts where it is, jaws unchanged")
         else:
-            worker.ask(prev[0], with_image=prev[1])
+            ui.set_status("stopping after the current step")
     elif cmd == "cancel":
         dropped = worker.cancel_queued()
         ui.set_status(
-            f"dropped {dropped} queued question(s)" if dropped
-            else "nothing queued (the one in flight cannot be recalled)"
+            f"dropped {dropped} queued instruction(s)" if dropped
+            else "nothing queued (the running one needs /stop or /abort)"
         )
-    elif cmd == "grid":
-        opts.grid = not opts.grid
-        ui.set_status(f"grid {'on' if opts.grid else 'off'} (redrawn on the next ask)")
-    elif cmd == "coords":
-        mode = (rest[0].lower() if rest else "")
-        if mode.startswith("n"):
-            opts.coord_mode = "norm"
-        elif mode.startswith("a"):
-            opts.coord_mode = "abs"
+    elif cmd == "again":
+        previous = worker.last_instruction()
+        if not previous:
+            ui.set_status("nothing run yet")
         else:
-            opts.coord_mode = "norm" if opts.coord_mode == "abs" else "abs"
-        ui.set_status(f"coords read as {opts.coord_mode}")
-    elif cmd == "tokens":
+            ui.emit(f"  again: {previous}")
+            worker.submit(previous)
+    elif cmd == "steps":
         try:
-            opts.tokens = max(1, int(rest[0]))
+            steps = max(1, int(rest[0]))
         except (IndexError, ValueError):
-            ui.set_status("usage: /tokens N")
+            ui.set_status("usage: /steps N")
         else:
-            ui.set_status(f"max_new_tokens = {opts.tokens}")
-    elif cmd == "frames":
-        try:
-            want = max(1, min(16, int(rest[0])))
-            gap = max(0.05, float(rest[1])) if len(rest) > 1 else opts.frame_gap_s
-        except (IndexError, ValueError):
-            ui.set_status("usage: /frames N [seconds-between]")
-            return True
-        # A frozen frame would be repeated and answered as if it were a
-        # sequence -- a wrong answer with no visible cause.
-        if want > 1 and opts.pinned is not None:
-            ui.set_status("frame is frozen -- /thaw first, a sequence needs live frames")
-            return True
-        opts.frames, opts.frame_gap_s = want, gap
-        if want > 1 and opts.send_mode == "single":
-            opts.send_mode = "images"
-        ui.set_status(
-            f"{want} frames {gap:g}s apart, sent as {opts.send_mode} "
-            f"({opts.fps:g} fps)" if want > 1 else "single frame"
-        )
-    elif cmd == "mode":
+            worker.set_max_steps(steps)
+            ui.set_status(f"giving up after {steps} step(s) per instruction")
+    elif cmd == "dry":
         want = (rest[0].lower() if rest else "")
-        match = [m for m in SEND_MODES if m.startswith(want)] if want else []
-        if len(match) != 1:
-            ui.set_status(f"usage: /mode {'|'.join(SEND_MODES)}")
+        state, _view = worker.snapshot()
+        if want in ("on", "yes", "1"):
+            dry = True
+        elif want in ("off", "no", "0"):
+            dry = False
+        else:
+            dry = not state.dry_run
+        if not dry and client is None:
+            ui.set_status("no arm on this run -- dry-run cannot be turned off")
             return True
-        opts.send_mode = match[0]
-        if opts.send_mode != "single" and opts.frames < 2:
-            opts.frames = 4
+        worker.set_dry_run(dry)
         ui.set_status(
-            f"mode {opts.send_mode}"
-            + (f", {opts.frames} frames {opts.frame_gap_s:g}s apart"
-               if opts.send_mode != "single" else "")
+            "dry run: deciding, never moving" if dry else "live: the arm will move"
         )
-    elif cmd == "watch":
-        if watcher is None:
-            ui.set_status("no watcher (needs the camera stream)")
-        elif rest and rest[0].lower() in ("off", "stop", "no"):
-            was = watcher.armed
-            _st, _sc, events, skipped, *_ = watcher.snapshot()
-            watcher.disarm()
-            ui.set_status(
-                f"watch off after {events} event(s)"
-                + (f", {skipped} skipped while busy" if skipped else "")
-                if was else "watch was already off"
-            )
-        elif not rest:
-            # Bare /watch reports when on and resumes when off -- monitoring
-            # starts on, so this must not be the way to turn it off.
-            if watcher.armed:
-                state, score, events, skipped, *_ = watcher.snapshot()
-                ui.emit(f"  watching for: {watcher.last_question}")
-                ui.set_status(
-                    f"{state}, score {score:.5f}, {events} event(s)"
-                    + (f", {skipped} skipped" if skipped else "")
-                    + f", threshold {watcher.threshold:.5f}"
-                )
-            else:
-                # Reuse whatever mode was last active -- disarm() leaves
-                # ``send`` untouched precisely so a bare resume doesn't
-                # silently downgrade an explicit /watch <q> pair back to latest.
-                watcher.arm(watcher.last_question, send=watcher.send)
-                ui.emit(f"  watching for: {watcher.last_question}")
-                ui.set_status("watching again (/watch off to stop)")
-        elif opts.pinned is not None:
-            ui.set_status("frame is frozen -- /thaw first, the watcher needs live frames")
-        else:
-            question = " ".join(rest)
-            watcher.arm(question, send="pair")
-            ui.emit(f"  watching for: {question}")
-            ui.set_status(
-                f"watching -- asks on motion above {watcher.threshold:.5f} (/watch off)"
-            )
-    elif cmd in ("objects", "obj"):
-        # "identify all objects" gets prose; the schema has to be named. See
-        # OBJECTS_PROMPT for the measurement behind that.
-        standing = bool(rest) and rest[0].lower() in ("watch", "keep", "on")
-        # ~35 tokens per boxed object, so a busy desk can still overrun a
-        # lowered budget and cut the array mid-entry. The entries that
-        # completed are recovered and the transcript flags the cut.
-        if opts.tokens < 500:
-            ui.emit(f"  note: /tokens {opts.tokens} may truncate the list; 600+ is safer")
-        if standing and watcher is not None:
-            watcher.arm(OBJECTS_PROMPT, send="latest")
-            ui.set_status("re-listing objects on every change (/watch off to stop)")
-        worker.ask(OBJECTS_PROMPT)
-    elif cmd == "identify":
-        standing = bool(rest) and rest[-1].lower() in ("watch", "keep", "on")
-        obj = " ".join(rest[:-1] if standing else rest).strip()
-        if not obj:
-            ui.set_status("usage: /identify <object(s)> [watch], e.g. /identify paintings")
-            return True
-        if opts.tokens < 500:
-            ui.emit(f"  note: /tokens {opts.tokens} may truncate the list; 600+ is safer")
-        question = IDENTIFY_PROMPT.format(obj=obj)
-        if standing and watcher is not None:
-            watcher.arm(question, send="latest")
-            ui.set_status(f"re-identifying {obj} on every change (/watch off to stop)")
-        worker.ask(question)
-        ui.emit(f"  identifying: {obj}")
-    elif cmd == "track":
-        if watcher is None:
-            ui.set_status("no watcher (needs the camera stream)")
-            return True
-        obj = " ".join(rest)
-        if not obj:
-            ui.set_status("usage: /track <object>, e.g. /track stapler")
-            return True
-        if opts.pinned is not None:
-            ui.set_status("frame is frozen -- /thaw first, tracking needs live frames")
-            return True
-        question = TRACK_PROMPT.format(obj=obj)
-        watcher.arm(question, send="latest")
-        ui.emit(f"  tracking: {obj} -- locating it on each new frame after movement")
-        ui.set_status(f"tracking {obj} (motion > {watcher.threshold:.5f}); /watch off to stop")
-        worker.ask(question)   # a box straight away, not only after the next move
-    elif cmd == "once":
-        question = " ".join(rest)
-        if not question:
-            ui.set_status("usage: /once <question>")
-        else:
-            worker.ask(question)
-    elif cmd == "sens":
-        if watcher is None:
-            ui.set_status("no watcher (needs the camera stream)")
-            return True
-        try:
-            watcher.threshold = max(0.0, float(rest[0]))
-        except (IndexError, ValueError):
-            _st, score, *_ = watcher.snapshot()
-            ui.set_status(
-                f"usage: /sens X (now {watcher.threshold:.5f}, live score {score:.5f})"
-            )
-        else:
-            ui.set_status(f"motion threshold {watcher.threshold:.5f}")
-    elif cmd == "sample":
-        opts.greedy = not opts.greedy
-        ui.set_status(
-            "greedy (reproducible)" if opts.greedy
-            else "sampling at the model's temperature 0.7 (answers will vary)"
-        )
-    elif cmd == "noimage":
-        prev = worker.last_submitted()
-        prompt = " ".join(rest) or (prev[0] if prev else "")
-        if not prompt:
-            ui.set_status("usage: /noimage <question>")
-        else:
-            worker.ask(prompt, with_image=False)
-    elif cmd in ("preset", "p"):
-        if not rest:
+    elif cmd == "scene":
+        # Queued like any other camera work: the worker owns the frame stream's
+        # "look now" calls, and reading the desk mid-transfer would show the
+        # arm across it anyway.
+        def look() -> None:
+            obs = I.observe(camera, frame=worker.frame(), token="scene")
             ui.emit("")
-            ui.emit("presets:")
-            for i, (name, prompt) in enumerate(PRESETS, start=1):
-                ui.emit(f"  {i:2d}. {name:<10} {prompt[:70]}")
-            ui.set_status("run one with /preset N")
+            ui.emit(f"  {obs.snapshot.summary}")
+            for row in obs.snapshot.table():
+                ui.emit(f"  {row}")
+            ui.set_status(obs.snapshot.summary)
+
+        worker.submit_chore("looking at the desk", look)
+    elif cmd == "status":
+        if client is None:
+            ui.set_status("no arm on this run (--dry-run)")
+            return True
+
+        def report() -> None:
+            status = client.get_status()
+            tcp = status.tcp
+            where = (
+                "no TCP" if tcp is None
+                else f"tcp ({tcp.x:.0f}, {tcp.y:.0f}, {tcp.z:.0f}) "
+                     f"j4 {tcp.j4:.0f} grip {tcp.grip}"
+            )
+            line = f"homed {status.homed}  {where}"
+            ui.emit(f"  {line}")
+            ui.set_status(line)
+
+        worker.submit_chore("reading arm status", report)
+    elif cmd == "park":
+        if client is None:
+            ui.set_status("no arm on this run (--dry-run)")
+            return True
+        worker.submit_chore(
+            "parking", lambda: retreat_for_camera(client, I.load_calibration())
+        )
+    elif cmd == "home":
+        if client is None:
+            ui.set_status("no arm on this run (--dry-run)")
+            return True
+
+        def do_home() -> None:
+            home_arm(client)
+            retreat_for_camera(client, I.load_calibration())
+            ui.emit("  homed and parked")
+            ui.set_status("homed and parked")
+
+        worker.submit_chore("homing", do_home)
+    elif cmd == "open":
+        if client is None:
+            ui.set_status("no arm on this run (--dry-run)")
+            return True
+
+        def release() -> None:
+            calib = I.load_calibration()
+            client.gripper(calib.grip_open_s)
+            # The jaws are open, so whatever the loop thought it was carrying
+            # is on the desk (or the floor). Saying so beats leaving the model
+            # to be told about an object the arm no longer has.
+            worker.set_held(None)
+            ui.emit("  jaws open -- nothing is held now")
+            ui.set_status("jaws open")
+
+        worker.submit_chore("opening the jaws", release)
+    elif cmd == "held":
+        want = " ".join(rest).strip()
+        if not want:
+            held = worker.held()
+            ui.set_status(
+                f"the loop believes the jaws hold: {held}" if held
+                else "the loop believes the jaws are empty"
+            )
+        elif want.lower() in ("none", "nothing", "empty", "-"):
+            worker.set_held(None)
+            ui.set_status("noted: the jaws are empty")
         else:
-            try:
-                name, prompt = PRESETS[int(rest[0]) - 1]
-            except (ValueError, IndexError):
-                ui.set_status(f"no such preset (1-{len(PRESETS)})")
-            else:
-                ui.set_status(f"preset {name}")
-                worker.ask(prompt)
+            worker.set_held(want)
+            ui.set_status(f"noted: the jaws hold a {want}")
     elif cmd == "save":
-        last = worker.last()
-        if last is None:
-            ui.set_status("nothing to save yet")
+        decision = worker.last_decision()
+        if decision is None:
+            ui.set_status("nothing decided yet")
         else:
             canvas = view.latest_canvas() if view is not None else None
-            path = save_probe(outdir, last, canvas, " ".join(rest))
+            path = save_record(outdir, decision, canvas, " ".join(rest))
             ui.set_status(f"saved {path}")
     elif cmd == "health":
         try:
@@ -457,9 +302,6 @@ def handle_command(
         else:
             ui.emit(f"  health: {json.dumps(info)}")
             ui.set_status("service ok")
-    elif cmd in ("live", "clear"):
-        worker.clear()
-        ui.set_status("live")
     else:
         ui.set_status(f"unknown command /{cmd} -- try /help")
     return True
@@ -468,231 +310,95 @@ def handle_command(
 # --------------------------------------------------------------------------- #
 
 
-def camera_hint() -> str:
-    """Which indices can be opened at all, for when auto-detect gives up.
-
-    ``--camera`` defaults to the shared ArUco auto-detect, which answers "which
-    camera sees the calibrated desk" -- but this harness needs no calibration
-    and no markers, and the tags are routinely occluded by the very objects
-    being probed. So a failure here is usually "pick an index", not "fix the
-    desk", and the useful reply is the list of indices that exist.
-    """
-    openable = []
-    for i in range(6):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
-        try:
-            if cap.isOpened() and cap.read()[0]:
-                openable.append(i)
-        finally:
-            cap.release()
-    if not openable:
-        return "no camera index 0-5 could be opened at all"
-    return f"openable camera indices: {openable} -- pass one with --camera"
-
-
-def run_once(args: argparse.Namespace, svc: str) -> int:
-    """Non-interactive single question, for scripting."""
-    frames: list[np.ndarray] = []
-    send_mode = "single"
-    stream: FrameStream | None = None
-    if not args.no_image:
-        want = 1 if args.mode == "single" else max(1, args.frames)
-        try:
-            if want == 1:
-                frames = [capture_frame(args.camera)]
-            else:
-                # One held stream, never repeated opens -- see QwenWorker.grab.
-                stream = FrameStream(args.camera)
-                frames = [stream.fresh(min_advance=1)]
-                for _ in range(want - 1):
-                    time.sleep(args.gap)
-                    frames.append(stream.fresh(min_advance=1))
-        except CameraError as exc:
-            print(f"camera: {exc}\n{camera_hint()}", file=sys.stderr)
-            return 1
-        finally:
-            if stream is not None:
-                stream.close()
-        send_mode = args.mode if len(frames) > 1 else "single"
-        if send_mode == "montage":
-            frames = [montage(frames)]
-        if args.grid:
-            frames = [annotate_for_pointing(f) for f in frames]
-
-    started = time.monotonic()
-    try:
-        reply = ask(
-            args.prompt, frames or None,
-            mode="video" if send_mode == "video" else "images",
-            fps=1.0 / args.gap if args.gap > 0 else 1.0,
-            url=args.url, max_new_tokens=args.tokens,
-            do_sample=args.sample,
-        )
-    except QwenError as exc:
-        print(f"qwen: {exc}", file=sys.stderr)
-        return 1
-    latency = time.monotonic() - started
-    regions = parse_regions(reply.text)
-
-    print(f"# {svc}  ({latency:.1f}s, {reply.mode}, {reply.prompt_tokens} prompt tok)")
-    warning = reply.frame_warning()
-    if warning:
-        print(f"# WARNING: {warning}", file=sys.stderr)
-    print(reply.text)
-    for r in regions:
-        print(f"# {format_region(r)}")
-    if args.save:
-        display = frames[0] if len(frames) == 1 else (
-            montage(frames) if frames else np.zeros((8, 8, 3), np.uint8)
-        )
-        answer = Answer(
-            prompt=args.prompt, sent_prompt=args.prompt, sent=display,
-            text=reply.text, regions=regions, latency_s=latency, tokens=args.tokens,
-            had_image=bool(frames), send_mode=send_mode, reply=reply,
-        )
-        annotated = answer.sent.copy()
-        draw_regions(annotated, regions, args.coords)
-        print(f"# saved {save_probe(Path(args.outdir), answer, annotated)}")
-    return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        description=(
-            "Interactive Qwen3-VL harness: ask questions about the camera feed "
-            "and see the answer (and any coordinates it returns) drawn on the "
-            "exact frame that was sent"
-        ),
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("instruction", nargs="*", help="what to do; omit for interactive")
+    ap.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX)
+    ap.add_argument("--url", default=DEFAULT_URL, help="Qwen3-VL service base URL")
+    ap.add_argument("--dry-run", action="store_true", help="decide, never move")
+    ap.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    ap.add_argument("--save-view", default=None, help="write the frame the model saw")
+    ap.add_argument("--outdir", default="instruction_runs", help="where /save writes")
+    ap.add_argument(
+        "--preview", action=argparse.BooleanOptionalAction, default=True,
+        help="live window: the frame the model saw with its answer drawn on it, "
+             "a state panel and a live inset; q or Esc stops the run (default: on)",
     )
-    p.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX)
-    p.add_argument("--url", default=DEFAULT_URL, help="service base URL")
-    p.add_argument(
-        "--tokens", type=int, default=DEFAULT_TOKENS, help="max_new_tokens",
-    )
-    p.add_argument(
-        "--grid", action="store_true",
-        help="draw a labelled pixel grid on the sent image (helps pointing)",
-    )
-    p.add_argument(
-        "--coords", choices=("abs", "norm"), default="norm",
-        help=(
-            "read returned coords as 0-1000 normalized (norm, measured default "
-            "for this build) or raw pixels (abs)"
-        ),
-    )
-    p.add_argument(
-        "--mode", choices=SEND_MODES, default="single",
-        help=(
-            "how multiple frames reach the model: images (direction right, ~2x "
-            "tokens), video (change right, direction not, ~1x), montage (tiled "
-            "into one picture)"
-        ),
-    )
-    p.add_argument(
-        "--watch", default=DEFAULT_WATCH_QUESTION, metavar="QUESTION",
-        help=(
-            "the standing question the motion watcher asks on the new frame "
-            "whenever the desk moves and settles. Watching is on by default; "
-            "whatever you type at the prompt replaces this"
-        ),
-    )
-    p.add_argument(
-        "--no-watch", action="store_true",
-        help="start with the motion watcher disarmed (/watch <q> arms it later)",
-    )
-    p.add_argument(
-        "--sens", type=float, default=MOTION_THRESHOLD,
-        help=f"motion trigger threshold (default {MOTION_THRESHOLD})",
-    )
-    p.add_argument("--frames", type=int, default=1, help="frames to capture")
-    p.add_argument("--gap", type=float, default=0.5, help="seconds between frames")
-    p.add_argument(
-        "--sample", action="store_true",
-        help="sample at the model's temperature 0.7 instead of greedy (default greedy)",
-    )
-    p.add_argument(
-        "--prompt", default="",
-        help="ask one question, print the answer, exit (no window)",
-    )
-    p.add_argument(
-        "--no-image", action="store_true",
-        help="with --prompt: text-only, do not send a frame",
-    )
-    p.add_argument("--save", action="store_true", help="with --prompt: save the record")
-    p.add_argument("--outdir", default="qwen_probes", help="where /save writes")
-    p.add_argument("--no-preview", action="store_true", help="no window; terminal only")
-    p.add_argument(
-        "--park", action="store_true",
-        help="home and retreat the arm to camera park first (needs calibration)",
-    )
-    args = p.parse_args(argv)
+    args = ap.parse_args()
 
     try:
         info = health(args.url)
     except QwenError as exc:
-        print(f"qwen unavailable: {exc}", file=sys.stderr)
+        print(f"qwen service: {exc}", file=sys.stderr)
         return 1
     svc = f"{info.get('model', '?')}  {info.get('device', '?')}/{info.get('quantization', '?')}"
     if not info.get("loaded", False):
-        print("note: model still loading; the first answer will be slow", file=sys.stderr)
-
-    if args.prompt:
-        return run_once(args, svc)
+        print("note: model still loading; the first decision will be slow", file=sys.stderr)
 
     client = None
-    if args.park:
-        # Optional and best-effort: the harness is about the camera and the
-        # model, but an arm parked over the desk is a frame problem that
-        # looks exactly like a model problem.
+    if not args.dry_run:
         try:
-            from mt4_jog.client import Mt4Client
-            from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
-            from mt4_vision.pickplace import ensure_homed, retreat_for_camera
-
-            calib = load_calibration(DEFAULT_CALIB_PATH)
             client = Mt4Client()
+            # Once per session. Homing every move is what wears the rig.
             ensure_homed(client)
-            retreat_for_camera(client, calib)
-            time.sleep(0.5)
-        except Exception as exc:  # noqa: BLE001 -- arm is not required here
-            print(f"warning: could not park the arm ({exc}); continuing", file=sys.stderr)
-            if client is not None:
-                client.close()
-                client = None
+        except Mt4ClientError as exc:
+            print(f"arm: {exc}", file=sys.stderr)
+            return 1
 
-    opts = Options(
-        tokens=args.tokens, grid=args.grid, coord_mode=args.coords,
-        send_mode=args.mode, frames=max(1, args.frames), frame_gap_s=max(0.05, args.gap),
-        greedy=not args.sample,
-    )
-    stream: FrameStream | None = None
-    view: HarnessPreview | None = None
-    ui = BottomUI("ask")
-    worker: QwenWorker | None = None
-    watcher: MotionWatcher | None = None
+    # On by default, because the question this window answers -- "did the model
+    # point at the thing it named" -- is one you want asked on every run, not
+    # only the runs where you already suspected something.
+    #
+    # Gated on a real GUI rather than left to LivePreview's own fallback: that
+    # fallback opens a system image viewer per update, which is a reasonable
+    # last resort for someone who typed --preview and unusable as a default.
+    want_preview = args.preview
+    if want_preview and not gui_available():
+        print(
+            "no OpenCV GUI here, so no preview window (is "
+            "opencv-python-headless installed?). --save-view still writes "
+            "the frame the model saw.",
+            file=sys.stderr,
+        )
+        want_preview = False
+
+    # Held open for the whole session, and shared. Only one consumer can hold
+    # the capture device, so the window and the decision captures have to come
+    # off the same stream -- and it is faster besides: a per-step reopen costs
+    # 2-3s of exposure warm-up that a continuously drained stream pays once.
+    #
+    # Opened before the pinned prompt takes over the terminal, so a camera that
+    # will not open reports itself as an ordinary error message rather than
+    # into a two-line footer that is about to be torn down.
     try:
-        # Held open even with --no-preview: see QwenWorker.grab.
         stream = FrameStream(args.camera)
-        worker = QwenWorker(stream=stream, url=args.url, opts=opts, ui=ui)
-        watcher = MotionWatcher(stream, worker, ui, threshold=args.sens)
-        if not args.no_preview:
-            view = HarnessPreview(stream, worker, svc=svc, ui=ui, watcher=watcher)
-        if not args.no_watch and args.watch:
-            watcher.arm(args.watch)
+    except CameraError as exc:
+        print(f"camera: {exc}", file=sys.stderr)
+        return 1
 
-        ui.emit(f"qwen3-vl probe -- {svc}")
-        ui.emit("/help for commands, /preset for capability probes")
-        if watcher.armed:
-            ui.emit(
-                f"  watching the desk (motion > {watcher.threshold:.5f}); default "
-                "question boxes and describes whatever appears. What you type "
-                "replaces it. /watch off to stop."
-            )
-            if opts.tokens < 500:
-                ui.emit(f"  note: /tokens {opts.tokens} may truncate the list; 600+ is safer")
-            ui.set_status("watching -- type a question, or wait for movement")
-        else:
-            ui.set_status("ready")
+    interactive = not args.instruction
+    ui: BottomUI | PlainUI = BottomUI("instruction") if interactive else PlainUI()
+    worker: TaskWorker | None = None
+    view: RunPreview | None = None
+    try:
+        worker = TaskWorker(
+            ui=ui, stream=stream, camera=args.camera, client=client,
+            max_steps=args.max_steps, save_view=args.save_view,
+            dry_run=args.dry_run,
+        )
+        if want_preview:
+            view = RunPreview(stream, worker, svc=svc, camera=args.camera, ui=ui)
+
+        if not interactive:
+            worker.submit(" ".join(args.instruction))
+            worker.drain()
+            return 0 if worker.last_result() else 2
+
+        ui.emit(f"mt4 instruction loop -- {svc}")
+        ui.emit("type what to do, or /help for commands")
+        if args.dry_run:
+            ui.emit("  dry run: every decision is made and validated, nothing moves")
+        ui.set_status("ready")
         while True:
             if view is not None and view.stopped_by_user():
                 break
@@ -700,62 +406,46 @@ def main(argv: list[str] | None = None) -> int:
             if line is None:
                 break
             if not line:
-                worker.clear()
-                ui.set_status("live")
                 continue
+            if line in ("quit", "exit"):
+                break
             if handle_command(
-                line, worker=worker, ui=ui, view=view, url=args.url,
-                outdir=Path(args.outdir), watcher=watcher,
+                line, worker=worker, ui=ui, view=view, client=client,
+                camera=args.camera, url=args.url, outdir=Path(args.outdir),
             ):
                 continue
-            worker.ask(line)
-            # A typed question answers now AND becomes what the watcher keeps
-            # asking, so "watch this for me" needs no second command. Only
-            # while already armed -- after an explicit /watch off, typing must
-            # not quietly switch monitoring back on. Commands (/preset,
-            # /again, /noimage) stay one-off and leave the standing question be.
-            if watcher is not None and watcher.armed:
-                # "latest", not "pair": a typed question is almost always about
-                # the state of the scene ("where is the stapler", "how many
-                # cubes"), and handing that a before/after pair reframes it as a
-                # comparison -- which is how the pair framing kept answering
-                # "it has not moved" instead of saying where things were. Only
-                # the built-in "what changed" default and an explicit
-                # /watch <q> want both frames.
-                watcher.arm(line, send="latest")
-                ui.set_status(f"answering this on every change: {line[:38]}")
-        # Clean exit (EOF or window closed): let a question already with the
-        # model finish, so a piped batch reports every answer.
-        worker.drain()
+            worker.submit(line)
+        # Clean exit: let an instruction already moving the arm finish rather
+        # than closing the serial port out from under it.
+        if worker.busy():
+            ui.set_status("finishing the current instruction before exiting...")
+            worker.drain()
         return 0
     except KeyboardInterrupt:
         return 0
-    except CameraError as exc:
-        ui.close()
-        print(f"camera: {exc}\n{camera_hint()}", file=sys.stderr)
-        return 1
     finally:
-        if watcher is not None:
-            watcher.close()
         if worker is not None:
             worker.close()
         ui.close()
         if view is not None:
             view.close()
-        if stream is not None:
-            stream.close()
+        stream.close()
         if client is not None:
+            try:
+                retreat_for_camera(client, I.load_calibration())
+            except Mt4ClientError:
+                pass
             client.close()
 
 
 if __name__ == "__main__":
     code = main()
-    # Hard exit after main()'s cleanup has already released the camera and the
-    # window. OpenCV highgui can keep a Windows process alive past the end of
-    # main, and a lingering process holds the capture device open -- which
-    # strands the camera for every other vision script in the repo until it is
-    # killed by hand. Observed once; not worth risking again for a CLI whose
-    # work is finished by this point.
+    # Hard exit after main()'s finally has already parked the arm, closed the
+    # serial port, the window and the camera. This script holds a FrameStream
+    # for the whole session, and OpenCV highgui can keep a Windows process
+    # alive past the end of main -- a lingering process holds the capture
+    # device open, stranding the camera for every other vision script in the
+    # repo until it is killed by hand.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)

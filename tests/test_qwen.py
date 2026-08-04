@@ -265,8 +265,8 @@ def test_parse_recovers_complete_entries_from_a_truncated_array() -> None:
 
 
 def test_in_bounds_flags_the_normalized_space_mismatch() -> None:
-    # A 0-1000-space box read as pixels lands far outside a 640x360 frame --
-    # the signal ask_qwen.py surfaces as "try /coords norm".
+    # A 0-1000-space box read as pixels lands far outside a 640x360 frame,
+    # which is the signal that the reply needs scaling rather than taking raw.
     r = Region("pen", "box", (500.0, 500.0, 800.0, 900.0))
     assert not r.in_bounds(640, 360)
     assert r.scaled(640 / 1000, 360 / 1000).in_bounds(640, 360)

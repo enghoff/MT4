@@ -10,9 +10,11 @@ text -- the model answers a question about a frame. When the prompt asks for
 grounding, Qwen answers with JSON boxes/points embedded in that text, so
 :func:`parse_regions` digs them back out for drawing.
 
-Nothing in the arm stack depends on this module; it exists for the
-interactive harness (``ask_qwen.py``) that checks what the VLM can and
-cannot see.
+:mod:`mt4_vision.instruct` reaches the model through :func:`ask`, one frame
+and one task per call, and reads the action to take out of the answer.
+``ask_qwen.py`` is the harness around that loop. Cube pick/place,
+calibration, stacking and the MCP tools do not touch this module and work
+with the service absent.
 """
 
 from __future__ import annotations
@@ -438,9 +440,10 @@ def parse_regions(text: str, *, fallback_bare: bool = True) -> list[Region]:
     Measured on the reference deployment (Qwen3-VL-4B-Instruct, NF4, a
     1280x720 frame): output is **0-1000 normalized**, not pixels -- a box
     reported at x=807 sits at 1033px, and asking for the whole desk returns
-    exactly ``[0, 433, 1000, 1000]``. So ``ask_qwen.py`` scales by default.
-    Do not generalize that to another build; re-check it, which is what the
-    harness and :meth:`Region.in_bounds` are for.
+    exactly ``[0, 433, 1000, 1000]``. So callers scale: see
+    ``instruct.to_frame_pixels``, which reads a reply as 0-1000 against the
+    frame's own width and height. Do not generalize that to another build;
+    re-check it, which is what :meth:`Region.in_bounds` is for.
     """
     out: list[Region] = []
     for span in _json_spans(text):

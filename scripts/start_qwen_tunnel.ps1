@@ -47,8 +47,9 @@ Write-Host ""
 # A single ssh invocation dies with the first network hiccup ("client_loop:
 # send disconnect: Connection reset"), and nothing says so except every
 # subsequent request failing as "service unreachable". That is a bad failure
-# mode for ask_qwen.py's watcher, which asks unattended -- so reconnect, and
-# timestamp each drop so the log shows how flaky the link really is.
+# mode for ask_qwen.py, which runs a multi-step instruction to completion with
+# the arm mid-task -- so reconnect, and timestamp each drop so the log shows
+# how flaky the link really is.
 $attempt = 0
 while ($true) {
     $attempt++

@@ -102,8 +102,8 @@ loading yet).
 
 **Essentially all of a request's time is the token loop, not the image.** Measured
 on the reference deployment, one 1280x720 frame at 912 prompt tokens: prefill is
-**0.85 s** and decode is **22 ms/token**, so a 350-token `/objects` reply is ~9 s
-with the image accounting for under 10% of it. Nothing about resizing frames or
+**0.85 s** and decode is **22 ms/token**, so a 350-token reply is ~9 s with the
+image accounting for under 10% of it. Nothing about resizing frames or
 trimming vision tokens will move that meaningfully; only the token loop will.
 
 Three things do, and the ordering is not the intuitive one:
@@ -153,10 +153,11 @@ byte-identical across repeated passes in one process.
 Weight-only int4 has to unpack for the wide GEMMs prefill is made of, where bf16
 just multiplies, so **prefill went 0.45 s → 0.85 s** while decode went 34 → 45
 tok/s. That puts the crossover at about **56 output tokens**: below it nf4 was
-marginally quicker, above it int4 wins and keeps winning. Every workload the
-harness actually runs — `/objects`, `/identify`, `/track`, the default watcher —
-returns 150-350 tokens, so this is the right side of the trade. A one-word answer
-("how many cubes?") is now a hair slower than it was.
+marginally quicker, above it int4 wins and keeps winning. The only workload here
+is one decision per step — an action, a box, a destination and a clause of
+reason, capped at 220 tokens by `instruct.MAX_NEW_TOKENS`. That is short enough
+to sit near the crossover rather than far above it, so measure before assuming
+int4 is the faster choice for this loop in particular.
 
 `QWEN_VL_INT4_SKIP` (default `visual`) keeps the vision tower in bf16. That is
 better on every axis at once — 43 → 45 tok/s, VRAM 5.0 → 4.7 GB, and compile time
@@ -165,7 +166,7 @@ encoder's. Set it empty to quantize everything.
 
 Quality spot-check: int4 and nf4 put the same grounding boxes within 1-4 units of
 each other on the 0-1000 scale, and prose stayed coherent. That was four prompts
-on one synthetic frame, not the capability matrix above — **re-run `/preset`
+on one synthetic frame, not the capability matrix above — **re-check grounding
 against the real desk** before trusting int4 for anything new.
 
 ### What it costs
@@ -179,9 +180,10 @@ against the real desk** before trusting int4 for anything new.
   dynamic-cache-eager on 3 of 4 probe prompts. Changing floating-point reduction
   order sends one near-tied argmax the other way and the rest of the sequence
   follows; every output involved stayed coherent. Reproducibility *within* a
-  configuration holds, which is what `/freeze` and `/again` depend on. Only
-  comparisons against answers recorded before this change are affected — if you
-  have such a baseline, re-run it.
+  configuration holds, which is what the loop's greedy decoding relies on: the
+  same frame and the same instruction give the same decision. Only comparisons
+  against answers recorded before this change are affected — if you have such a
+  baseline, re-run it.
 
 ### Sizing `QWEN_VL_CACHE_LEN`
 
@@ -193,23 +195,23 @@ image (912 prompt tokens) plus a full 700-token reply.
 
 Requests that would overrun it fall back to the dynamic cache, and therefore to
 eager — correct, just slow, and reported as `"cache": "dynamic"` in the response.
-That covers multi-frame `images` mode (6 frames measured at 5310 prompt tokens →
-8.4 tok/s) and the explicit `/watch <question>` before/after pair. Raise the knob
-if that is your normal workload, and expect the single-frame case to get slower
-in exchange.
+That covers any multi-frame send — `images` mode with 6 frames measured at 5310
+prompt tokens → 8.4 tok/s. Raise the knob if that is your normal workload, and
+expect the single-frame case to get slower in exchange.
 
 ### What's left
 
 Decode is no longer the obvious bottleneck, and the next steps are structural
 rather than a knob:
 
-- **The multi-frame fallback.** `images`/`video` mode and `/watch <q>` pairs get
-  none of this, because one static cache can only be one size. Two caches (one
-  single-frame, one wide) would fix it at the cost of a second CUDA graph.
-- **Concurrency.** The service is still strictly one request at a time, which is
-  why `MotionWatcher` has to *drop* events rather than queue them. vLLM or SGLang
-  would give continuous batching and prefix caching; both would want an int4
-  checkpoint, which is now what this is.
+- **The multi-frame fallback.** `images`/`video` mode gets none of this, because
+  one static cache can only be one size. Two caches (one single-frame, one wide)
+  would fix it at the cost of a second CUDA graph.
+- **Concurrency.** The service is strictly one request at a time. The instruction
+  loop is serial anyway — one arm, one decision per step — so nothing queues
+  behind itself today, but a second client would. vLLM or SGLang would give
+  continuous batching and prefix caching; both would want an int4 checkpoint,
+  which is what this is.
 - **45 tok/s is still ~20% of this card's roofline**, so there is real headroom
   left in the kernels if it ever matters.
 
@@ -241,51 +243,9 @@ MCP tools and Grounding DINO all work with this service absent.
 | Entry point | What it does |
 |-------------|--------------|
 | [mt4_vision/qwen.py](../mt4_vision/qwen.py) | Client. `ask(prompt, frames, mode=...)` → `Reply` (text plus what the service really encoded, incl. `frame_warning()`); `generate(prompt, frame)` → just text for the one-frame case; `parse_regions(text)` → the boxes/points Qwen named; `health()`. Raises `QwenError` when unreachable. `MT4_QWEN_URL` overrides the default URL |
-| [ask_qwen.py](../ask_qwen.py) | Interactive harness — see below |
-| [run_instruction.py](../run_instruction.py) | The same harness shape, wired to the arm: type an English instruction and it is carried out — see below |
+| [mt4_vision/instruct.py](../mt4_vision/instruct.py) | The policy layer: builds the decision prompt, reads the action and the box back out. Nothing in it computes a robot coordinate |
+| [ask_qwen.py](../ask_qwen.py) | The harness: type an English instruction and the arm carries it out — see below |
 | [services/qwen3_vl/](../services/qwen3_vl/) | The deployed service itself: `server.py`, `requirements.txt`, systemd unit |
-
-### The interactive harness
-
-```powershell
-python ask_qwen.py --camera 1          # interactive
-python ask_qwen.py --prompt "how many cubes are on the desk?"   # one-shot, scriptable
-```
-
-Type a question, get the answer drawn beside **the exact frame that was
-POSTed**, with any coordinates it returned drawn on that frame. Showing the
-submitted frame rather than the live feed is the point: a wrong answer about a
-frame the arm was blocking is a different problem from a wrong answer about a
-clean frame, and the text alone never tells you which happened. A live inset
-stays in the corner so you can keep aiming the camera.
-
-`/help` lists the commands. The ones that earn their keep:
-
-| Command | Why |
-|---|---|
-| `/freeze` | Pin one frame so repeat asks use an identical image — separates model nondeterminism from scene change |
-| `/again` | Re-ask the same question; with `/freeze`, the same question on the same pixels |
-| `/coords abs\|norm` | Reinterpret returned coordinates — see below |
-| `/grid` | Draw a labelled pixel grid on the sent image (`annotate_for_pointing`), which measurably helps pointing |
-| `/frames N [gap]` | Capture N frames, `gap` seconds apart |
-| `/mode M` | How they reach the model: `single`, `montage`, `images`, `video`. Set `/frames` once, then flip `/mode` and `/again` to A/B the representations on the same question |
-| `/sample` | Toggle greedy (default) vs the model's temperature 0.7. Greedy is what makes two answers comparable |
-| `/watch` | Watching is **on by default** — whatever you type becomes the standing question, re-asked on every movement. `/watch off` stops it; see below |
-| `/once <q>` | Ask without changing what the watcher is watching for |
-| `/sens X` | Motion trigger threshold |
-| `/preset` | A capability checklist: description, inventory, counting, colors, grounding, pointing, OCR, fiducial tags, spatial relations, graspability, arm-occlusion |
-| `/save` | Write the sent frame, the annotated view and a JSON record to `qwen_probes/` |
-
-Questions queue FIFO, one on the GPU at a time (generation is serialized
-server-side, so overlapping requests only make both slower). Piping works —
-`printf '/preset 3\n/preset 5\n' | python ask_qwen.py --camera 1 --no-preview`
-answers both and exits.
-
-`--camera` defaults to the repo-wide ArUco auto-detect, which asks "which
-camera sees the calibrated desk". This harness needs no calibration and no
-markers, and the desk tags are routinely occluded by the very objects being
-probed — so if auto-detect gives up it prints the openable indices and you pass
-one explicitly.
 
 ### Multiple frames: images vs video (measured)
 
@@ -320,79 +280,11 @@ Video's direction failure is the model, not the plumbing — verified by
 comparing tensors for forward vs reversed frame lists (they differ correctly,
 all frames present, order preserved).
 
-### Watching for movement (on by default)
-
-```powershell
-python ask_qwen.py --camera 1              # already watching
-python ask_qwen.py --camera 1 --no-watch   # request/response only
-```
-
-The harness is a **monitor by default**: it watches the desk from startup and
-asks about anything that moves. Until you type something it asks the generic
-"what changed between these two frames"; after that, **whatever you last typed
-becomes the standing question**, asked again on every event. So
-
-```
-ask: is the red cube still on its marker?
-```
-
-answers immediately *and* keeps answering that same question each time the desk
-changes — no second command. Commands are the exception: `/preset`, `/again`,
-`/noimage` and `/once <q>` are one-offs and leave the standing question alone.
-`/watch off` stops; a bare `/watch` reports state when on and resumes when off
-(it is deliberately not the way to turn it off, now that it starts on).
-
-**A typed question is asked about the new frame alone, not the pair.** Almost
-every question is about the state of the scene — "where is the stapler", "how
-many cubes" — and handing that a before/after pair silently reframes it as a
-comparison. That is how the pair framing kept answering *"it has not moved"*
-for changes the frame diff had already proven. Only two things use both frames:
-the built-in "what changed" default, and an explicit `/watch <question>`.
-
-For tracking one object, `/track <object>` arms the same single-frame path with
-a grounding prompt, so each event redraws its box:
-
-```
-ask: /track stapler
-```
-
-An answer costs 3-5s and the GPU serializes them, so polling the model to ask
-"has anything moved" would run at ~0.2 Hz and keep the GPU busy permanently. A
-frame diff answers that question at camera rate for nothing, so it gates
-everything: the model is asked once the scene has **moved and settled**, and is
-handed the last quiet frame plus the first new quiet one, as two images. While
-disarmed the watcher thread does not even read the camera, so `--no-watch`
-costs nothing.
-
-Waiting for the settle is the part that matters — firing on the first changed
-frame catches the arm mid-sweep or a hand still over the desk. Events that
-arrive while an answer is still generating are dropped and counted, not queued,
-because a backlog of stale before/after pairs reads as current.
-
-Threshold defaults to `0.0005`, from measurement on the desk camera: 60 static
-frames gave a noise floor of mean `0.00008` / max `0.00016`, while a 25x25px
-object moving produces ~`0.0014`. So it sits ~3x above the worst noise and ~3x
-below the smallest real event. `/sens` retunes it; the live score is in the
-panel, and changed regions are outlined on the view so you can see whether it
-fired on the object you care about or on a shadow.
-
-**The gate is more reliable than the model.** Verified with arm-driven motion:
-a 0.063 event (390x the noise floor) was described correctly, but a 0.027 event
-(169x noise) came back as *"no discernible change between the two frames"*.
-Treat the diff score as the authority on **whether** something moved, and the
-model only as the answer to **what** — if it contradicts a trigger, believe the
-trigger.
-
-For actually tracking an object's position, use Grounding DINO instead
-([docs/GROUNDING_DINO.md](GROUNDING_DINO.md)): ~3 Hz, real boxes, and already
-running here. This is for the semantics — what changed, did it fall over, is
-the arm in the way.
-
-### Getting a JSON object list instead of prose
+### The schema has to be named
 
 `identify all objects` returns a paragraph. Asking for "JSON" returns JSON of
-the wrong shape. **The schema has to be named.** Measured on one frame, greedy,
-3 runs each:
+the wrong shape. **Naming the keys is what works.** Measured on one frame,
+greedy, 3 runs each:
 
 | Prompt | Boxes returned |
 |---|---|
@@ -402,12 +294,14 @@ the wrong shape. **The schema has to be named.** Measured on one frame, greedy,
 
 All three were 3/3 reproducible under greedy decoding, so this is a property of
 the prompt, not luck. No constrained decoding needed — the model complies once
-told the keys. `/objects` has the working prompt baked in (`OBJECTS_PROMPT` in
-`ask_qwen.py`), and `/objects watch` re-lists on every scene change.
+told the keys. `instruct.build_prompt` spells its own keys out for exactly this
+reason, forbids prose and markdown fences, and ends with "Begin your reply with
+`{` and end it with `}`".
 
-Budget tokens for it: roughly 35 per boxed object, so the 256 default truncates
-a busy desk mid-array. `parse_regions` recovers the complete entries, but the
-tail goes missing silently — use `/tokens 600` or more.
+Budget tokens accordingly: roughly 35 per boxed object. `MAX_NEW_TOKENS` is 220
+in the instruction loop, which is ample for the one action, one box and one
+clause of reason a decision returns — and nowhere near enough for a list of
+everything on the desk.
 
 ### The frame-dropping trap
 
@@ -429,15 +323,21 @@ check `temporal_groups` in the response against `ceil(frames/2)`;
 
 **This build answers in 0-1000 normalized coordinates, not pixels.** Verified
 against the desk camera at 1280x720: a box reported at `x=807` sits at 1033px,
-and asking for the whole desk returns exactly `[0, 433, 1000, 1000]`. So
-`ask_qwen.py` scales by default (`--coords norm`).
+and asking for the whole desk returns exactly `[0, 433, 1000, 1000]`. So the
+instruction loop scales: `instruct.to_frame_pixels` reads a reply as 0-1000
+against the frame's own width and height, `x * w / 1000` and `y * h / 1000`,
+two different factors on a non-square frame. Measured over 3 targets × 2 prompt
+styles on one 1280x720 frame, box centres land **2-13px** from truth read that
+way, 6 of 6 — and **264-363px** away read as raw pixels.
 
 Do not carry that assumption to another build. Qwen2-VL used 0-1000, 2.5-VL
 onward is *documented* as absolute pixels, and "absolute" can still mean the
 processor's internally resized image rather than the one you submitted.
 `parse_regions` therefore returns coordinates exactly as written and guesses
-nothing; the harness flags regions that fall outside the frame and suggests the
-other interpretation, which settles it by eye in one keystroke.
+nothing, and `Region.in_bounds` flags a region falling outside the frame —
+which is what a 0-1000 reply read as pixels looks like. The instruction loop
+keeps the raw-pixel reading as a retry, used only when the normalized one fails
+to segment.
 
 Accuracy on the reference desk, for calibration of expectations: named objects
 (stapler, red cube, toy figurine) box tightly and usefully. But it labelled the
@@ -448,15 +348,14 @@ detection there is [Grounding DINO](GROUNDING_DINO.md).
 
 ### The instruction loop
 
-`run_instruction.py` is the same harness shape pointed at the arm: a prompt
-pinned to the bottom of the terminal, a background worker, a window that keeps
-redrawing while the worker is busy. What differs is that the worker moves real
-hardware, and that changes what the pieces are for.
+`ask_qwen.py` is a prompt pinned to the bottom of the terminal, a background
+worker, and a window that keeps redrawing while the worker is busy. The worker
+moves real hardware, and that is what shapes the rest of the pieces.
 
 ```powershell
-python run_instruction.py                                  # interactive
-python run_instruction.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
-python run_instruction.py --dry-run "pick up the stapler"  # decide, never move
+python ask_qwen.py                                  # interactive
+python ask_qwen.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
+python ask_qwen.py --dry-run "pick up the stapler"  # decide, never move
 ```
 
 **The window is three things at once.** The left pane is the frame the last
