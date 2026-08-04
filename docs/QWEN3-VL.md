@@ -367,6 +367,7 @@ moves real hardware, and that is what shapes the rest of the pieces.
 ```powershell
 python ask_qwen.py                                  # interactive
 python ask_qwen.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
+python ask_qwen.py "find all the pickable objects"  # a report, nothing moves
 python ask_qwen.py --dry-run "pick up the stapler"  # decide, never move
 ```
 
@@ -440,6 +441,42 @@ direction, and `[0, 0]` reads as absent, because this build fills an unused
 optional field with zeros rather than null (observed live beside a real
 `dest_2d`, where it would otherwise mean "lay it along the line to the frame's
 top-left corner").
+
+**A question about the desk is answered in boxes.** `REPORT` is the action for
+a task whose answer is a list of things rather than a movement — *"find all the
+pickable objects"*, *"what is on the desk"*. The reply carries `objects`, one
+`{"box_2d": [...], "label": "..."}` per thing found, and every box is validated
+exactly as a PICK's single box is: the same two coordinate readings, the same
+whole-frame rejection. Then each one is segmented and put through
+`instruct.source_entity` — reach, the J1 keep-out, ground Z, the desk polygon
+and the jaw-width plan, the same predicate a pick has to satisfy. Each object
+comes back as a numbered row with its millimetres, its robot position and either
+"pickable" or the gate that stopped it, and the same numbers are drawn on the
+frame in green and red. Nothing moves, and nothing is registered — the ids are
+the report's own rows and do not outlive it.
+
+Prose in `reason` cannot answer that question, and the reason is not about
+writing. Whether the arm can pick something up depends on how far it reaches,
+how close to its own base it can work, where the desk ends and how wide the jaws
+open, and none of those is visible in the photograph the model is looking at. So
+the prompt tells it plainly that pickability is **not** its to judge: list every
+candidate object, and let the gates rule out the ones that fail. An object left
+out because it looked hard to grasp would be gone from the answer with nothing
+able to notice — which is the same argument that keeps the cube list out of the
+prompt in the first place.
+
+For the same reason the list is never quietly shortened. An entry that will not
+read — a null `box_2d`, a bare string, a box covering the whole frame — is
+reported as a named gap (`Action.report_notes`) rather than dropped, and a box
+that reads but will not segment keeps its row with the segmenter's complaint. A
+report is a claim about a whole desk, so what is missing from it has to be as
+visible as what is in it. An empty `objects` list is a real answer and not a
+refusal: it says there are none.
+
+A REPORT ends the instruction, counted as success. The report *is* the answer,
+so another step would put the same question to the same unchanged desk — the
+argument a chosen STOP already runs on. A task that wants something reported
+*and* moved is two instructions.
 
 **A STOP the model chose is terminal.** It is the model's answer to the
 request, so re-asking is asking the same question again. Live, `open the

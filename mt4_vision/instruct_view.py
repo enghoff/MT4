@@ -121,6 +121,7 @@ def decision_view(
     grounding=None,
     obj=None,
     action: I.Action | None = None,
+    report=None,
     caption: list[tuple[str, tuple[int, int, int]]] | None = None,
 ) -> np.ndarray:
     """What the model just answered, drawn on the frame it answered about.
@@ -140,6 +141,11 @@ def decision_view(
     behind it to draw instead: landing on a tag means the model echoed that
     tag's coordinates, so the dot sits on the circled tag exactly when the echo
     was right, and visibly off it when the model pointed somewhere else.
+
+    ``report`` is a REPORT's measured findings, drawn as one numbered box per
+    object in the same green/red the terminal rows read in. It is the only case
+    where the answer is several things at once, and the picture is where the
+    model's list and the arm's verdict on each item can be compared.
     """
     grounding = grounding if grounding is not None else (
         None if action is None else action.source
@@ -155,6 +161,7 @@ def decision_view(
         grounding=grounding,
         obj=obj,
         action=action,
+        report=report,
         bound_px=bound,
         dest_bound_px=dest_bound,
         accepted=None if action is None else action.ok,

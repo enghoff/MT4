@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import cv2
 import numpy as np
 
 from mt4_vision.detect import CubeDetection, MarkerDetection
@@ -19,6 +20,7 @@ from mt4_vision.preview import (
     VideoRecorder,
     annotate_qwen,
     annotate_scene,
+    clipped_text,
     draw_mask,
     wrap_text,
 )
@@ -201,6 +203,75 @@ def test_wrap_text_keeps_a_single_unbreakable_word():
     assert wrap_text("supercalifragilistic", max_px=10, scale=0.5) == [
         "supercalifragilistic"
     ]
+
+
+def test_clipped_text_ends_where_the_room_does_and_says_it_was_cut():
+    """One line with a hard edge -- a label beside a box has the room between
+    that box and the frame's edge and no more. Silently truncating a gate's
+    reason would read as the whole reason."""
+    reason = "r=123mm is inside the 140mm J1 keep-out (firmware mp refuses any target there)"
+    assert clipped_text(reason, max_px=4000, scale=0.42) == reason
+    cut = clipped_text(reason, max_px=200, scale=0.42)
+    assert cut.endswith("...")
+    assert reason.startswith(cut[:-3])
+    assert cv2.getTextSize(cut, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0][0] <= 200
+
+
+# ---------------------------------------------------------------- draw_report
+
+
+class _Found:
+    """An instruct.Finding as far as the overlay is concerned."""
+
+    def __init__(self, index, label, box_px, pickable, note):
+        self.index, self.label = index, label
+        self.box_px, self.pickable, self.note = box_px, pickable, note
+
+
+def test_a_report_draws_every_object_and_splits_them_by_the_pick_verdict():
+    """The split inside the list is the answer. Which things the arm can take
+    comes from reach, the keep-out, the desk edge and the jaw width -- none of
+    which is in the photograph -- so the picture is the only place the model's
+    list and the arm's verdict can be compared."""
+    frame = _blank()
+    out = annotate_qwen(
+        frame,
+        report=[
+            _Found(1, "red cube", (40.0, 40.0, 80.0, 80.0), True, "pickable"),
+            _Found(2, "stapler", (160.0, 40.0, 200.0, 80.0), False, "r=367mm is beyond reach"),
+        ],
+    )
+    assert np.array_equal(frame, _blank())
+    # Sampled on each rectangle's own top edge, so this reads the colour laid
+    # down rather than a colour that happens to be somewhere in the frame.
+    assert tuple(int(v) for v in out[40, 60]) == QWEN_BOUND_BGR
+    assert tuple(int(v) for v in out[40, 180]) == QWEN_REFUSED_BGR
+
+
+def test_a_report_row_that_could_not_be_measured_is_still_drawn():
+    """A box that named something the segmenter could not cut is still an
+    object the model saw. Dropping it would shorten the answer."""
+    out = annotate_qwen(
+        _blank(),
+        report=[_Found(1, "smudge", (40.0, 40.0, 80.0, 80.0), False, "no foreground in that box")],
+    )
+    assert tuple(int(v) for v in out[40, 60]) == QWEN_REFUSED_BGR
+
+
+def test_a_report_label_at_the_right_edge_stays_inside_the_frame():
+    """A box near the edge has almost no room for its reason, and the reason is
+    a whole sentence. It is clipped there, not run off the side."""
+    out = annotate_qwen(
+        _blank(),
+        report=[
+            _Found(
+                1, "chip", (300.0, 100.0, 316.0, 116.0), False,
+                "r=123mm is inside the 140mm J1 keep-out (firmware mp refuses any "
+                "target there)",
+            )
+        ],
+    )
+    assert out.shape == (240, 320, 3)
 
 
 # ----------------------------------------------------------------- draw_mask

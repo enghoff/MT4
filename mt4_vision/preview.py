@@ -753,6 +753,32 @@ def wrap_text(
     return lines
 
 
+def clipped_text(text: str, *, max_px: int, scale: float) -> str:
+    """``text`` cut down to what draws inside ``max_px``, ellipsised when cut.
+
+    For a single line that has to end somewhere, where :func:`wrap_text` would
+    wrap: a label beside a box has the room between that box and the edge of
+    the frame and no more. Measured in the font that will draw it, because
+    ``draw_outlined_text``'s Hershey font is not monospaced and a character
+    count is not a width.
+
+    The ellipsis is the point. Whatever this shortens is a summary of something
+    written out in full elsewhere -- a gate's whole sentence in a transcript row
+    -- and a silently truncated reason reads as the whole reason.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def width(s: str) -> int:
+        return cv2.getTextSize(s, font, scale, 1)[0][0]
+
+    if width(text) <= max_px:
+        return text
+    cut = len(text)
+    while cut > 1 and width(f"{text[:cut]}...") > max_px:
+        cut -= 1
+    return f"{text[:cut]}..."
+
+
 def draw_inset(
     canvas: np.ndarray,
     frame: np.ndarray,
@@ -845,12 +871,57 @@ def _draw_alt_reading(
     )
 
 
+def draw_report(img: np.ndarray, findings) -> None:
+    """Every object a REPORT boxed, coloured by whether the arm can take it.
+
+    Duck-typed like the rest of this module: an entry needs ``index``,
+    ``label``, ``box_px``, ``pickable`` and ``note`` (i.e.
+    ``instruct.Finding``).
+
+    Two colours rather than one, because the split inside the list is the
+    answer. A report says which of the things on the desk the arm can pick up,
+    and that verdict comes from reach, the keep-out, the desk edge and the jaw
+    width -- none of which is visible in the photograph, so the picture is the
+    only place the two can be compared. Each box carries the gate's own words
+    when it is red, so "why not that one" is answered where it is asked.
+
+    The number on a box is the number of its row in the terminal, so a
+    rectangle and a line of text can be matched without counting from the top.
+    Both lines are clipped to what fits between the box and the right edge --
+    a gate's reason is a whole sentence, and the full one is in the row that
+    carries the same number.
+    """
+    width = img.shape[1]
+    for f in findings or ():
+        box = getattr(f, "box_px", None)
+        if box is None:
+            continue
+        colour = QWEN_BOUND_BGR if getattr(f, "pickable", False) else QWEN_REFUSED_BGR
+        x0, y0, x1, y1 = (int(v) for v in box)
+        cv2.rectangle(img, (x0, y0), (x1, y1), colour, 2)
+        room = max(1, width - x0 - 4)
+        draw_outlined_text(
+            img,
+            clipped_text(
+                f"{getattr(f, 'index', '?')}. {getattr(f, 'label', '?')}",
+                max_px=room, scale=0.5,
+            ),
+            (x0, max(12, y0 - 20)), scale=0.5, color=colour,
+        )
+        draw_outlined_text(
+            img,
+            clipped_text(str(getattr(f, "note", "")), max_px=room, scale=0.42),
+            (x0, max(24, y0 - 6)), scale=0.42, color=colour,
+        )
+
+
 def annotate_qwen(
     base: np.ndarray,
     *,
     grounding=None,
     obj=None,
     action=None,
+    report=None,
     bound_px: tuple[float, float] | None = None,
     dest_bound_px: tuple[float, float] | None = None,
     accepted: bool | None = None,
@@ -892,6 +963,10 @@ def annotate_qwen(
       transfer draws no other picture, so an arrow pointing at the wrong marker
       is the only warning there will be: nothing after this looks at the desk
       again.
+    * **Numbered green and red boxes** -- a REPORT's whole answer (``report``,
+      a sequence of ``instruct.Finding``), green for the objects the arm can
+      pick up and red for the rest, each with the gate that stopped it. See
+      :func:`draw_report`.
     """
     out = base.copy()
     h, w = out.shape[:2]
@@ -923,6 +998,8 @@ def annotate_qwen(
                 out, note, (max(2, int(origin[0])), ly),
                 scale=0.5, color=QWEN_MASK_BGR,
             )
+
+    draw_report(out, report)
 
     if grounding is not None:
         alt_box = getattr(grounding, "alt_box_px", None)

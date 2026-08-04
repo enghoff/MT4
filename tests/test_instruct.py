@@ -809,6 +809,198 @@ def test_tag_at_names_a_tag_underfoot_and_nothing_further_off():
     assert instruct.tag_at(obs, 150.0, 250.0 + instruct.ON_TAG_MM + 1) is None
 
 
+# -- REPORT: an answer about several things at once ------------------------ #
+#
+# "Find all the pickable objects" has no answer in prose. Which things the arm
+# can take depends on reach, the J1 keep-out, ground Z, the desk polygon and the
+# jaw width, and a model looking at a photograph can see none of them. So the
+# reply carries one box per object and the stack measures each and runs the real
+# gate. What these pin is that the list survives intact -- boxed, counted, and
+# never quietly shortened.
+
+
+def test_a_report_carries_one_grounding_per_boxed_object():
+    act = _decide_on(
+        '{"action": "REPORT", "objects": ['
+        '{"box_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}, '
+        '{"box_2d": ' + _norm_box(600, 400, 700, 460) + ', "label": "stapler"}], '
+        '"reason": "two things on the desk"}',
+        _desk(),
+        "find all the pickable objects",
+    )
+    assert act.ok, act.reason
+    assert act.kind == "REPORT"
+    assert [g.label for g in act.report] == ["red cube", "stapler"]
+    assert _close(act.report[0].box_px, (180.0, 80.0, 220.0, 120.0))
+    assert _close(act.report[1].box_px, (600.0, 400.0, 700.0, 460.0))
+    assert act.report_notes == ()
+    # A report moves nothing, so it carries neither end of a motion.
+    assert act.source is None and act.dest_point_px is None
+
+
+def test_a_report_box_is_read_in_the_same_space_a_pick_box_is():
+    """One convention for every box in the protocol. A reader should not have
+    to remember which field follows which rule -- see ``box_readings``."""
+    act = _decide_on(
+        '{"action": "REPORT", "objects": [{"box_2d": [200, 300, 260, 360], '
+        '"label": "pen"}], "reason": "one pen"}',
+        _desk(),
+        "what is on the desk?",
+    )
+    assert act.ok, act.reason
+    assert _close(
+        act.report[0].box_px,
+        (200 * FRAME_W / 1000, 300 * FRAME_H / 1000,
+         260 * FRAME_W / 1000, 360 * FRAME_H / 1000),
+    )
+    assert act.report[0].alt_box_px == (200.0, 300.0, 260.0, 360.0)
+
+
+def test_an_empty_report_is_a_real_answer_not_a_refusal():
+    """"There are none" is what the question asked for, so it is not a failure
+    and there is nothing to look at a second time."""
+    act = _decide_on(
+        '{"action": "REPORT", "objects": [], "reason": "the desk is bare"}',
+        _desk(),
+        "find all the pickable objects",
+    )
+    assert act.ok
+    assert act.report == ()
+    assert not act.declined
+    assert "bare" in act.reason
+
+
+def test_a_report_with_no_objects_list_is_refused_by_name():
+    """The list is REPORT's whole answer, so a reply without one has answered
+    nothing -- and the refusal has to name the field and its shape."""
+    for reply in (
+        '{"action": "REPORT", "reason": "there are three cubes"}',
+        '{"action": "REPORT", "objects": null, "reason": "three cubes"}',
+        '{"action": "REPORT", "objects": "a red cube and a pen", "reason": "x"}',
+    ):
+        act = _decide_on(reply, _desk(), "find all the pickable objects")
+        assert not act.ok, reply
+        assert "objects" in act.reason, reply
+        # Forced, not chosen: a reply that answered badly is worth one more look.
+        assert not act.declined, reply
+
+
+def test_an_unreadable_report_entry_is_named_and_the_rest_survive():
+    """A report claims completeness, so a dropped entry is a wrong answer, not
+    a smaller one. The readable objects stand and the gap is printed."""
+    act = _decide_on(
+        '{"action": "REPORT", "objects": ['
+        '{"box_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}, '
+        '{"box_2d": null, "label": "thing at the back"}, '
+        '"a pen"], '
+        '"reason": "what I can see"}',
+        _desk(),
+        "find all the pickable objects",
+    )
+    assert act.ok, act.reason
+    assert [g.label for g in act.report] == ["red cube"]
+    assert len(act.report_notes) == 2
+    assert "thing at the back" in act.report_notes[0]
+    assert "'a pen'" in act.report_notes[1]
+
+
+def test_a_whole_frame_entry_is_rejected_inside_a_report_too():
+    """Asked to locate something absent this build returns the whole image
+    rather than an empty list, and inside a report that would read as one more
+    object. The same threshold a PICK's box faces applies to every entry."""
+    act = _decide_on(
+        '{"action": "REPORT", "objects": ['
+        '{"box_2d": [0, 0, 1000, 1000], "label": "desk"}, '
+        '{"box_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}], '
+        '"reason": "everything"}',
+        _desk(),
+        "find all the pickable objects",
+    )
+    assert act.ok, act.reason
+    assert [g.label for g in act.report] == ["red cube"]
+    assert "% of the frame" in act.report_notes[0]
+
+
+def test_the_prompt_offers_report_and_forbids_judging_pickability():
+    """The one thing the model must not filter on. Reach, the keep-out, the
+    desk edge and the jaw width decide what can be picked up, and none of them
+    is in the photograph -- an object left out because it looks hard to grasp
+    is gone from the answer with nothing able to notice."""
+    prompt = instruct.build_prompt(_desk(), "find all the pickable objects")
+    assert "REPORT" in prompt
+    assert '"objects"' in prompt
+    assert "not yours to judge" in prompt
+    assert "list every candidate" in prompt
+
+
+def test_measure_report_runs_the_pick_gate_on_every_object():
+    """Pickability is answered by ``source_entity`` -- the same predicate a PICK
+    must satisfy -- so a report cannot advertise a target a pick would refuse,
+    nor omit one it would accept. A box that will not segment keeps its row."""
+    act = _decide_on(
+        '{"action": "REPORT", "objects": ['
+        '{"box_2d": ' + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}, '
+        '{"box_2d": ' + _norm_box(600, 400, 700, 460) + ', "label": "stapler"}, '
+        '{"box_2d": ' + _norm_box(900, 600, 940, 640) + ', "label": "smudge"}], '
+        '"reason": "three things"}',
+        _desk(),
+        "find all the pickable objects",
+    )
+    obs = _desk()
+
+    class _Obj:
+        long_mm, short_mm = 20.0, 20.0
+
+    def _fake_measure(_obs, g, *, label=None, object_height_mm=None):
+        if g.label == "smudge":
+            return None, "GrabCut found no foreground in that box"
+        return _Obj(), ""
+
+    def _fake_entity(_obs, _obj, *, eid="obj_1"):
+        if eid == "obj_2":
+            return Entity(
+                id=eid, kind="object", label="stapler", x=300.0, y=190.0,
+                pickable=False, reason="r=356mm is beyond the 350mm max reach",
+            )
+        return Entity(
+            id=eid, kind="object", label="red cube", x=200.0, y=-40.0,
+            pickable=True,
+        )
+
+    saved = (instruct.measure_grounding, instruct.source_entity)
+    instruct.measure_grounding, instruct.source_entity = _fake_measure, _fake_entity
+    try:
+        found = instruct.measure_report(obs, act)
+    finally:
+        instruct.measure_grounding, instruct.source_entity = saved
+
+    assert [f.index for f in found] == [1, 2, 3]
+    assert [f.pickable for f in found] == [True, False, False]
+    assert found[0].note == "pickable"
+    assert "max reach" in found[1].note
+    assert "no foreground" in found[2].note
+    # The unmeasurable one keeps its row rather than shrinking the answer.
+    assert "could not be measured" in found[2].line()
+    assert "beyond the 350mm max reach" in found[1].line()
+
+
+def test_a_report_is_saved_with_its_boxes_and_its_measured_rows():
+    """``/save`` writes the decision; for a report the millimetres and the
+    verdicts are the decision, and the boxes alone are only the question."""
+    act = _decide_on(
+        '{"action": "REPORT", "objects": [{"box_2d": '
+        + _norm_box(180, 80, 220, 120) + ', "label": "red cube"}], '
+        '"reason": "one cube"}',
+        _desk(),
+        "find all the pickable objects",
+    )
+    d = act.as_dict()
+    assert d["action"] == "REPORT" and d["ok"] is True
+    assert d["objects"][0]["label"] == "red cube"
+    assert _close(d["objects"][0]["box_px"], (180.0, 80.0, 220.0, 120.0))
+    assert _close(d["objects"][0]["point_px"], (200.0, 100.0))
+
+
 # -- grip geometry --------------------------------------------------------- #
 
 

@@ -4,6 +4,10 @@
 ask Qwen for one action, resolve it against that same snapshot, move. The prompt
 thread never blocks on any of it, so ``/abort`` still lands mid-transfer.
 
+A REPORT resolves to a measurement instead of a motion. Every box the reply
+listed is segmented and put to the same gates a pick has to pass, and those rows
+are the answer -- see :meth:`TaskWorker._report`.
+
 Instructions queue FIFO because there is one arm. Arm chores (home, park, read
 status) go through the same queue rather than running on the prompt thread:
 ``Mt4Client`` is individually thread-safe, but "home the arm" arriving in the
@@ -54,6 +58,10 @@ class Decision:
     summary: str
     view: np.ndarray
     grasp: str = ""
+    # A REPORT's measured rows. The action alone carries only the boxes, and
+    # the millimetres and the pick verdict are the answer -- a saved record
+    # without them holds the question and not what came back.
+    report: tuple[str, ...] = ()
 
 
 @dataclass
@@ -142,6 +150,8 @@ def _place_angle_words(dest_grasp) -> str:
 
 def describe(obs: I.Observation, action: I.Action) -> str:
     bits = [action.kind]
+    if action.kind == "REPORT":
+        bits.append(f"{len(action.report)} object(s) boxed")
     if action.label:
         bits.append(action.label)
     if action.source is not None and action.source.box_px:
@@ -338,14 +348,20 @@ class TaskWorker:
         with self._lock:
             self._view = frame
 
-    def _record(self, obs: I.Observation, action: I.Action, grasp: str = "") -> None:
+    def _record(
+        self,
+        obs: I.Observation,
+        action: I.Action,
+        grasp: str = "",
+        report: tuple[str, ...] = (),
+    ) -> None:
         with self._lock:
             if self._view is None:
                 return
             self._decision = Decision(
                 instruction=self._state.instruction, step=self._state.step,
                 action=action, summary=obs.snapshot.summary, view=self._view,
-                grasp=grasp,
+                grasp=grasp, report=report,
             )
 
     def _outcome(self, text: str) -> None:
@@ -449,6 +465,48 @@ class TaskWorker:
                 "/open releases it."
             )
         self._ui.set_status(f"stopped: {reason[:60]}")
+
+    def _report(
+        self, obs: I.Observation, action: I.Action, instruction: str, step: int
+    ) -> None:
+        """Measure everything the reply boxed, print the rows, draw the boxes.
+
+        Terminal, and counted as the instruction succeeding. The report *is* the
+        answer to a task that asked what is on the desk, so there is nothing
+        left to do, and another step would put the same question to the same
+        unchanged desk -- the argument a chosen STOP already runs on. A task
+        that wants something moved as well is two instructions.
+
+        Every row goes through the gates a PICK goes through
+        (:func:`instruct.measure_report`), so "pickable" on a row is the arm's
+        verdict and not the model's. A box that would not measure keeps its row
+        and carries the reason, and entries of the reply that would not even
+        read are printed first: a report is a claim about a whole desk, so what
+        is missing from it has to be as visible as what is in it.
+        """
+        self._phase("measuring")
+        self._ui.set_status(
+            f"step {step}: measuring {len(action.report)} boxed object(s)"
+        )
+        findings = I.measure_report(obs, action)
+        for note in action.report_notes:
+            self._ui.emit(f"    ! {note}")
+        for found in findings:
+            self._ui.emit(f"    {found.line()}")
+        pickable = sum(1 for found in findings if found.pickable)
+        line = f"reported {len(findings)} object(s), {pickable} the arm can pick up"
+        self._ui.emit(f"    -> {line}")
+        self._show(
+            obs, action=action, report=findings,
+            caption=[
+                (f"[{step}] {instruction}", CAPTION_BGR),
+                (line, QWEN_BOUND_BGR),
+                (action.reason, CAPTION_DIM_BGR),
+            ],
+        )
+        self._record(obs, action, report=tuple(row.line() for row in findings))
+        self._outcome(line)
+        self._ui.set_status(line)
 
     def _refused(
         self, reason: str, held: str | None, step: int, max_steps: int
@@ -596,6 +654,10 @@ class TaskWorker:
 
             if action.kind == "DONE":
                 self._ui.set_status(f"done in {step} step(s)")
+                result = True
+                break
+            if action.kind == "REPORT":
+                self._report(obs, action, instruction, step)
                 result = True
                 break
             if action.declined:
@@ -771,6 +833,8 @@ def save_record(outdir: Path, decision: Decision, canvas: np.ndarray | None,
         "grasp": decision.grasp,
         **decision.action.as_dict(),
     }
+    if decision.report:
+        record["report"] = list(decision.report)
     path = outdir / f"{stem}.json"
     path.write_text(json.dumps(record, indent=2), encoding="utf-8")
     return path

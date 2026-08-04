@@ -11,10 +11,11 @@ works. Two jobs live here:
   convention is applied, and they order their two readings identically.
 * **Turning the box the model drew into something measurable.**
   :func:`box_grounding` validates it, :func:`measure_grounding` segments it
-  into a ``LocatedObject`` with real millimetres.
+  into a ``LocatedObject`` with real millimetres. :func:`report_groundings`
+  does the first of those for a REPORT's whole list at once.
 
 There is **one** grounding call per decision, and it is the decision itself:
-the reply carries a box, and that box is what gets measured. No separate
+the reply carries the boxes, and those boxes are what get measured. No separate
 "where is the X" pass runs first, because there is no entity list for an
 unlisted noun to be grounded into. See the :mod:`mt4_vision.instruct` module
 docstring.
@@ -179,6 +180,7 @@ def box_grounding(
     size: tuple[int, int],
     *,
     label: str = "object",
+    around: str = "the thing to pick up",
 ) -> tuple[Grounding | None, str]:
     """The decision reply's ``box_2d`` as a :class:`Grounding`, or (None, why).
 
@@ -186,11 +188,15 @@ def box_grounding(
     thing. A box must be four numbers, and it must not cover most of the frame
     -- asked to locate something absent, this build returns the whole image
     instead of declining (see :data:`MAX_BOX_FRAME_SHARE`).
+
+    ``around`` names what the box was asked to enclose, for the refusal text.
+    A PICK's box goes round the thing to pick up; a REPORT's entries go round
+    each thing found, and the message has to say which was wanted.
     """
     if not isinstance(box, (list, tuple)) or len(box) != 4:
         return None, (
             f"the reply needs box_2d as four pixel numbers [x1, y1, x2, y2] "
-            f"around the thing to pick up, and gave {box!r}"
+            f"around {around}, and gave {box!r}"
         )
     try:
         coords = [float(v) for v in box]
@@ -279,6 +285,43 @@ def _grounding(
         alt_point_px=None if alt is None else centre(alt),
         alt_box_px=None if alt is None or kind != "box" else box(alt),
     )
+
+
+def report_groundings(
+    entries: Sequence[Any], size: tuple[int, int]
+) -> tuple[tuple[Grounding, ...], tuple[str, ...]]:
+    """A REPORT reply's ``objects`` list as groundings, and what would not read.
+
+    One entry is ``{"box_2d": [x1, y1, x2, y2], "label": "..."}`` and goes
+    through :func:`box_grounding`, so a box inside a report is validated exactly
+    as a PICK's single box is: the same two coordinate readings, the same
+    whole-frame rejection.
+
+    An entry that will not read comes back as a note rather than as a refusal of
+    the whole reply. A report answers "what is on this desk", and four objects
+    plus a named gap is a better answer than none at all. The gap has to be
+    *named*, though, which is why the notes are returned alongside: a report
+    that quietly dropped an entry would under-count while looking complete, and
+    a question phrased "find all ..." is answered wrongly by exactly that.
+    """
+    found: list[Grounding] = []
+    notes: list[str] = []
+    for i, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            notes.append(
+                f"entry {i} is {entry!r}, not an object with box_2d and label"
+            )
+            continue
+        label = str(entry.get("label") or "").strip() or "object"
+        g, bad = box_grounding(
+            entry.get("box_2d"), size,
+            label=label, around="each thing you found",
+        )
+        if g is None:
+            notes.append(f"entry {i} ({label}): {bad}")
+            continue
+        found.append(g)
+    return tuple(found), tuple(notes)
 
 
 def measure_grounding(

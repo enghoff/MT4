@@ -3,6 +3,7 @@
 
     python ask_qwen.py                       # interactive prompt + window
     python ask_qwen.py "put the red cube on marker 3"
+    python ask_qwen.py "find all the pickable objects"
     python ask_qwen.py --dry-run "pick up the green cube"
     python ask_qwen.py --no-preview "..."    # no window (headless, CI)
 
@@ -78,6 +79,21 @@ the MCP server's ``mt4_pick``, which would resolve a target in a *different*
 capture. The arm is parked while the model thinks and nothing else on this desk
 moves, so the measurement taken from the box is still true when the jaws
 arrive.
+
+**A question about the desk is answered in boxes, not in prose.** "Find all the
+pickable objects" gets a ``REPORT``: the model draws one box round each thing it
+found, and every box is then segmented and put through the same gates a pick
+goes through -- reach, the keep-out, ground, the jaw-width plan, the desk
+polygon. Each object comes back as a row with its millimetres, its position and
+either "pickable" or the gate that stopped it, and the same numbered boxes are
+drawn on the frame in green and red. Nothing moves.
+
+The model is told plainly not to decide that part for itself, because it cannot
+see it: what the arm can reach, how close to its own base it can work, where the
+desk ends and how wide the jaws open are facts about the machine, not about the
+photograph. So it lists every candidate and the gates rule out the ones that
+fail. An object the model left out because it looked hard to grasp would be
+missing from the answer with nothing able to notice.
 
 **What the gripper holds outlives an instruction.** The jaws are physical and
 one line of typing does not empty them, so ``held`` is session state, not

@@ -24,6 +24,12 @@ it.** Three rules follow from that, and every one of them is load-bearing:
   the thing to pick up. With no id to resolve there is no binding, no ambiguity
   refusal and no named-vs-pointed disagreement -- three ways a correct reply
   can be turned into an abandoned task.
+* **An answer about several things is several boxes.** ``REPORT`` carries an
+  ``objects`` list, one box per thing found, and each box is measured and put
+  to the pick gates exactly as a PICK's is (:func:`measure_report`). That is
+  how "find all the pickable objects" gets a true answer: which things the arm
+  can take is a fact about reach, the keep-out, the desk edge and the jaw
+  width, none of which is visible in the photograph the model is looking at.
 * **A destination is a point, not an id.** ``dest_2d`` is the only destination
   channel there is, on the same 0-1000 grid the tag positions are printed in.
   Landing on a tag means echoing that tag's listed coordinates back. An id would
@@ -122,6 +128,7 @@ from mt4_vision.instruct_reply import (
     box_readings,
     measure_grounding,
     point_readings,
+    report_groundings,
     to_frame_pixels,
 )
 from mt4_vision.preview import annotate_for_pointing
@@ -130,10 +137,11 @@ from mt4_vision.scene import capture_scene
 
 __all__ = [
     "ACTIONS", "COORD_SCALE", "MAX_NEW_TOKENS", "MAX_BOX_FRAME_SHARE",
-    "ON_TAG_MM", "Action", "Grounding", "Observation",
+    "ON_TAG_MM", "Action", "Finding", "Grounding", "Observation",
     "box_grounding", "box_readings", "build_prompt", "decide",
-    "destination_grasp", "measure_grounding", "observe",
-    "point_readings", "tag_at", "to_frame_pixels", "load_calibration",
+    "destination_grasp", "measure_grounding", "measure_report", "observe",
+    "point_readings", "report_groundings", "tag_at", "to_frame_pixels",
+    "load_calibration",
 ]
 
 # A decision is an action, a box, a destination and whatever the model has to
@@ -144,14 +152,21 @@ __all__ = [
 # a few dozen tokens of it. A cap is a ceiling, not a target: a short reply
 # still decodes short.
 #
+# A REPORT spends it on boxes rather than on prose -- one
+# ``{"box_2d": [x, y, x, y], "label": "..."}`` entry is about 30 tokens of
+# JSON, so this holds a list far longer than any desk this arm works over.
+# Running out is not silent: a reply cut off mid-array has no balanced
+# ``{...}`` for ``_first_json_object`` to find, so it refuses as "no JSON object
+# in the reply" rather than reporting the objects that fit and losing the rest.
+#
 # It does not cost the service's fast path, because this prompt never had it.
 # ``server.py`` takes the reused StaticCache when ``prompt_len + max_new_tokens
-# <= CACHE_LEN`` (1664), and this prompt measures **1815 tokens** on a 1280x720
-# frame -- over the cache on its own, so every decision already runs on the
-# dynamic cache and eager decode whatever this number is. Restoring the fast
-# path means raising ``QWEN_VL_CACHE_LEN`` past prompt + reply, which slows
-# every other request the service serves; that is a service-level call, not
-# one this constant can make.
+# <= CACHE_LEN`` (1664), and this prompt measures **2057 tokens** on a 1280x720
+# frame with no tags listed -- over the cache on its own, so every decision
+# already runs on the dynamic cache and eager decode whatever this number is.
+# Restoring the fast path means raising ``QWEN_VL_CACHE_LEN`` past prompt +
+# reply, which slows every other request the service serves; that is a
+# service-level call, not one this constant can make.
 MAX_NEW_TOKENS = 640
 
 # The retry decode in `decide`, and the only sampled call in this loop. Low
@@ -168,7 +183,15 @@ RETRY_TEMPERATURE = 0.6
 # There is no locate-and-register action, because there is no list to register
 # into: every pick measures a box on the frame the box was drawn on, so every
 # pick *is* a locate-at-pixel and costs no extra park-capture-decide round trip.
-ACTIONS = ("TRANSFER", "PICK", "PLACE", "DONE", "STOP")
+#
+# REPORT is the answer channel for a task whose answer is a list of things
+# rather than a sentence -- "find all the pickable objects", "what is on the
+# desk". It moves nothing. Prose in ``reason`` cannot answer it, for a reason
+# that is not about writing: whether the arm can pick a thing up depends on
+# reach, the J1 keep-out, ground Z, the desk polygon and the width of the jaws,
+# and a model looking at a photograph can see none of those. Boxes can be
+# measured and put to the real gates; a sentence cannot.
+ACTIONS = ("TRANSFER", "PICK", "PLACE", "REPORT", "DONE", "STOP")
 
 
 @dataclass(frozen=True)
@@ -262,6 +285,14 @@ class Action:
     # Optional: absent means the reply had no orientation opinion and the
     # destination is squared to the world axes. See ``instruct._place_grasp``.
     dest_axis_px: tuple[float, float] | None = None
+    # What a REPORT boxed: one grounding per object, in the order the reply
+    # wrote them, and empty for every other action. An empty report with no
+    # notes is a real answer -- the reply saying there is nothing to list.
+    report: tuple[Grounding, ...] = ()
+    # Entries of that list that would not read, one line each. Carried rather
+    # than dropped because a report is a claim of completeness: "found 4" with a
+    # fifth entry silently discarded is a wrong answer to "find all ...".
+    report_notes: tuple[str, ...] = ()
     raw: str = ""
 
     @property
@@ -297,6 +328,17 @@ class Action:
             out["dest_axis_px"] = [
                 round(self.dest_axis_px[0], 1), round(self.dest_axis_px[1], 1)
             ]
+        if self.report:
+            out["objects"] = [
+                {
+                    "label": g.label,
+                    "box_px": [round(v, 1) for v in g.box_px],
+                    "point_px": [round(g.point_px[0], 1), round(g.point_px[1], 1)],
+                }
+                for g in self.report
+            ]
+        if self.report_notes:
+            out["report_notes"] = list(self.report_notes)
         return out
 
 
@@ -478,12 +520,17 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "Choose one action:\n"
         f"{actions}"
         "  PLACE    - put down what is held. dest_2d says where\n"
+        "  REPORT   - the task asks what is on the desk rather than for "
+        "something to be moved. Answer it by boxing the things it asks about: "
+        "objects carries one box each. Nothing moves\n"
         "  DONE     - the task is complete\n"
         "  STOP     - the task cannot be done, or you cannot tell which thing "
         "is meant\n\n"
         "Reply with ONLY a JSON object, no prose, no markdown fence:\n"
         '{"action": "...", "box_2d": [x1, y1, x2, y2], "label": "...", '
-        '"dest_2d": [x, y], "dest_axis_2d": [x, y], "reason": "..."}\n\n'
+        '"dest_2d": [x, y], "dest_axis_2d": [x, y], '
+        '"objects": [{"box_2d": [x1, y1, x2, y2], "label": "..."}], '
+        '"reason": "..."}\n\n'
         "Every coordinate you give is on a 0-1000 scale across the image: 0 is "
         "the left edge, 1000 the right edge, and the same top to bottom. The "
         "tag positions above are written that way too, and the numbered "
@@ -512,6 +559,18 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "the line from dest_2d to it is the direction the object should lie "
         "in. Give it only when the task says something about direction; null "
         "otherwise, and the object goes down square to the desk.\n"
+        "objects is REPORT's answer, and the only way to answer about more "
+        "than one thing: a list with one entry per thing you found, each "
+        '{"box_2d": [x1, y1, x2, y2], "label": "..."}, every box drawn the '
+        "same way box_2d is. Required for REPORT, and an empty list [] is a "
+        "real answer -- it says there are none. Whether the arm can actually "
+        "pick a thing up is not yours to judge and not something the image "
+        "shows: how far it can reach, how close to its own base it can work, "
+        "where the desk ends and how wide the jaws open decide that, and every "
+        "box you list gets measured and put to those tests after you answer. "
+        "So list every candidate object, and let the tests rule out the ones "
+        "that fail. Leaving something out because it looks hard to grasp "
+        "deletes it from the answer, and nobody can tell that it was there.\n"
         # The one text-derived rule left, and it is about the one datum we
         # supply rather than about the model's own grounding. Measured live
         # 2026-08-03, "place it on marker 0" on a desk of markers 1-4: the model
@@ -748,7 +807,103 @@ def measure_source(
     )
 
 
-def source_entity(obs: Observation, obj: Any) -> Entity:
+@dataclass(frozen=True)
+class Finding:
+    """One object a REPORT boxed, measured and put to the pick gates.
+
+    The model boxes; this says what the thing measures and whether the arm can
+    take it. :attr:`pickable` is never the model's opinion -- it is
+    ``entities.object_entity``'s, the same predicate a PICK has to satisfy
+    before the jaws move. So a report cannot advertise a target that a pick
+    would then refuse, and it cannot omit one a pick would accept.
+
+    ``obj`` and ``entity`` are both None when the box would not segment;
+    :attr:`trouble` says why, and the entry stays in the list. A box that named
+    something the segmenter could not cut is still an object the model saw, and
+    dropping it would answer "find all ..." with a shorter list than the reply
+    gave.
+
+    :attr:`index` numbers the row and the rectangle drawn on the frame with the
+    same number, so a line of terminal text and a box on the desk can be tied
+    together without counting from the top.
+    """
+
+    index: int
+    label: str
+    grounding: Grounding
+    obj: Any | None = None
+    entity: Entity | None = None
+    trouble: str = ""
+
+    @property
+    def box_px(self) -> tuple[float, float, float, float] | None:
+        """The box the model drew, in frame pixels. What the overlay draws."""
+        return self.grounding.box_px
+
+    @property
+    def pickable(self) -> bool:
+        return self.entity is not None and self.entity.pickable
+
+    @property
+    def note(self) -> str:
+        """One clause: pickable, or the gate that says otherwise."""
+        if self.entity is None:
+            return self.trouble
+        if self.entity.pickable:
+            return "pickable"
+        return self.entity.reason or "not pickable"
+
+    def line(self) -> str:
+        """The transcript row, in the column layout ``Snapshot.table`` uses."""
+        head = f"{self.index}. {self.label:<14}"
+        if self.entity is None or self.obj is None:
+            return f"{head} could not be measured: {self.trouble}"
+        return (
+            f"{head} ({self.entity.x:>6.1f},{self.entity.y:>7.1f})  "
+            f"{self.obj.long_mm:.0f}x{self.obj.short_mm:.0f}mm  {self.note}"
+        )
+
+
+def measure_report(obs: Observation, action: "Action") -> tuple[Finding, ...]:
+    """Measure everything a REPORT boxed and ask the pick gates about each.
+
+    Object for object, this is the same work :func:`measure_source` does for a
+    single pick: GrabCut inside the box the model drew, on the frame it drew it
+    on, at ``calib.cube_height_mm`` rather than a height read off the silhouette
+    (see :func:`measure_source` for what inferring it costs). Then
+    :func:`source_entity`, which is where reach, the J1 keep-out, ground Z, the
+    desk polygon and the jaw-width plan live.
+
+    Running the real gate is the whole point of answering with boxes instead of
+    prose. "Can the arm pick this up" is geometry the model cannot see, so the
+    only honest answer comes from the predicate the arm itself obeys.
+
+    Nothing moves and nothing is registered. The ids are positional, for the
+    report's own rows, and do not outlive it -- ``obs.snapshot`` is unchanged.
+
+    Neighbour clearance stays off, as it is for a pick on this path: it counts
+    only ``scene.cubes``, so it would call a grasp beside a cube blocked and the
+    identical grasp beside a pen clear, in a loop that never tells the model
+    cubes are a category.
+    """
+    out: list[Finding] = []
+    for i, g in enumerate(action.report, start=1):
+        obj, why = measure_grounding(
+            obs, g, object_height_mm=obs.calib.cube_height_mm
+        )
+        if obj is None:
+            out.append(Finding(i, g.label, g, trouble=why))
+            continue
+        out.append(
+            Finding(
+                i, g.label, g,
+                obj=obj, entity=source_entity(obs, obj, eid=f"obj_{i}"),
+            )
+        )
+    return tuple(out)
+
+
+def source_entity(obs: Observation, obj: Any, *, eid: str = "obj_1") -> Entity:
     """The measured object as an entity, so the pick gate is the shared one.
 
     ``object_entity`` is where reach, the J1 keep-out, ground Z, the desk
@@ -764,10 +919,14 @@ def source_entity(obs: Observation, obj: Any) -> Entity:
     never tells the model that cubes are a category. A veto the model cannot
     see, cannot argue with and cannot route around is worse than a nudged
     neighbour, which is visible on the desk and recoverable.
+
+    ``eid`` names the entity. A pick measures one thing and takes the default;
+    a report measures several in one frame and numbers them, so its rows do not
+    all claim to be ``obj_1``.
     """
     from mt4_vision.entities import object_entity
 
-    return object_entity(obj, "obj_1", scene=obs.scene, require_clearance=False)
+    return object_entity(obj, eid, scene=obs.scene, require_clearance=False)
 
 
 def decide(
@@ -782,11 +941,14 @@ def decide(
     Every failure path produces ``ok=False`` with prose, never an exception.
 
     What this checks is that the reply is *well formed for the action it
-    chose*: a known action, a usable box where a box is required, and a
-    destination where one is required. What it does not check is whether the
-    model was right about what it boxed -- there is nothing here to check that
-    against, which is the point. Nor does it check the gripper: ``held`` is a
-    belief a person typed in, not a reading.
+    chose*: a known action, a usable box where a box is required, a destination
+    where one is required, and a list where a REPORT's answer belongs. What it
+    does not do is measure any of it -- a REPORT's boxes go to
+    :func:`measure_report` after this returns, for the same reason a pick's
+    single box goes to :func:`measure_source`. What it does not check is
+    whether the model was right about what it boxed -- there is nothing here to
+    check that against, which is the point. Nor does it check the gripper:
+    ``held`` is a belief a person typed in, not a reading.
 
     A reply carrying no JSON at all is asked once more, **sampled**. Re-asking
     greedily would be pointless -- same prompt, same weights, same reply -- so
@@ -834,6 +996,26 @@ def decide(
         return Action(
             kind, kind == "DONE", why or kind.lower(),
             declined=kind == "STOP", raw=raw,
+        )
+
+    if kind == "REPORT":
+        # ok=True whatever the list holds, including empty: a report moves
+        # nothing, so there is no pose to be wrong about, and "there are none"
+        # is an answer to the question that was asked. What the list is worth
+        # is settled by ``measure_report``, object by object, against the gates.
+        said = got.get("objects")
+        if not isinstance(said, list):
+            return Action(
+                "STOP", False,
+                "REPORT answers with objects, a list of "
+                '{"box_2d": [x1, y1, x2, y2], "label": "..."} entries -- one '
+                f"per thing found, [] when there are none -- and gave {said!r}",
+                raw=raw,
+            )
+        found, notes = report_groundings(said, obs.size)
+        return Action(
+            kind, True, why or "report",
+            report=found, report_notes=notes, raw=raw,
         )
 
     # No gate on the gripper. `held` is a belief typed in by hand (`/held`),
