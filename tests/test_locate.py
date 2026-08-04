@@ -764,6 +764,53 @@ def test_an_explicit_height_overrides_both_cues() -> None:
     assert d_true < d_zero
 
 
+def test_the_cube_height_routes_through_the_calibrated_map() -> None:
+    """At exactly ``cube_height_mm`` the measured cube-top map aims, not the
+    analytic contraction.
+
+    The map is fitted against cubes the arm placed at known coordinates, so it
+    carries the detector's centroid bias as well as the parallax. Measured
+    2026-08-04 against the cube detector's own reading, three objects with a
+    snug box: 3.2mm mean through the map, 14.3mm through the analytic form at
+    the same height. Any other height has no such map and must not borrow it.
+    """
+    from mt4_vision.locate import _is_cube_height, _object_from_mask, _unproject
+
+    calib = RIG_CALIB
+    assert _is_cube_height(calib, calib.cube_height_mm)
+    assert not _is_cube_height(calib, calib.cube_height_mm + 5.0)
+    assert not _is_cube_height(rig_calibration(cube_top_homography=None), calib.cube_height_mm)
+
+    mask, origin = prism_mask(calib, 160.0, -150.0, 20, 20, 20, 0.0)
+    frame = np.zeros((origin[1] + mask.shape[0] + 8, origin[0] + mask.shape[1] + 8, 3), np.uint8)
+    obj = _object_from_mask(frame, mask, origin, calib, calib.cube_height_mm)
+    assert obj is not None
+    mx, my = calib.pixel_to_robot(obj.px, obj.py, on_cube_top=True)
+    assert math.hypot(obj.x - mx, obj.y - my) < 1e-6
+    # Not the analytic contraction, which is a different answer here.
+    ax, ay = _unproject(calib, obj.px, obj.py, calib.cube_height_mm / 2.0)
+    assert math.hypot(obj.x - ax, obj.y - ay) > 1.0
+
+
+def test_an_assumed_cube_height_does_not_shrink_the_measured_width() -> None:
+    """The assumption moves the aim point; it must not de-inflate the width.
+
+    Subtracting a height nobody measured takes more off than the silhouette was
+    inflated by -- on a live frame 2026-08-04 it drove a 20mm cube's 20mm
+    reading to the 1mm clamp, retiring the only test for an object too wide for
+    the jaws. A silhouette reads wide, so leaving it errs toward refusing.
+    """
+    calib = RIG_CALIB
+    mask, origin = prism_mask(calib, 160.0, -150.0, 20, 20, 20, 0.0)
+    frame = np.zeros((origin[1] + mask.shape[0] + 8, origin[0] + mask.shape[1] + 8, 3), np.uint8)
+    from mt4_vision.locate import _object_from_mask
+
+    assumed = _object_from_mask(frame, mask, origin, calib, calib.cube_height_mm)
+    raw = _object_from_mask(frame, mask, origin, calib, 0.0)
+    assert abs(assumed.short_mm - raw.short_mm) < 1e-6
+    assert assumed.short_mm > 10.0
+
+
 def test_no_camera_geometry_means_no_height_correction() -> None:
     """Without a measured nadir and lens height there is no parallax model, so
     the measurement claims no height rather than guessing at one."""

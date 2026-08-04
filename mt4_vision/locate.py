@@ -661,6 +661,17 @@ def _check_plausible(long_mm: float, short_mm: float, what: str) -> None:
     )
 
 
+def _is_cube_height(calib: Calibration, height_mm: float) -> bool:
+    """True when ``height_mm`` is the configured cube height and a map exists.
+
+    The one condition under which the measured cube-top map applies: it was fitted
+    at ``cube_height_mm`` and says nothing about any other height.
+    """
+    return bool(calib.cube_top_homography) and abs(
+        height_mm - float(calib.cube_height_mm)
+    ) < 1e-6
+
+
 def _height_corrected(
     calib: Calibration,
     centroid_px: tuple[float, float],
@@ -723,7 +734,27 @@ def _height_corrected(
         if basis is not None and len(outline_px):
             radial_mm, cross_mm = _table_extents_mm(calib, outline_px, u, v)
             height = min(height, _height_from_sweep(radial_mm, cross_mm, gain))
-    if height > 0.0:
+    if _is_cube_height(calib, height):
+        # The calibrated map for exactly this case, fitted by
+        # calibrate_height.py against cubes the arm placed at known
+        # coordinates. It carries the detector's centroid bias as well as the
+        # parallax, which the analytic form cannot know about, and it is the
+        # map the cube detector and stacking already aim with. Measured
+        # 2026-08-04 against the cube detector's own reading over three objects
+        # with a snug box: 3.2mm mean, against 14.3mm for the analytic
+        # contraction at the same height.
+        #
+        # The width is left as the silhouette measured it. De-inflating by a
+        # height nobody measured subtracts more than the silhouette was
+        # actually inflated by -- on the same frame it took a 20mm cube's 20mm
+        # reading down to the 1mm clamp, which would retire the only test for
+        # an object too wide to fit between the jaws. A silhouette width reads
+        # wide, so leaving it alone errs toward refusing, and closing on air is
+        # the failure with no detector.
+        cx, cy = calib.pixel_to_robot(
+            centroid_px[0], centroid_px[1], on_cube_top=True
+        )
+    elif height > 0.0:
         short_mm = max(1.0, short_mm - height * gain * cos_radial)
         # The silhouette's centroid lies midway between the footprint and the
         # top outline, so it unprojects at half the object's height.
