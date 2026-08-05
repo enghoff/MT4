@@ -915,6 +915,40 @@ def draw_report(img: np.ndarray, findings) -> None:
         )
 
 
+def draw_move(
+    img: np.ndarray,
+    from_px: tuple[float, float] | None,
+    to_px: tuple[float, float] | None,
+    colour: tuple[int, int, int] = QWEN_BOUND_BGR,
+) -> None:
+    """The move in flight: where the jaws close, and where they open again.
+
+    The same green rings and arrow :func:`annotate_qwen` draws on the decision
+    frame, so the plan and the arm carrying it out read as one picture even
+    though they are drawn on different frames. This one goes on the *live*
+    feed, where the question is no longer what the model pointed at but
+    whether the arm is going there.
+
+    Either end can be absent: a pick has no destination and a place has no
+    source, so the rings are labelled rather than left to be inferred from
+    which one is present.
+    """
+    for point, tag in ((from_px, "from"), (to_px, "to")):
+        if point is None:
+            continue
+        px, py = int(point[0]), int(point[1])
+        cv2.circle(img, (px, py), 20, colour, 2)
+        draw_outlined_text(img, tag, (px + 26, py + 6), scale=0.5, color=colour)
+    if from_px is None or to_px is None:
+        return
+    cv2.arrowedLine(
+        img,
+        (int(from_px[0]), int(from_px[1])),
+        (int(to_px[0]), int(to_px[1])),
+        colour, 2, cv2.LINE_AA, tipLength=0.04,
+    )
+
+
 def annotate_qwen(
     base: np.ndarray,
     *,

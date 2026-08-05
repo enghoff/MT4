@@ -775,6 +775,20 @@ class TaskWorker:
             where = grasp if grasp is not None else dest_grasp
             yaw = "wrist kept" if where.yaw_deg is None else f"yaw {where.yaw_deg:.0f}"
 
+            # Where the jaws will close and open again, as pixels of the desk.
+            # Projected with no z: both poses are at table height, where
+            # robot_to_pixel is the exact table-plane inverse. The live pane
+            # draws these for as long as the arm is in flight.
+            self._set(
+                move_from_px=(
+                    None if grasp is None
+                    else obs.calib.robot_to_pixel(grasp.x, grasp.y)
+                ),
+                move_to_px=(
+                    None if dest_grasp is None
+                    else obs.calib.robot_to_pixel(dest_grasp.x, dest_grasp.y)
+                ),
+            )
             self._phase("moving")
             try:
                 where_to = _destination_words(obs, action)
@@ -840,6 +854,10 @@ class TaskWorker:
                 self._ui.set_status(f"{note}: {exc}")
                 self._set(error=f"{note}: {exc}")
                 break
+            finally:
+                # The arm has stopped, wherever it got to. Leaving the rings up
+                # would draw the finished move over the park that follows it.
+                self._set(move_from_px=None, move_to_px=None)
         else:
             self._ui.emit(f"    -> gave up after {max_steps} steps")
             self._ui.set_status(f"gave up after {max_steps} steps")

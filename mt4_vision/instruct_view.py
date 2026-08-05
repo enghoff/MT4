@@ -43,6 +43,7 @@ from mt4_vision.preview import (
     VideoRecorder,
     annotate_qwen,
     draw_inset,
+    draw_move,
     draw_outlined_text,
     wrap_text,
 )
@@ -55,8 +56,16 @@ MAX_STEPS = 6
 # 1280x720 stream, 26.3 ms of it waiting for the next frame and 6.0 ms drawing
 # -- so recording every canvas would triple the file for motion nobody is
 # watching at that resolution. RunPreview writes on a clock instead of every
-# tick, which is also what keeps playback at real speed.
+# tick, which is also what keeps the moving stretches at real speed.
 RECORD_FPS = 10.0
+
+
+# How much sparser the recording gets while the arm stands still. Waiting on
+# the model is seconds of a picture that does not change, so those stretches
+# are written at a tenth of the rate and play back ten times faster; motion is
+# written in full. A recording is therefore real time through every move and
+# fast-forward between them, which is what makes a whole session watchable.
+WAIT_SPEEDUP = 10
 
 
 CAPTION_BGR = (255, 255, 255)
@@ -127,6 +136,13 @@ class RunState:
     held: str | None = None
     action: str = ""
     reason: str = ""
+    # The move in flight, as pixels of the desk the camera is looking at now:
+    # where the jaws close and where they open again, projected from the poses
+    # the arm was actually given. Either can be absent -- a pick has no
+    # destination, a place no source. Drawn on the live pane while it has the
+    # space, and cleared when the motion call returns.
+    move_from_px: tuple[float, float] | None = None
+    move_to_px: tuple[float, float] | None = None
     # Oldest first, the same sentences the model is told about on the next
     # step -- so the panel and the prompt cannot drift apart.
     outcomes: tuple[str, ...] = ()
@@ -348,10 +364,17 @@ def compose(
     large pane is the arm actually crossing the desk. Neither picture ever
     leaves the window, so the comparison is always available -- what swaps is
     which one is worth the space.
+
+    The live pane carries the move itself while it is the large one -- rings on
+    where the jaws close and where they open again, an arrow between. Those are
+    the poses the arm was given, projected into pixels, so the arm can be
+    watched against its own plan rather than against a memory of the overlay
+    that is now two inches wide in the corner.
     """
     if view is None or state.arm_moving:
         main = live.copy()
         draw_outlined_text(main, "LIVE", (14, 28), scale=0.55, color=(220, 220, 220))
+        draw_move(main, state.move_from_px, state.move_to_px)
         if view is not None:
             draw_inset(main, view, "DECIDED")
     else:
@@ -403,6 +426,7 @@ class RunPreview:
         # non-positive rate has no meaning here; callers validate it.
         self._record_period = 1.0 / fps
         self._next_write = time.monotonic()
+        self._last_period = self._record_period
         self._latest: np.ndarray | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -442,7 +466,7 @@ class RunPreview:
                 continue
             with self._lock:
                 self._latest = canvas
-            self._record(canvas)
+            self._record(canvas, state.arm_moving)
             if self._preview is None:
                 continue
             try:
@@ -457,25 +481,34 @@ class RunPreview:
                 self._ui.set_status("window closed -- stopping; press Enter to quit")
                 break
 
-    def _record(self, canvas: np.ndarray) -> None:
+    def _record(self, canvas: np.ndarray, moving: bool) -> None:
         """Write this canvas as many times as the recording clock owes it.
 
-        Paced against wall time, not against the loop, so the file plays back
-        at the speed the desk actually moved -- a move timed off the video is
-        the move that happened. The loop turns over faster than the recording
-        rate (30.7/s measured, against 10 written), so an ordinary tick writes
-        one frame or none; a late tick -- window-redraw jitter, or the 200 ms
-        sleep after a camera error -- repeats the canvas to fill the gap it
-        left. Writing at most one frame per tick instead drops those periods
-        and shortens the video: 7.4 s of file for an 8.0 s run, measured with
-        the window open.
+        Paced against wall time, not against the loop, so a move plays back at
+        the speed it happened -- a move timed off the video is the move that
+        happened. The loop turns over faster than the recording rate (30.7/s
+        measured, against 10 written), so an ordinary tick writes one frame or
+        none; a late tick -- window-redraw jitter, or the 200 ms sleep after a
+        camera error -- repeats the canvas to fill the gap it left. Writing at
+        most one frame per tick instead drops those periods and shortens the
+        video: 7.4 s of file for an 8.0 s run, measured with the window open.
 
-        ``now`` is read once, so a write slower than ``_record_period`` cannot
-        chase its own tail.
+        Standing still, the rate drops by ``WAIT_SPEEDUP``, so the seconds
+        spent waiting on the model pass ten times faster on playback. The new
+        pace starts at the tick that changed it rather than after the deadline
+        already pending, because the switch into motion is exactly where a
+        whole slow period would otherwise swallow the start of a move.
+
+        ``now`` is read once, so a write slower than the period cannot chase
+        its own tail.
         """
         if self._recorder is None:
             return
+        period = self._record_period * (1 if moving else WAIT_SPEEDUP)
         now = time.monotonic()
+        if period != self._last_period:
+            self._last_period = period
+            self._next_write = min(self._next_write, now)
         while now >= self._next_write:
             try:
                 self._recorder.write(canvas)
@@ -487,7 +520,7 @@ class RunPreview:
                 self._recorder = None
                 self._ui.emit(f"  recording stopped -- {type(exc).__name__}: {exc}")
                 return
-            self._next_write += self._record_period
+            self._next_write += period
 
     def close(self) -> None:
         self._stop.set()

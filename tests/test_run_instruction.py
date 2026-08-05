@@ -34,7 +34,7 @@ from mt4_vision.instruct_view import (
     render_panel,
 )
 from mt4_vision.instruct_worker import TaskWorker
-from mt4_vision.preview import draw_inset, wrap_text
+from mt4_vision.preview import QWEN_BOUND_BGR, draw_inset, wrap_text
 
 H, W = 720, 1280
 
@@ -155,6 +155,50 @@ def test_the_swap_still_shows_both_frames():
         )
 
 
+def test_the_move_is_drawn_on_the_live_pane_and_only_while_it_is_large():
+    """Rings on where the jaws close and open, over the frame of the desk now.
+
+    Sampled on the ring itself -- ``draw_move`` circles radius 20 -- so this
+    reads the colour actually laid down rather than one that happens to be
+    somewhere in the canvas.
+    """
+    live, view = blank(value=40), blank(value=200)
+    ends = {"move_from_px": (300.0, 300.0), "move_to_px": (700.0, 500.0)}
+    moving = compose(
+        live, view, RunState(instruction="x", phase="moving", **ends),
+        svc="s", camera=1,
+    )
+    assert tuple(int(v) for v in moving[280, 300]) == QWEN_BOUND_BGR
+    assert tuple(int(v) for v in moving[480, 700]) == QWEN_BOUND_BGR
+    # The arrow crosses the space between them, so the midpoint is no longer
+    # the live frame's own fill.
+    assert tuple(int(v) for v in moving[400, 500]) != (40, 40, 40)
+    # Standing still the decision frame has the pane, and it carries its own
+    # overlay already -- the live frame is not even the one being drawn on.
+    still = compose(
+        live, view, RunState(instruction="x", phase="deciding", **ends),
+        svc="s", camera=1,
+    )
+    plain = compose(
+        live, view, RunState(instruction="x", phase="deciding"), svc="s", camera=1,
+    )
+    assert np.array_equal(still, plain)
+
+
+def test_a_pick_draws_one_end_and_no_arrow():
+    """A pick has no destination, so there is nothing to point at."""
+    live, view = blank(value=40), blank(value=200)
+    canvas = compose(
+        live, view,
+        RunState(instruction="x", phase="moving", move_from_px=(300.0, 300.0)),
+        svc="s", camera=1,
+    )
+    assert tuple(int(v) for v in canvas[280, 300]) == QWEN_BOUND_BGR
+    # Where the other ring and the arrow would be: untouched live frame.
+    assert tuple(int(v) for v in canvas[480, 700]) == (40, 40, 40)
+    assert tuple(int(v) for v in canvas[400, 500]) == (40, 40, 40)
+
+
 def test_compose_survives_a_view_and_a_live_frame_of_different_sizes():
     """The window must not die because the camera changed mode mid-session."""
     canvas = compose(
@@ -224,19 +268,22 @@ def paced(fps: float = 10.0) -> RunPreview:
     view = object.__new__(RunPreview)
     view._recorder = FrameCounter()
     view._record_period = 1.0 / fps
+    view._last_period = 1.0 / fps
     view._next_write = 0.0
     view._ui = Recorder()
     return view
 
 
-def replay(view: RunPreview, ticks: list[float], monkeypatch) -> None:
+def replay(
+    view: RunPreview, ticks: list[float], monkeypatch, moving: bool = True,
+) -> None:
     """Offer one canvas per tick, with the clock reading that tick's time."""
     clock = {"now": 0.0}
     monkeypatch.setattr(instruct_view.time, "monotonic", lambda: clock["now"])
     canvas = blank(h=8, w=8)
     for tick in ticks:
         clock["now"] = tick
-        view._record(canvas)
+        view._record(canvas, moving)
 
 
 def test_recording_writes_at_the_declared_rate(monkeypatch):
@@ -244,6 +291,23 @@ def test_recording_writes_at_the_declared_rate(monkeypatch):
     view = paced(10.0)
     replay(view, [i / 30 for i in range(1, 300)], monkeypatch)
     assert view._recorder.frames == 100
+
+
+def test_standing_still_is_recorded_ten_times_sparser(monkeypatch):
+    """10 s of waiting on the model becomes 1 s of video."""
+    view = paced(10.0)
+    replay(view, [i / 30 for i in range(1, 300)], monkeypatch, moving=False)
+    assert view._recorder.frames == 10
+
+
+def test_a_move_is_recorded_from_the_tick_it_starts_on(monkeypatch):
+    """The slow deadline left pending by a wait must not swallow a move's start."""
+    view = paced(10.0)
+    replay(view, [i / 30 for i in range(1, 31)], monkeypatch, moving=False)
+    waited = view._recorder.frames
+    # A second of motion, on the same clock the wait left off at.
+    replay(view, [1.0 + i / 30 for i in range(1, 31)], monkeypatch, moving=True)
+    assert view._recorder.frames - waited == 10, "a second of motion is 10 frames"
 
 
 def test_a_stalled_tick_is_filled_so_the_file_keeps_wall_time(monkeypatch):

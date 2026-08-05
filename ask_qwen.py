@@ -31,12 +31,18 @@ run; the arm is still parked on the way out.
 takes the large pane and the frame with the overlay drops to the inset, for
 the phases where the desk is actually changing -- a carry, a park, a homing,
 the jaws letting go. Both are always on screen; what changes is which one is
-worth the space, and during a move that is the arm crossing the desk.
+worth the space, and during a move that is the arm crossing the desk. The live
+pane carries the move as well: a ring where the jaws close, a ring where they
+open again, an arrow between. Those are the poses the arm was handed, so what
+is on screen is the plan and the arm executing it, not the plan twice.
 
 ``--record run.mp4`` writes that same composited picture to a video for the
-whole session, at 10 fps and real speed. It does not need the window: with
-``--no-preview``, or on a machine whose OpenCV has no GUI, the file is written
-anyway, which is the case where it is the only way to see what happened.
+whole session, at 10 fps. It does not need the window: with ``--no-preview``,
+or on a machine whose OpenCV has no GUI, the file is written anyway, which is
+the case where it is the only way to see what happened. Motion is recorded in
+full and plays back at the speed it happened; the stretches with the arm
+standing still -- waiting on the model, mostly -- are written a tenth as often
+and play back ten times faster, which is what makes a whole session watchable.
 
 Each step is one capture, one decision, one motion:
 
@@ -387,8 +393,9 @@ def main() -> int:
     )
     ap.add_argument(
         "--record-fps", type=record_fps, default=RECORD_FPS,
-        help=f"frames per second written by --record (default {RECORD_FPS:g}); "
-             "the file plays back at real speed at any value",
+        help=f"frames per second written by --record while the arm moves "
+             f"(default {RECORD_FPS:g}); standing still it writes a tenth as "
+             "often, so waiting plays back 10x faster and motion at real speed",
     )
     args = ap.parse_args()
 
