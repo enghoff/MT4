@@ -73,13 +73,14 @@ rather than reporting a physical limit:
 None of the three can produce an illegal pose, and each failure they used to
 prevent is visible on the desk and recoverable.
 
-**Why a box and not a point.** ``box_2d`` unlocks GrabCut, measured at 4 of 4
-objects segmented on a frame where the bare-point desk-deviation path manages
-1 of 4. It also bounds the mask so it cannot flood the desk, and gives an extent
-that can be sanity-checked before the arm moves. See :class:`Grounding`.
+**Why a box and not a point.** ``box_2d`` is what the segmenter is prompted
+with, and from a box it returns a usable silhouette for every object tried on
+this desk -- 5 of 5 including a cube standing on a marker tag -- where the
+bare-point desk-deviation path manages 1 of 4. A box also gives an extent that
+can be sanity-checked before the arm moves. See :class:`Grounding`.
 
 **Grip geometry.** Every object is gripped at ``calib.table_z`` -- as low as the
-jaws go -- with the yaw of the GrabCut mask's long axis. Nothing about the grip
+jaws go -- with the yaw of the segmentation mask's long axis. Nothing about the grip
 *height* depends on how tall the thing is: no object here is taller than the
 jaws' vertical clearance, so the lowest grip is always available.
 
@@ -306,7 +307,7 @@ class Action:
     label: str | None = None
     # The source box in frame pixels, and its centre. The box is what gets
     # measured; the centre is what the preview draws and what the desk-deviation
-    # path falls back to when GrabCut cannot cut the box.
+    # path falls back to when nothing can be segmented in the box.
     source: Grounding | None = None
     # Where to release, in frame pixels, and the same reply read as raw pixels
     # as a retry. This is the only destination form: landing on a tag means the
@@ -875,10 +876,11 @@ def measure_source(
 
     Three choices, all deliberate:
 
-    * **GrabCut from the box first.** ``measure_with_box_fallback`` prefers it,
-      falls back to desk-deviation at the box centre, then to the raw box.
-      Measured on one live frame, GrabCut from a box segmented 4 of 4 objects
-      where the point path managed 1 of 4.
+    * **The mask from the box first.** ``measure_with_box_fallback`` prompts
+      SAM 2.1 with the box, falls back to desk-deviation at the box centre,
+      then to the raw box. Measured on live frames, a box prompt segments every
+      object tried where the point path manages 1 of 4. When the service is
+      unreachable it refuses instead of dropping to those weaker rungs.
     * **Height assumed to be ``calib.cube_height_mm``**, not inferred from the
       silhouette. Height cannot be measured from one view, and on this steeply
       oblique mount every millimetre of error in it moves the aim point by
@@ -957,9 +959,10 @@ class Finding:
 
         The width quoted is ``grip_mm``, what the jaws will actually close
         across at the planned grasp point -- **not** the silhouette's extent.
-        GrabCut from a box takes in the object's shadow, so on the nine-cube
-        desk of 2026-08-04 the extent read 38-64mm long for 20mm cubes while
-        ``grip_mm`` read 20.5-28.7mm. The position is sound either way (0.3-8.2
+        A silhouette of a cube on this oblique mount spans its top and its
+        front face together, so on the nine-cube desk of 2026-08-04 the extent
+        read 38-64mm long for 20mm cubes while ``grip_mm`` read 20.5-28.7mm.
+        The position is sound either way (0.3-8.2
         mm from the HSV detector's reading on those nine), but a size column
         two to three times over is worse in an operator's hands than no size
         column, and the grip width is the number the pick is planned on.
@@ -978,8 +981,8 @@ def measure_report(obs: Observation, action: "Action") -> tuple[Finding, ...]:
     """Measure everything a REPORT boxed and ask the pick gates about each.
 
     Object for object, this is the same work :func:`measure_source` does for a
-    single pick: GrabCut inside the box the model drew, on the frame it drew it
-    on, at ``calib.cube_height_mm`` rather than a height read off the silhouette
+    single pick: segmented inside the box the model drew, on the frame it drew
+    it on, at ``calib.cube_height_mm`` rather than a height read off the silhouette
     (see :func:`measure_source` for what inferring it costs). Then
     :func:`source_entity`, which is where reach, the J1 keep-out, ground Z, the
     desk polygon and the jaw-width plan live.

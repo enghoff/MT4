@@ -6,11 +6,11 @@ by SSH forward, see ``scripts/start_sam_tunnel.ps1``. Setup: ``docs/SAM2.md``.
 
 Where :mod:`mt4_vision.grounding` answers "where is the pen" with a box, this
 answers "which pixels are it" with a mask, from a point or a box you already
-have. The two compose: a Grounding DINO box is a prompt this service turns
-into a silhouette, which is a better input to
-:func:`mt4_vision.locate.measure`'s width and long-axis maths than a box
-corner-to-corner. Cube pick/place, calibration, stacking and the MCP tools do
-not touch this module and work with the service absent.
+have. The two compose, and :mod:`mt4_vision.locate` is where: every
+measurement that starts from a box prompts this service and measures the
+silhouette that comes back. Cube pick/place, calibration and stacking do not
+touch it, and neither does measuring from a bare pixel, which segments by
+distance from the local desk colour.
 
 The service keeps the image encoder's output for the last few frames it has
 seen, keyed by the bytes of the JPEG it was sent. Since :func:`segment`

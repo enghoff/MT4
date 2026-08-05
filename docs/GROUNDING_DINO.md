@@ -232,11 +232,15 @@ to the whole prompt string while boxes stay correct.
 
 Detection stops at a box; measurement is separate. Both the CLI and the MCP tool
 hand the box to `locate.measure_with_box_fallback`, which tries three things in
-order — **GrabCut inside the DINO box**, then desk-segment `measure` around the
-box centre, then the raw box AABB. Only the first two recover a true centre,
-long axis and mm size; the AABB fallback inherits whatever slop the box has. So
-a plausible box is not yet a pickable object, and `grasp_feasibility` is what
-decides.
+order — **the SAM 2.1 mask for the DINO box** ([docs/SAM2.md](SAM2.md)), then
+desk-segment `measure` around the box centre, then the raw box AABB. Only the
+first two recover a true centre, long axis and mm size; the AABB fallback
+inherits whatever slop the box has. So a plausible box is not yet a pickable
+object, and `grasp_feasibility` is what decides.
+
+Both services fit on one 8 GB card, so measurement works while DINO is the
+resident detector. If the SAM service is down the measurement refuses and says
+so, rather than dropping to the two weaker rungs.
 
 ---
 

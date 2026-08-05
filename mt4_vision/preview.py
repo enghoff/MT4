@@ -978,7 +978,7 @@ def annotate_qwen(
       coordinate convention. This build answers 0-1000 normalized whatever the
       prompt says, and the two readings land 200-280px apart, so a coordinate
       space error is a glance rather than an investigation.
-    * **Spring-green fill** -- the GrabCut silhouette the box was seeded with
+    * **Spring-green fill** -- the silhouette segmented from the box
       (``obj``, a ``locate.LocatedObject``), with the measured size and how much
       of the search window it filled. This is the layer everything above depends
       on and the only one you cannot check from numbers: a mask that leaked into

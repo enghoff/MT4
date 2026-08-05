@@ -2,9 +2,12 @@
 
 Prompted segmentation for the MT4 desk camera. The segmenter is a small
 FastAPI service wrapping `facebook/sam2.1-hiera-small`; the arm side talks to
-it over HTTP and needs nothing else. Everything else in this repo works with
-the service absent — cube pick/place, calibration and the rest of the MCP
-tools do not depend on it.
+it over HTTP and needs nothing else.
+
+**Every measurement that starts from a detector box goes through it**, so it is
+not an optional extra for the open-vocabulary half of this repo — see
+[What depends on the service being up](#what-depends-on-the-service-being-up).
+Cube pick/place, stacking, calibration and the jog client do not touch it.
 
 **What it buys you:** a point or a box becomes a *silhouette*. Grounding DINO
 says the pen is somewhere in this rectangle; this says which pixels are pen. On
@@ -320,13 +323,32 @@ reason not to.
 |-------------|--------------|
 | [mt4_vision/sam.py](../mt4_vision/sam.py) | Client. `health()`, `embed(frame)`, `segment(frame, points=…, boxes=…)` → `Mask` list with `mask`, `score`, `area`, `bbox` and a centre-of-area `cx`/`cy`. `best_per_object()` takes the top candidate each. Raises `SamError` when unreachable |
 | `python -m mt4_vision sam --pixel PX PY` | Segment at a pixel or `--box X1 Y1 X2 Y2`, print the numbers, save `sam_frame.jpg` with the mask tinted on. `--candidates` draws all three |
+| [mt4_vision/locate.py](../mt4_vision/locate.py) | **Every measurement that starts from a box.** `measure_sam` prompts with the box; `measure_with_box_fallback` is the ladder Grounding DINO, Qwen3-VL, the MCP tools and `relocate` all reach it through |
 
 Measured from the arm host through an SSH tunnel, a call takes 30–95 ms; the
 spread is the link, not the model, whose own accounting is the table above.
 
-A mask is not yet a grasp. `mt4_vision.locate.measure` is what turns pixels
-into a centre, a long axis and millimetres, and `grasp_feasibility` decides
-whether the jaws can take it.
+A mask is not yet a grasp. `mt4_vision.locate` is what turns pixels into a
+centre, a long axis and millimetres, and `grasp_feasibility` decides whether
+the jaws can take it.
+
+### What depends on the service being up
+
+Anything that measures an object **from a box**: `mt4_locate_by_prompt`,
+`ask_dino.py`, `ask_qwen.py` and the instruction worker, `python -m mt4_vision
+grounding --locate`, and re-acquiring a registered object with
+`locate.relocate`. All but the last already need a GPU service for the box
+itself, and this one runs beside either of those on the same card.
+
+Untouched by an outage: cube pick/place, stacking, calibration, the jog client,
+and `locate.measure` from a bare pixel, which segments by how far each pixel
+sits from the local desk colour and needs no model at all.
+
+When the service is unreachable, a box measurement **refuses and says so**. It
+does not quietly fall to the rungs below — the desk-deviation path cannot
+segment a stapler at all, and the last rung reports the box's own dimensions as
+the object's (150 × 74 mm for a stapler, measured 2026-08-02), which is a wrong
+number that looks like a right one.
 
 ---
 

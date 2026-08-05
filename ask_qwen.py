@@ -49,7 +49,7 @@ Each step is one capture, one decision, one motion:
     park clear of the camera
         -> one frame -> pixel grid + the decoded ArUco ids drawn on it
         -> Qwen3-VL picks an action and draws a box round what it means
-        -> GrabCut inside that box -> position, size and angle in millimetres
+        -> SAM 2.1 segments inside that box -> position, size and angle in mm
         -> the physical gates: reach, keep-out, ground, jaw clearance, desk
         -> motion.transfer / pick_at / place_at, off that same frame
         -> park clear of the camera again
@@ -70,7 +70,7 @@ nothing to refuse over a name. The box goes straight to the segmenter that
 turns pixels into millimetres.
 
 **Every object is gripped at table height.** The jaws close at ``table_z``, as
-low as they go, oriented by the GrabCut mask's long axis. Nothing on this desk
+low as they go, oriented by the mask's long axis. Nothing on this desk
 is taller than the jaws' vertical clearance, so the lowest grip is always
 available and no pick has to know how tall a thing is to decide its Z.
 

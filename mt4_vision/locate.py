@@ -53,6 +53,8 @@ import numpy as np
 
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import classify_color
+from mt4_vision.sam import SamError
+from mt4_vision.sam import segment as sam_segment
 from mt4_vision.wrist import j4_for_long_axis
 from mt4_vision.workspace import work_region_block_reason
 
@@ -318,13 +320,10 @@ def refine_at_hint(
     return got
 
 
-# GrabCut: detector AABB is probable FG; a small centre disc is sure FG so the
-# GMM has a colour sample. Marking the box border as sure BG looks tempting for
-# loose boxes but eats thin rotated objects whose tips sit in that border.
-GRABCUT_ITERS = 5
-GRABCUT_MARGIN_PX = 32  # desk context around the box for the GMM
-GRABCUT_SURE_FG_RADIUS_PX = 10
-GRABCUT_MIN_AREA_FRAC = 0.02  # refuse if FG is tiny vs the box
+# Desk kept around the box in the returned crop. The mask itself is computed at
+# frame resolution, so this only widens the window the crop is taken from --
+# which is what `relocate` stores as a template and matches on later.
+SAM_CROP_MARGIN_PX = 32
 
 
 def _clip_box(
@@ -342,115 +341,53 @@ def _clip_box(
     return xa, ya, xb, yb
 
 
-def _segment_grabcut(
+def _segment_sam(
     frame: np.ndarray,
     x1: float,
     y1: float,
     x2: float,
     y2: float,
-    exclude: np.ndarray | None = None,
     *,
-    iters: int = GRABCUT_ITERS,
-    margin_px: int = GRABCUT_MARGIN_PX,
+    margin_px: int = SAM_CROP_MARGIN_PX,
 ) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
-    """Foreground mask from a detector AABB via GrabCut.
+    """Foreground mask from a detector AABB, via the SAM 2.1 service.
 
-    The box is a strong prior from Grounding DINO; GrabCut turns it into a
-    silhouette that desk-deviation segmentation often cannot find (low contrast,
-    textured objects, soft shadows). Marker paper is forced to sure background.
+    The box is a prompt, not a crop: the model sees the whole frame and answers
+    with the object the box points at, so the mask may reach past the box on an
+    object the detector cut through. The returned crop covers both.
+
+    An object resting on marker paper needs nothing special. The mask comes from
+    the image, so a cube standing on marker 3's tag returns 3,183 px of cube --
+    where a segmenter given a geometric paper prior kept a 353 px fragment of
+    the same cube, because the prior cannot tell paper from what is lying on it.
+
+    One mask, not the model's three candidates. Measured over five desk objects
+    the single mask matched or beat the best-scoring of three, which on a binder
+    clip took in the cable behind it and read 69.6 mm long against 39.4.
+
+    Raises :class:`mt4_vision.sam.SamError` if the service is unreachable, which
+    is a different thing from "no object in this box" and must stay that way --
+    one is worth falling back from, the other is worth stopping for.
     """
     clipped = _clip_box(frame, x1, y1, x2, y2)
     if clipped is None:
         return None
+    found = sam_segment(
+        frame,
+        boxes=[[float(x1), float(y1), float(x2), float(y2)]],
+        multimask=False,
+    )[0]
+    if found.bbox is None:
+        return None
+
     bx0, by0, bx1, by1 = clipped
+    mx0, my0, mx1, my1 = found.bbox
     h, w = frame.shape[:2]
-    # Crop with margin so GrabCut sees real desk outside the box.
-    cx0 = max(0, bx0 - margin_px)
-    cy0 = max(0, by0 - margin_px)
-    cx1 = min(w, bx1 + margin_px)
-    cy1 = min(h, by1 + margin_px)
-    crop = np.ascontiguousarray(frame[cy0:cy1, cx0:cx1])
-    if crop.size == 0 or min(crop.shape[:2]) < 8:
-        return None
-
-    lx0, ly0 = bx0 - cx0, by0 - cy0
-    lx1, ly1 = bx1 - cx0, by1 - cy0
-    bw, bh = lx1 - lx0, ly1 - ly0
-
-    gc = np.full(crop.shape[:2], cv2.GC_BGD, dtype=np.uint8)
-    gc[ly0:ly1, lx0:lx1] = cv2.GC_PR_FGD
-    # Seed sure FG at the box centre so GrabCut has an object colour sample
-    # even when most of a loose AABB is desk.
-    hx = max(0, min((lx0 + lx1) // 2, crop.shape[1] - 1))
-    hy = max(0, min((ly0 + ly1) // 2, crop.shape[0] - 1))
-    r = max(3, min(GRABCUT_SURE_FG_RADIUS_PX, bw // 4, bh // 4))
-    cv2.circle(gc, (hx, hy), r, int(cv2.GC_FGD), thickness=-1)
-
-    if exclude is not None:
-        ex = exclude[cy0:cy1, cx0:cx1]
-        if ex.shape[:2] == gc.shape:
-            paper = ex.astype(bool)
-            inside = np.zeros_like(paper)
-            inside[ly0:ly1, lx0:lx1] = True
-            # Outside the detector box, marker paper is background and that is
-            # the end of it.
-            gc[paper & ~inside] = cv2.GC_BGD
-            # Inside the box it is only a PRIOR. The mask is geometric -- a
-            # quad around each marker's calibrated position -- so it cannot
-            # tell paper from something lying on top of paper, and the box is
-            # a strong statement that the object is right here.
-            #
-            # Measured 2026-08-02: the stapler was resting ON marker 0's paper
-            # (the arm had placed it there). The exclusion covered 53.8% of
-            # Qwen's box, including the stapler itself, so GrabCut found no
-            # foreground at all -- 8 grounding calls out of 8. Every
-            # measurement then fell through to the raw box, reporting the
-            # AABB's dimensions as the object's: 150x74mm for a stapler, with
-            # no silhouette for grasp planning to use.
-            #
-            # GC_PR_BGD lets GrabCut reclaim pixels its colour model says are
-            # not paper, which is exactly the object on top of it, while still
-            # steering it away from the high-contrast black-and-white tag that
-            # made this exclusion necessary in the first place.
-            gc[paper & inside] = cv2.GC_PR_BGD
-            # The sure-FG seed has to survive: it is the only thing telling
-            # GrabCut what the object's colour actually is.
-            cv2.circle(gc, (hx, hy), r, int(cv2.GC_FGD), thickness=-1)
-
-    bgd = np.zeros((1, 65), np.float64)
-    fgd = np.zeros((1, 65), np.float64)
-    try:
-        cv2.grabCut(crop, gc, None, bgd, fgd, iters, cv2.GC_INIT_WITH_MASK)
-    except cv2.error:
-        return None
-
-    fg = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
-    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    # Keep only the component under the box centre (or nearest inside the box).
-    n, labels = cv2.connectedComponents(fg)
-    if n <= 1:
-        return None
-    want = int(labels[hy, hx])
-    if want == 0:
-        ys, xs = np.nonzero(labels)
-        if not len(ys):
-            return None
-        # Prefer components that overlap the detector box.
-        in_box = (
-            (xs >= lx0) & (xs < lx1) & (ys >= ly0) & (ys < ly1) & (labels[ys, xs] > 0)
-        )
-        if in_box.any():
-            ys, xs = ys[in_box], xs[in_box]
-        d2 = (ys - hy) ** 2 + (xs - hx) ** 2
-        i = int(d2.argmin())
-        want = int(labels[ys[i], xs[i]])
-    mask = (labels == want).astype(np.uint8)
-    area = int(mask.sum())
-    box_area = max(1, bw * bh)
-    if area < max(16, int(box_area * GRABCUT_MIN_AREA_FRAC)):
-        return None
-    return mask, (cx0, cy0, cx1, cy1)
+    cx0 = max(0, min(bx0 - margin_px, mx0))
+    cy0 = max(0, min(by0 - margin_px, my0))
+    cx1 = min(w, max(bx1 + margin_px, mx1 + 1))
+    cy1 = min(h, max(by1 + margin_px, my1 + 1))
+    return found.mask[cy0:cy1, cx0:cx1].astype(np.uint8), (cx0, cy0, cx1, cy1)
 
 
 def refine_at_box(
@@ -459,14 +396,12 @@ def refine_at_box(
     y1: float,
     x2: float,
     y2: float,
-    *,
-    exclude: np.ndarray | None = None,
 ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
-    """GrabCut mask for a detector AABB (preview / measure path)."""
-    got = _segment_grabcut(frame, x1, y1, x2, y2, exclude)
+    """Segmentation mask for a detector AABB (preview / measure path)."""
+    got = _segment_sam(frame, x1, y1, x2, y2)
     if got is None:
         raise LocateError(
-            f"GrabCut found no foreground in box "
+            f"nothing was segmented in box "
             f"({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})"
         )
     return got
@@ -1030,7 +965,7 @@ def measure_box(
     )
 
 
-def measure_grabcut(
+def measure_sam(
     frame: np.ndarray,
     x1: float,
     y1: float,
@@ -1040,26 +975,24 @@ def measure_grabcut(
     label: str,
     *,
     confidence: float = 1.0,
-    marker_xy: Sequence[tuple[float, float]] = (),
     object_height_mm: float | None = None,
 ) -> LocatedObject:
-    """Measure via GrabCut seeded by a detector AABB.
+    """Measure the object a detector AABB points at, via the SAM 2.1 service.
 
-    Tighter than ``measure_box`` (axis-aligned AABB) when the object contrasts
-    with the desk; still refuses on empty / flooded masks.
+    Tighter than ``measure_box`` (the axis-aligned AABB itself) by as much as
+    the object is not a rectangle; still refuses on empty or flooded masks.
     """
-    exclude = marker_paper_mask(frame, calib, marker_xy) if marker_xy else None
-    got = _segment_grabcut(frame, x1, y1, x2, y2, exclude)
+    got = _segment_sam(frame, x1, y1, x2, y2)
     if got is None:
         raise LocateError(
-            f"GrabCut found no foreground in box "
+            f"nothing was segmented in box "
             f"({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})"
         )
     mask, (ox, oy, _x1, _y1) = got
     obj = _object_from_mask(frame, mask, (ox, oy), calib, object_height_mm)
     if obj is None:
-        raise LocateError("GrabCut mask produced a degenerate silhouette")
-    _check_plausible(obj.long_mm, obj.short_mm, "GrabCut")
+        raise LocateError("the mask produced a degenerate silhouette")
+    _check_plausible(obj.long_mm, obj.short_mm, "the mask")
     return replace(obj, label=label, confidence=float(confidence))
 
 
@@ -1076,14 +1009,21 @@ def measure_with_box_fallback(
     marker_xy: Sequence[tuple[float, float]] = (),
     object_height_mm: float | None = None,
 ) -> LocatedObject:
-    """Prefer GrabCut from ``box``; else desk ``measure``; else raw ``measure_box``."""
+    """Prefer the mask from ``box``; else desk ``measure``; else raw ``measure_box``."""
     if box is not None:
         try:
-            return measure_grabcut(
+            return measure_sam(
                 frame, box[0], box[1], box[2], box[3], calib, label,
-                confidence=confidence, marker_xy=marker_xy,
-                object_height_mm=object_height_mm,
+                confidence=confidence, object_height_mm=object_height_mm,
             )
+        except SamError as exc:
+            # An unreachable service is not "no object in this box". The rungs
+            # below are weaker: the desk-deviation path cannot segment a
+            # stapler at all, and the last one reports the box's own dimensions
+            # as the object's (150x74 mm for a stapler, measured 2026-08-02).
+            # Falling through would answer with one of those instead of saying
+            # the service is down.
+            raise LocateError(f"cannot measure from a box: {exc}") from exc
         except LocateError:
             pass
     try:
@@ -1155,13 +1095,17 @@ def relocate_detail(
 
     **The re-measure runs through the matched template's own bounds.** That box
     is a tight, true outline of the object in this frame -- it is the crop the
-    object was registered from, found again -- so it seeds GrabCut exactly the
-    way a detector box does. The plain desk-deviation :func:`measure` cannot
-    segment a stapler at all (measured 2026-08-02: one that had not moved
-    template-matched at **0.993** on the identical pixel), so without the
-    template bounds any object that only GrabCut could find in the first place
-    is permanently un-re-acquirable: registration succeeds, and every attempt
-    to act on it is refused.
+    object was registered from, found again -- so it prompts the segmenter
+    exactly the way a detector box does. The plain desk-deviation
+    :func:`measure` cannot segment a stapler at all (measured 2026-08-02: one
+    that had not moved template-matched at **0.993** on the identical pixel), so
+    without the template bounds any object that only a mask could find in the
+    first place is permanently un-re-acquirable: registration succeeds, and
+    every attempt to act on it is refused.
+
+    This is the one path here that reaches the SAM service without a model
+    having asked for anything, so a re-acquire fails while the service is down
+    even though the object was registered when it was up.
     """
     th, tw = obj.template.shape[:2]
     if th < 2 or tw < 2:

@@ -30,9 +30,10 @@ a typed English instruction into instructions for the MT4 arm.
 - [PlatformIO](https://platformio.org/) + avrdude (only to flash firmware)
 - For vision: an overhead USB camera and printed ArUco markers
   (DICT_4X4_50; sheet in [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf))
-- Optional, for open-vocab grounding: somewhere to run the Grounding DINO
-  service — a CUDA GPU on this machine or another host (CPU works, slowly).
-  See [Open-vocabulary objects](#open-vocabulary-objects)
+- For open-vocab grounding: somewhere to run the Grounding DINO service **and**
+  the SAM 2.1 service — a CUDA GPU on this machine or another host (CPU works,
+  slowly). DINO finds the object, SAM measures it, and both fit on one 8 GB
+  card. See [Open-vocabulary objects](#open-vocabulary-objects)
 
 Serial ports auto-detect the CH340 USB-UART when `--port` / `MT4_SERIAL_PORT`
 are omitted (COM numbers often change after a re-plug). The camera index comes
@@ -272,8 +273,19 @@ A single point is ambiguous — the cube, its top face, or the stack it sits on
 — so the model returns three candidates with its own confidence in each, and
 the client takes the best. The service keeps the encoded frame for the last
 eight images it saw, so a second question about one frame costs about 20 ms of
-service time against 50 for the first. Setup, HTTP API and the measured
-fp16 / compile / cache choices: [docs/SAM2.md](docs/SAM2.md).
+service time against 50 for the first.
+
+**This is also how every box becomes millimetres.** A detector box — from DINO,
+from Qwen, or from re-finding a registered object — is a prompt, and the
+silhouette that comes back is what the centre, long axis and width are measured
+from. Measured on five desk objects, that silhouette is right where a
+colour-model cut is not: a cube standing on a marker tag came back whole at
+3,183 px where a colour-prior cut kept a 353 px fragment of it, and a two-tone
+stapler came back whole rather than as its dark half. When the service is down,
+a box measurement says so rather than falling back to a weaker one.
+
+Setup, HTTP API and the measured fp16 / compile / cache choices:
+[docs/SAM2.md](docs/SAM2.md).
 
 ### Telling the arm what to do in English
 
@@ -294,8 +306,8 @@ The model is the eyes and nothing else. It gets the frame and the decoded ArUco
 tag numbers — a tag's printed number is the one thing no vision-language model
 can read off an image — and every other object on the desk is its job to see.
 No cube list, no object registry, no preprocessing of what you type. A target
-comes back as a box, which GrabCut turns into a position, a size and a wrist
-angle in millimetres; reach, the J1 keep-out, ground Z, jaw clearance and the
+comes back as a box, which the SAM 2.1 service turns into a silhouette and then
+into a position, a size and a wrist angle in millimetres; reach, the J1 keep-out, ground Z, jaw clearance and the
 desk polygon are all checked before the gripper opens.
 
 A task that asks *what is on the desk* rather than for something to be moved is
