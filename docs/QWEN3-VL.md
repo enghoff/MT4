@@ -226,11 +226,11 @@ options (SSH tunnel vs. LAN bind) and the WSL2-specific gotchas
 
 For the reference deployment (`media`), use
 [scripts/start_tunnel.ps1](../scripts/start_tunnel.ps1). One ssh connection
-carries a forward per service, so a single window covers Qwen and the SAM 2.1
-segmenter its measurements go through:
+carries a forward per remote GPU service (DINO and/or Qwen). SAM 2.1 runs
+in-process on the arm host and does not need a tunnel:
 
 ```powershell
-.\scripts\start_tunnel.ps1 qwen,sam
+.\scripts\start_tunnel.ps1 qwen
 # leave running, then from another terminal:
 curl http://127.0.0.1:8766/health
 ```

@@ -431,19 +431,19 @@ def test_measure_prefers_the_mask_when_box_given() -> None:
     assert obj.mask_area_px < 0.7 * box_area
 
 
-def test_unreachable_service_refuses_rather_than_measuring_the_box() -> None:
-    """A service outage stops the ladder; the weaker rungs would answer wrongly."""
+def test_sam_failure_refuses_rather_than_measuring_the_box() -> None:
+    """A SAM load/run failure stops the ladder; the weaker rungs would answer wrongly."""
     from mt4_vision import locate as mod
     from mt4_vision.locate import measure_with_box_fallback
     from mt4_vision.sam import SamError
 
     def down(*_a, **_k):
-        raise SamError("sam service unreachable at http://127.0.0.1:8767")
+        raise SamError("sam unavailable: missing torch")
 
     real = mod.sam_segment
     mod.sam_segment = down
     try:
-        with pytest.raises(LocateError, match="unreachable"):
+        with pytest.raises(LocateError, match="sam unavailable"):
             measure_with_box_fallback(
                 pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", box=pen_box(),
             )
@@ -506,12 +506,29 @@ def test_hint_off_frame_edge_refuses() -> None:
 # -- re-acquire ----------------------------------------------------------
 
 
+def _without_sam(fn):
+    """Relocate re-measures through a box, which calls SAM. Offline tests use
+    the desk-deviation rung instead of loading the model."""
+    from mt4_vision import locate as mod
+
+    real = mod._segment_sam
+    mod._segment_sam = lambda *a, **k: None
+    try:
+        return fn()
+    finally:
+        mod._segment_sam = real
+
+
 def test_relocate_finds_a_shifted_object() -> None:
     obj = measure(pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", win=PEN_WIN)
     moved = frame_with_bar(
         PEN_CX + 30.0, PEN_CY + 20.0, PEN_LONG_PX, PEN_SHORT_PX, PEN_ANGLE
     )
-    again = relocate(moved, obj, CALIB, win=PEN_WIN)
+
+    def run():
+        return relocate(moved, obj, CALIB, win=PEN_WIN)
+
+    again = _without_sam(run)
     assert again is not None
     assert abs(again.x - (PEN_CX + 30.0) * MM_PER_PX) < 6.0
     assert abs(again.y - (PEN_CY + 20.0) * MM_PER_PX) < 6.0
@@ -523,14 +540,18 @@ def test_relocate_returns_none_when_the_object_is_gone() -> None:
     acts on whatever position comes back."""
     obj = measure(pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", win=PEN_WIN)
     bare = np.full((FRAME_H, FRAME_W, 3), DESK, dtype=np.uint8)
-    assert relocate(bare, obj, CALIB, win=PEN_WIN) is None
+    assert _without_sam(lambda: relocate(bare, obj, CALIB, win=PEN_WIN)) is None
 
 
 def test_relocate_respects_its_score_floor() -> None:
     obj = measure(pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", win=PEN_WIN)
     same = pen_frame()
-    assert relocate(same, obj, CALIB, win=PEN_WIN, min_score=0.99) is not None
-    assert relocate(same, obj, CALIB, win=PEN_WIN, min_score=1.01) is None
+    assert _without_sam(
+        lambda: relocate(same, obj, CALIB, win=PEN_WIN, min_score=0.99)
+    ) is not None
+    assert _without_sam(
+        lambda: relocate(same, obj, CALIB, win=PEN_WIN, min_score=1.01)
+    ) is None
 
 
 # -- feasibility ---------------------------------------------------------

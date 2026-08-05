@@ -4,8 +4,8 @@
 # whichever one is active before starting the other. Deployed at ~/switch_vision_service.sh
 # (source of truth: services/switch_vision_service.sh in the mt4 repo).
 #
-# sam2.service is not part of the trade: SAM 2.1 small holds ~600MB including
-# its CUDA context, so it stays up alongside whichever of the two is running.
+# SAM 2.1 is not part of this trade: it runs in-process on the arm host
+# (mt4_vision.sam), not as a service on this card.
 set -euo pipefail
 
 DINO_SERVICE="grounding-dino.service"

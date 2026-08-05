@@ -339,7 +339,7 @@ def _segment_sam(
     *,
     margin_px: int = SAM_CROP_MARGIN_PX,
 ) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
-    """Foreground mask from a detector AABB, via the SAM 2.1 service.
+    """Foreground mask from a detector AABB, via in-process SAM 2.1.
 
     The box is a prompt, not a crop: the model sees the whole frame and answers
     with the object the box points at, so the mask may reach past the box on an
@@ -354,9 +354,9 @@ def _segment_sam(
     the single mask matched or beat the best-scoring of three, which on a binder
     clip took in the cable behind it and read 69.6 mm long against 39.4.
 
-    Raises :class:`mt4_vision.sam.SamError` if the service is unreachable, which
-    is a different thing from "no object in this box" and must stay that way --
-    one is worth falling back from, the other is worth stopping for.
+    Raises :class:`mt4_vision.sam.SamError` if the model cannot load or run,
+    which is a different thing from "no object in this box" and must stay that
+    way -- one is worth falling back from, the other is worth stopping for.
     """
     clipped = _clip_box(frame, x1, y1, x2, y2)
     if clipped is None:
@@ -966,7 +966,7 @@ def measure_sam(
     confidence: float = 1.0,
     object_height_mm: float | None = None,
 ) -> LocatedObject:
-    """Measure the object a detector AABB points at, via the SAM 2.1 service.
+    """Measure the object a detector AABB points at, via in-process SAM 2.1.
 
     Tighter than ``measure_box`` (the axis-aligned AABB itself) by as much as
     the object is not a rectangle; still refuses on empty or flooded masks.
@@ -1006,12 +1006,12 @@ def measure_with_box_fallback(
                 confidence=confidence, object_height_mm=object_height_mm,
             )
         except SamError as exc:
-            # An unreachable service is not "no object in this box". The rungs
+            # A SAM load/run failure is not "no object in this box". The rungs
             # below are weaker: the desk-deviation path cannot segment a
             # stapler at all, and the last one reports the box's own dimensions
             # as the object's (150x74 mm for a stapler, measured 2026-08-02).
             # Falling through would answer with one of those instead of saying
-            # the service is down.
+            # the model is unavailable.
             raise LocateError(f"cannot measure from a box: {exc}") from exc
         except LocateError:
             pass
@@ -1092,9 +1092,9 @@ def relocate_detail(
     first place is permanently un-re-acquirable: registration succeeds, and
     every attempt to act on it is refused.
 
-    This is the one path here that reaches the SAM service without a model
-    having asked for anything, so a re-acquire fails while the service is down
-    even though the object was registered when it was up.
+    This is the one path here that reaches SAM without a detector having asked
+    for anything, so a re-acquire fails when the model cannot load even though
+    the object was registered earlier in the same process.
     """
     th, tw = obj.template.shape[:2]
     if th < 2 or tw < 2:
