@@ -671,7 +671,7 @@ class TaskWorker:
             if action.kind == "REPORT":
                 # Not terminal. The rows carry the arm's verdict on every
                 # object the model boxed -- reach, keep-out, ground, the desk
-                # edge, jaw width -- and handing them to the next step is the
+                # edge, the grasp plan -- and handing them to the next step is the
                 # only way anything the arm knows gets back to the model.
                 findings = self._report(obs, action, instruction, step)
                 history.append(I.report_recap(obs, findings))
@@ -742,7 +742,7 @@ class TaskWorker:
                         grasp = entity.as_grasp(obs.calib)
                     else:
                         # The physical gate, quoted verbatim. It names reach,
-                        # the J1 keep-out, ground Z, jaw clearance or the desk
+                        # the J1 keep-out, ground Z, the grasp plan or the desk
                         # polygon -- the useful answer, and the only thing here
                         # entitled to override the model.
                         trouble = f"cannot pick it up: {entity.reason}"

@@ -139,17 +139,6 @@ class LocatedObject:
     # desk that had a green statue on it -- see entities.object_entity.
     color: str | None = None
 
-    def footprint_offset_mm(self, calib) -> tuple[float, float]:
-        """Height correction applied to the centroid, as a plane offset.
-
-        ``x``/``y`` are unprojected at the object's assumed height; the mask is
-        in raw pixels. Grasp planning maps mask pixels through the table plane
-        and then shifts them by this, so a planned point lands in the same
-        frame of reference the rest of the stack uses for this object.
-        """
-        rx, ry = calib.pixel_to_robot(self.px, self.py)
-        return self.x - float(rx), self.y - float(ry)
-
     def as_dict(self) -> dict[str, object]:
         return {
             "label": self.label,
@@ -1147,16 +1136,20 @@ def grasp_feasibility(
 ) -> tuple[bool, str | None]:
     """Can the arm actually take this object? Returns (ok, reason-if-not).
 
-    Reuses the workspace predicates rather than restating them, and adds the
-    two checks specific to a non-cube: the jaws must be able to span its short
-    axis, and a wrist angle must exist that closes across its long axis.
+    Reuses the workspace predicates rather than restating them, and adds the one
+    check specific to a non-cube: a wrist angle must exist that closes across its
+    long axis.
+
+    Nothing here tests the object's width. The gripper servo stops on
+    resistance, so closing on something too wide costs nothing, and the only
+    width vision can offer is a *silhouette* width -- which on this oblique mount
+    spans an object's top and its near side face together and reads far too wide
+    for anything tall. Measured on the live stapler 2026-08-05: 50mm across a
+    body the 35mm of usable jaw could plausibly have taken.
     """
     region = work_region_block_reason(obj.x, obj.y, calib)
     if region is not None:
         return False, region
-    span = jaw_span_block_reason(obj.short_mm, calib)
-    if span is not None:
-        return False, span
     if is_compact(obj.long_mm, obj.short_mm):
         # Near-square: jaw orientation is not load-bearing (90° period).
         return True, None
@@ -1166,72 +1159,28 @@ def grasp_feasibility(
 
 
 def plan_object_grasp(obj: LocatedObject, calib: Calibration):
-    """Best jaw placement on ``obj``, or (None, why not).
+    """Jaw placement on ``obj``: its own centre, across its narrow axis.
 
-    Falls back to the outline when no silhouette was stored -- ``measure_box``
-    has no mask, and neither do objects measured before the mask was carried --
-    so the answer degrades to "close across the short axis at the centroid"
-    rather than to a refusal.
+    The point is ``obj.x``/``obj.y``, which is the mask's centre of mass
+    unprojected from ``cube_height_mm`` onto the table -- see
+    :func:`_height_corrected`. Only the angle and the two extents come from the
+    silhouette's shape.
+
+    Falls back to the outline's own ``minAreaRect`` when no silhouette was stored
+    -- ``measure_box`` has no mask, and neither do duck-typed objects -- so the
+    answer degrades to the short axis at the centre.
+
+    The only refusal is the mask-noise floor in :func:`grasp.plan_grasp`. Width
+    is reported, never gated: see :func:`grasp_feasibility`.
     """
     from mt4_vision.grasp import GraspPlan, footprint_mm, plan_grasp
 
-    span = _span_mm(calib, int(calib.grip_open_s))
-    if span is None:
-        # Nothing to plan against. Keep the historical behaviour rather than
-        # inventing a jaw width -- see jaw_span_block_reason.
-        return GraspPlan(
-            x=obj.x, y=obj.y, yaw_deg=obj.axis_yaw_deg,
-            width_mm=obj.short_mm, length_mm=obj.long_mm, offset_mm=0.0,
-        ), ""
     mask = getattr(obj, "mask", None)
     if mask is None or getattr(mask, "size", 0) == 0:
-        reason = jaw_span_block_reason(obj.short_mm, calib)
-        if reason is not None:
-            return None, reason
         return GraspPlan(
             x=obj.x, y=obj.y, yaw_deg=obj.axis_yaw_deg,
-            width_mm=obj.short_mm, length_mm=obj.long_mm, offset_mm=0.0,
+            width_mm=obj.short_mm, length_mm=obj.long_mm,
         ), ""
-    pts = footprint_mm(
-        obj.mask, obj.mask_origin_px, calib,
-        offset_mm=obj.footprint_offset_mm(calib),
+    return plan_grasp(
+        footprint_mm(obj.mask, obj.mask_origin_px, calib), x=obj.x, y=obj.y
     )
-    return plan_grasp(pts, max_span_mm=span)
-
-
-def jaw_span_block_reason(short_mm: float, calib: Calibration) -> str | None:
-    """"Too wide for the jaws" in prose, or None. The single width test.
-
-    Lives here so ``grasp_feasibility`` (CLI, MCP server) and
-    ``entities.object_entity`` (the policy loop) cannot drift into two
-    different answers about whether the arm can hold something -- which they
-    had, because ``object_entity`` had no width test at all.
-
-    Silent when ``grip_span_s_*`` are unmeasured, which is a deliberate
-    fail-open: inventing a jaw width would refuse real objects on a rig whose
-    gripper nobody has measured. It is not a safe default, only the least
-    wrong one, and it is why measuring the span matters. Measured on this rig
-    2026-08-02 by photographing the jaws at table height across S 140..230:
-    ``span_mm = (205.0 - S) / 1.797``, so 36mm at ``grip_open_s`` = 140.
-
-    Note ``short_mm`` is a *silhouette* width and reads wide for anything with
-    height on this oblique mount, so the comparison already errs toward
-    refusing. That is the right direction: closing on air is the failure with
-    no detector.
-    """
-    span_open = _span_mm(calib, int(calib.grip_open_s))
-    if span_open is None or short_mm <= span_open:
-        return None
-    return (
-        f"it measures {short_mm:.0f}mm across the grasp and the jaws open to "
-        f"{span_open:.0f}mm -- they would close beside it, not on it"
-    )
-
-
-def _span_mm(calib: Calibration, s: int) -> float | None:
-    """Jaw span (mm) at gripper value ``s``, or None when uncalibrated."""
-    at_zero = calib.grip_span_s_at_zero_mm
-    per_mm = calib.grip_span_s_per_mm
-    if at_zero is None or per_mm is None or per_mm == 0:
-        return None
-    return (float(at_zero) - float(s)) / float(per_mm)

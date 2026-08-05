@@ -587,27 +587,15 @@ def test_infeasible_past_the_cameras_coverage() -> None:
     assert ok_side, "a 240mm radius cap refuses this; the camera sees it fine"
 
 
-def test_infeasible_wider_than_the_jaws_open() -> None:
+def test_width_never_refuses_a_grasp() -> None:
+    """No width gate anywhere. The jaws open to ~64mm under this model and an
+    80mm silhouette is still feasible: the servo stops on resistance, and a
+    silhouette width reads wide for anything tall (the live stapler measured
+    50mm across on 2026-08-05, wider than the jaws, gripped fine)."""
     calib = _span_calib()
-    # Jaws open to (285-140)/2.25 ~ 64mm.
-    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=40.0), calib)
-    assert ok
-    ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=80.0), calib)
-    assert not ok
-    # The wording comes from locate.jaw_span_block_reason, the one place the
-    # width test lives now -- entities.object_entity shares it, so the policy
-    # loop and the MCP server cannot disagree about what the jaws can hold.
-    assert "80mm" in reason and "64mm" in reason
-
-
-def test_too_open_check_is_skipped_when_uncalibrated() -> None:
-    """Without the measured jaw model there is no jaws-open limit to compare
-    against, and inventing one would refuse valid grasps. Closing too FAR on a
-    wide object only squeezes, which the jaws tolerate."""
-    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=80.0), RIG_CALIB)
-    assert ok
-    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=17.0), RIG_CALIB)
-    assert ok
+    for short in (9.0, 40.0, 80.0):
+        ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=short), calib)
+        assert ok, f"{short}mm refused: {reason}"
 
 
 def test_narrow_object_allowed_when_the_jaw_model_is_uncalibrated() -> None:

@@ -813,7 +813,7 @@ def test_tag_at_names_a_tag_underfoot_and_nothing_further_off():
 #
 # "Find all the pickable objects" has no answer in prose. Which things the arm
 # can take depends on reach, the J1 keep-out, ground Z, the desk polygon and the
-# jaw width, and a model looking at a photograph can see none of them. So the
+# grasp plan, and a model looking at a photograph can see none of them. So the
 # answer is one box per object and the stack measures each and runs the real
 # gate.
 #
@@ -1011,7 +1011,7 @@ def test_the_decision_schema_names_no_object_list():
 
 def test_the_enumeration_prompt_carries_the_task_and_forbids_pre_filtering():
     """The one thing the model must not do here. Reach, the keep-out, the desk
-    edge and the jaw width decide what can be picked up and none is in the
+    edge and the grasp plan decide what can be picked up and none is in the
     photograph -- and the decision prompt's own attempt at a list came back
     reasoning that "the red cube is the only object ... that can be picked up",
     which is the model ruling on geometry it cannot see."""

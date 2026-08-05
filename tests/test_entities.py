@@ -309,42 +309,22 @@ def test_object_entity_is_long_axis_periodic() -> None:
     assert obj.pickable and obj.reason is None
 
 
-def test_object_wider_than_the_jaws_is_not_pickable() -> None:
-    """The gap that let a 75mm stapler through.
+def test_a_wide_object_is_still_pickable() -> None:
+    """Width is reported, never gated.
 
-    ``grasp_feasibility`` has had a width test for a while, but only the MCP
-    server and the CLI call it -- ``object_entity`` had none, and the policy
-    loop acts on ``object_entity``. Measured live 2026-08-02: the loop reported
-    obj_1 pickable at 150x75mm, the 36mm jaws closed beside the stapler, and
-    the run went on to report a successful pick and then DONE.
+    The gripper servo stops on resistance, so closing on something too wide
+    costs nothing, and the width vision can offer is a *silhouette* width --
+    measured on the live stapler 2026-08-05, 50mm across a body the 35mm of
+    usable jaw could plausibly have taken. Refusing on that number loses real
+    objects. See locate.grasp_feasibility.
     """
-    from dataclasses import replace
-
-    from mt4_vision.entities import object_entity
-
-    # The rig, plus the jaw model measured on it: span = (205 - S) / 1.797,
-    # so 36mm at grip_open_s = 140.
-    calib = replace(CALIB, grip_span_s_at_zero_mm=205.0, grip_span_s_per_mm=1.797)
-    sc = replace(scene([]), calib=calib)
-
-    narrow = object_entity(FakeObject(213.4, -58.1, short_mm=20.0), 1, scene=sc)
-    assert narrow.pickable and narrow.reason is None
-
-    wide = object_entity(FakeObject(213.4, -58.1, short_mm=75.0), 1, scene=sc)
-    assert not wide.pickable
-    assert "75mm" in wide.reason and "36mm" in wide.reason
-
-
-def test_object_width_gate_is_silent_without_the_jaw_model() -> None:
-    """Fail-open when unmeasured, on purpose: inventing a jaw width would
-    refuse real objects on a rig whose gripper nobody has measured. It is the
-    least wrong default, not a safe one -- see locate.jaw_span_block_reason."""
     from mt4_vision.entities import object_entity
 
     sc = scene([])
-    assert sc.calib.grip_span_s_at_zero_mm is None
-    wide = object_entity(FakeObject(213.4, -58.1, short_mm=75.0), 1, scene=sc)
-    assert wide.pickable
+    for short_mm in (9.0, 20.0, 75.0):
+        ent = object_entity(FakeObject(213.4, -58.1, short_mm=short_mm), 1, scene=sc)
+        assert ent.pickable, f"{short_mm}mm refused: {ent.reason}"
+        assert ent.grip_mm == short_mm
 
 
 def test_cube_entity_is_square_periodic() -> None:
@@ -458,12 +438,18 @@ def test_as_grasp_carries_yaw_and_period() -> None:
     assert g.grip_close_s == GRIPPER_S_CLOSED
 
 
-def test_compact_object_uses_square_yaw_period() -> None:
+def test_even_a_near_square_object_is_long_axis_periodic() -> None:
+    """A yaw that is a major axis is 180°-periodic whatever the aspect ratio.
+
+    The 90° square lattice is for a cube face, where a quarter turn is the same
+    grasp. Applied to a major axis it commands a wrist a quarter turn away for
+    half of all angles, which closes the jaws along the object.
+    """
     sn = snap([], objects=[FakeObject(200.0, 0.0, long_mm=22.0, short_mm=20.0)])
     obj = sn.get("obj_1")
     assert obj is not None
-    assert obj.yaw_period_deg == YAW_PERIOD_SQUARE
-    assert obj.as_grasp().yaw_period_deg == YAW_PERIOD_SQUARE
+    assert obj.yaw_period_deg == YAW_PERIOD_LONG_AXIS
+    assert obj.as_grasp().yaw_period_deg == YAW_PERIOD_LONG_AXIS
 
 
 def test_as_grasp_opens_fully_and_closes_fully_on_objects() -> None:

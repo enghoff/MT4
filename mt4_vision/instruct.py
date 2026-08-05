@@ -29,7 +29,7 @@ it.** Three rules follow from that, and every one of them is load-bearing:
   object, and each box is measured and put to the pick gates exactly as a
   PICK's is (:func:`measure_report`). That is how "find all the pickable
   objects" gets a true answer: which things the arm can take is a fact about
-  reach, the keep-out, the desk edge and the jaw width, none of which is
+  reach, the keep-out, the desk edge and the grasp plan, none of which is
   visible in the photograph the model is looking at. The list needs its own
   call because a schema listing ``box_2d`` first collapses it to one object,
   and listing the list first sends a TRANSFER's *destination* into the pick
@@ -50,7 +50,7 @@ it.** Three rules follow from that, and every one of them is load-bearing:
 **What refuses, and why that is not second-guessing.** The measurement must
 survive segmentation, the two-window stability check and the plausibility band,
 and the resulting pose must clear reach, the J1 keep-out, ground Z, the
-jaw-width plan and the desk edge (``entities.object_entity``). Those gates read
+grasp plan and the desk edge (``entities.object_entity``). Those gates read
 geometry, never the model's judgement about *what* a thing is. They are what
 makes trusting the rest safe: nothing here can command a pose the envelope
 would reject.
@@ -252,7 +252,7 @@ class Observation:
     # whether to explain refusals at all.
     history: tuple[str, ...] = ()
     # The detections the snapshot was built from. Passed to ``object_entity``
-    # for the calibration it carries, which the reach test and the jaw-width
+    # for the calibration it carries, which the reach test and the grasp
     # plan both need; its cube list is not read on this path. Never reaches
     # the prompt.
     scene: Any = None
@@ -985,7 +985,7 @@ def measure_report(obs: Observation, action: "Action") -> tuple[Finding, ...]:
     it on, at ``calib.cube_height_mm`` rather than a height read off the silhouette
     (see :func:`measure_source` for what inferring it costs). Then
     :func:`source_entity`, which is where reach, the J1 keep-out, ground Z, the
-    desk polygon and the jaw-width plan live.
+    desk polygon and the grasp plan live.
 
     Running the real gate is the whole point of answering with boxes instead of
     prose. "Can the arm pick this up" is geometry the model cannot see, so the
@@ -1021,7 +1021,7 @@ def report_recap(obs: Observation, findings: Sequence["Finding"]) -> str:
 
     This is the only channel by which the model ever learns a physical fact
     about this desk. Every row carries the verdict of ``object_entity`` --
-    reach, the J1 keep-out, ground Z, the desk polygon and the jaw-width plan --
+    reach, the J1 keep-out, ground Z, the desk polygon and the grasp plan --
     which is exactly what the prompt tells it it cannot see in a photograph. A
     report that ends the task throws all of it away.
 
@@ -1046,7 +1046,7 @@ def refusal_recap(
     """A refused attempt as a history line. ``end`` is "source" or "destination".
 
     Without this the model is blind to every gate: history records only
-    completed motions, so a step refused for reach or jaw width leaves no trace
+    completed motions, so a step refused for reach or a grasp plan leaves no trace
     and the next decision is made as if it had never happened. Live, one
     out-of-reach blob was chosen twice running and refused at r=367mm and then
     r=373mm -- one problem, tried again because nothing had said it was a
@@ -1071,13 +1071,13 @@ def source_entity(obs: Observation, obj: Any, *, eid: str = "obj_1") -> Entity:
     """The measured object as an entity, so the pick gate is the shared one.
 
     ``object_entity`` is where reach, the J1 keep-out, ground Z, the desk
-    polygon, the jaw-width plan and neighbour clearance all live, and it is the
+    polygon, the grasp plan and neighbour clearance all live, and it is the
     same function the MCP registration path uses. Routing through it rather
     than re-deriving a pick test here is the reason a box from the model cannot
     command a pose the envelope would have refused.
 
     ``obs.scene`` is passed for the calibration it carries, which the reach
-    test and the jaw-width plan both need. The neighbour check it could also
+    test and the grasp plan both need. The neighbour check it could also
     feed is off here: it counts only ``scene.cubes``, so it refuses a grasp
     beside a cube and permits the identical grasp beside a pen, and this loop
     never tells the model that cubes are a category. A veto the model cannot
