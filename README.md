@@ -228,6 +228,43 @@ supervision, remote access, HTTP API, troubleshooting:
 [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md). Everything else in this repo
 works without it.
 
+### Telling the arm what to do in English
+
+A second, optional GPU service wraps `Qwen/Qwen3-VL-4B-Instruct`. `ask_qwen.py`
+hands it one frame and one typed instruction, and it answers with the single
+next action and a box around the thing to act on. Cube pick/place, calibration,
+stacking and the MCP tools all work with this service absent.
+
+```powershell
+python ask_qwen.py                                  # interactive prompt + window
+python ask_qwen.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
+python ask_qwen.py "find all the pickable objects"  # a report, nothing moves
+python ask_qwen.py --dry-run "pick up the stapler"  # decide, never move
+```
+
+The model is the eyes and nothing else. It gets the frame and the decoded ArUco
+tag numbers — a tag's printed number is the one thing no vision-language model
+can read off an image — and every other object on the desk is its job to see.
+No cube list, no object registry, no preprocessing of what you type. A target
+comes back as a box, which GrabCut turns into a position, a size and a wrist
+angle in millimetres; reach, the J1 keep-out, ground Z, jaw clearance and the
+desk polygon are all checked before the gripper opens.
+
+A task that asks *what is on the desk* rather than for something to be moved is
+answered the same way, one box per object — from a second call whose only job is
+to enumerate, which on a nine-cube desk returns all nine where asking the
+decision prompt for a list returned one. Each object is measured and put to those
+same gates, so every row carries a position, the width the jaws will close
+across, and either "pickable" or the gate that stopped it — the arm's verdict,
+not the model's, because what the arm can reach and how wide its jaws open are
+not visible in a photograph.
+
+The window shows the exact frame each decision was made from with the model's
+own answer drawn on it, so a wrong answer about a frame the arm was blocking
+looks different from a wrong answer about a clean one. Setup, commands, and the
+measured coordinate-space and accuracy findings:
+[docs/QWEN3-VL.md](docs/QWEN3-VL.md).
+
 ## MCP server
 
 `mt4_mcp` exposes the arm to any MCP client over Streamable HTTP or stdio.
@@ -427,7 +464,7 @@ Full hardware detail (board, drivers, flash path) is in
 |------|---------|
 | [firmware/mt4_jog/](firmware/mt4_jog/) | Custom Arduino firmware: `config`/`pins`/`gripper`/`dda`/`motion`/`homing`/`commands`/`kinematics` |
 | [mt4_jog/](mt4_jog/) | Python client library: serial protocol, joint map, kinematics, gamepad |
-| [mt4_vision/](mt4_vision/) | Vision + motion: calibration, detection, entity table, grounding, grasp/place primitives, path planning, preview |
+| [mt4_vision/](mt4_vision/) | Vision + motion: calibration, detection, entity table, grounding, VLM client, grasp/place primitives, path planning, preview |
 | [mt4_mcp/](mt4_mcp/) | MCP server (HTTP or stdio) + OAuth |
 | [services/grounding_dino/](services/grounding_dino/) | Grounding DINO GPU service (deployed to a separate host) |
 | [scripts/](scripts/) | Diagnostics (`diagnose_pick_accuracy.py`, `validate_scene_live.py`), ngrok + grounding-tunnel launchers |
@@ -437,9 +474,10 @@ Full hardware detail (board, drivers, flash path) is in
 
 Key `mt4_vision` modules: `calib` (calibration + pixel↔robot transforms),
 `detect`/`scene` (cube detection), `entities` (the addressable snapshot),
-`locate`/`grounding` (non-cube objects), `motion`/`pickplace` (grasp and place
-primitives), `stackpath`/`landing`/`workspace` (path and site planning),
-`preview` (annotated overlay).
+`locate`/`grounding` (non-cube objects), `qwen` (VLM question-answering),
+`motion`/`pickplace` (grasp and place primitives),
+`stackpath`/`landing`/`workspace` (path and site planning),
+`preview` (annotated overlay), `console` (bottom-pinned interactive UI).
 
 ## Tests
 
@@ -473,6 +511,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | [docs/OAUTH_CHATGPT.md](docs/OAUTH_CHATGPT.md) | OAuth 2.1 via Google + ngrok for public MCP access |
 | [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md) | Grounding DINO server setup: GPU-host install, WSL2 prerequisites, systemd unit, SSH tunnel, HTTP API, troubleshooting |
 | [services/grounding_dino/README.md](services/grounding_dino/README.md) | What the deployed service files are, and the day-to-day detect commands |
+| [docs/QWEN3-VL.md](docs/QWEN3-VL.md) | Qwen3-VL service: start/stop, HTTP API, SSH tunnel, the `ask_qwen.py` harness, measured coordinate space and accuracy |
 | [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf) | Printable marker sheet (DICT_4X4_50) |
 | [firmware/mt4_jog/src/main.cpp](firmware/mt4_jog/src/main.cpp) | Full serial protocol reference (header comment) |
 | [CLAUDE.md](CLAUDE.md) | Agent instructions: hardware autonomy, primary tools, typical failure patterns |

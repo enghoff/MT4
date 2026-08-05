@@ -1,0 +1,13 @@
+torch
+torchvision
+transformers
+accelerate
+# int4 weight-only quantization (QWEN_VL_QUANT=int4, the default) -- the only
+# 4-bit backend here that transformers will also compile.
+torchao
+# Still needed for QWEN_VL_QUANT=nf4, kept as the fallback backend.
+bitsandbytes
+fastapi
+uvicorn[standard]
+pillow
+python-multipart

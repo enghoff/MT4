@@ -27,8 +27,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import dataclasses
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -44,11 +47,86 @@ class CalibrationError(Exception):
     """Raised when calibration data is missing, unloadable, or degenerate."""
 
 
+def _is_empty(value: object) -> bool:
+    """Does this field carry no measurement?
+
+    Empty containers count. ``color_xy_offset_mm={}`` is how that field is
+    cleared, and a caller that writes ``{}`` over a measured set of offsets has
+    lost exactly as much as one that writes ``None``.
+    """
+    return value is None or (isinstance(value, (dict, list, tuple)) and not value)
+
+
+def update_calibration(
+    path: Path = DEFAULT_CALIB_PATH,
+    *,
+    based_on: "Calibration | None" = None,
+    clearing: Sequence[str] = (),
+    **fields: Any,
+) -> "Calibration":
+    """Merge measured fields into the file **as it stands now**, and save.
+
+    Every calibration script here has the same shape::
+
+        calib = load_calibration(path)   # t0
+        ... minutes of driving the arm ...
+        calib.save(path)                 # t1
+
+    ``Calibration`` is a mutable dataclass, so that last line writes back the
+    *whole* object -- which is the file as it was at t0, plus this script's
+    edits. Anything written between t0 and t1 is silently reverted. The gaps
+    are not small: 98 lines of cube sweeping in ``calibrate_camera_nadir``,
+    106 in ``calibrate_height``, 69 in ``calibrate_table_edge``. Worse,
+    ``calibrate_height`` saves *repeatedly during* its run, so every one of
+    those writes reverts the file to its t0 state again.
+
+    Measured 2026-08-03: ``calibrate_camera_nadir.py`` was run, wrote
+    ``cam_xy_robot`` and ``cam_height_mm``, and both were null again by the end
+    of the morning -- for the second time that day. Nothing reported an error,
+    because nothing was wrong from any single script's point of view.
+
+    So a script must not write the whole object. It re-reads the file at write
+    time and lays only what it measured on top. ``Calibration.save``'s
+    drop-check still runs underneath, which is what catches a merge that would
+    still lose something.
+
+    ``based_on`` is the calibration the caller actually computed against. If the
+    table map has changed underneath it, this says so -- the numbers being
+    written were derived from a different map, and merging them is arithmetic
+    the caller has to agree to.
+    """
+    current = load_calibration(path)
+    if based_on is not None and based_on.homography != current.homography:
+        print(
+            f"WARNING: {path} has been re-fit since this run loaded it. The "
+            "values about to be written were measured against the previous "
+            "table map, so they may not describe the current one. Re-run this "
+            "calibration if the camera or the arm moved.",
+            file=sys.stderr,
+        )
+    merged = dataclasses.replace(current, **fields)
+    merged.save(path, clearing=clearing)
+    return merged
+
+
+def cleared_fields(previous: dict, incoming: dict) -> list[str]:
+    """Field names that held a value in ``previous`` and hold none in ``incoming``.
+
+    Compares the two dicts rather than two ``Calibration`` objects, so a field
+    added to the dataclass after an old file was written is not reported as
+    lost -- it was never there.
+    """
+    return sorted(
+        k for k, v in previous.items()
+        if not _is_empty(v) and _is_empty(incoming.get(k))
+    )
+
+
 # One-shot per process: a table-plane recalibration clears
-# cube_top_homography (correctly -- it was fit at the old camera pose), and
-# nothing downstream failed when the refit was skipped; picks just silently
-# regained 15-30mm of parallax error. Warn at use time so every entry path
-# (recalibrate script, manual JSON edits, backup restores) is covered.
+# cube_top_homography (correctly -- that fit belongs to the camera pose it was
+# measured at), and nothing downstream fails when the refit is skipped; picks
+# silently carry 15-30mm of parallax error. Warn at use time so every entry
+# path (recalibrate script, manual JSON edits, backup restores) is covered.
 _warned_no_cube_top_correction = False
 
 
@@ -147,10 +225,6 @@ class Calibration:
     # default; assumes firmware ``j4zero`` (``calibrate_j4.py``) so world
     # J4 = 0 means jaws along the arm.
     face_align_picks: bool = True
-    # Pixel-space convex hull of the marker centers. Kept for the overlay and
-    # for older calibrations; no longer a pick/place gate -- see
-    # workspace.in_work_region for what replaced it and why.
-    workspace_hull_px: list[list[float]] | None = None
     # Desk surface as a polygon in ROBOT frame (mm), safety margin already
     # applied. Written by calibrate_table_edge.py. This is the answer to "is
     # there anything there to set an object down on", which the marker hull
@@ -263,7 +337,56 @@ class Calibration:
             float((w * deltas[:, 1]).sum() / denom),
         )
 
-    def save(self, path: Path = DEFAULT_CALIB_PATH) -> None:
+    def save(
+        self, path: Path = DEFAULT_CALIB_PATH, *, clearing: Sequence[str] = ()
+    ) -> None:
+        """Write the calibration, refusing to silently drop a measured value.
+
+        Most fields here cost arm time to measure and are used by code that
+        fails **open** when they are missing -- ``grip_s_for_span_mm`` warns
+        once and carries on, ``locate`` drops its parallax correction,
+        ``pixel_to_robot`` falls back to the flat table map. So a field that
+        quietly reverts to ``None`` does not break anything; it degrades
+        everything, silently, until someone notices weeks later.
+
+        A partial rebuild is the sharp case: a script that constructs a fresh
+        ``Calibration`` and names only the fields it measured leaves every
+        other field on its dataclass default. ``grip_span_s_at_zero_mm`` =
+        212.3 and ``grip_span_s_per_mm`` = 1.881 go that way -- the jaw-opening
+        model, a property of the *gripper*, which a camera recalibration has no
+        business touching, and with it gone the width refusal switches itself
+        off. The camera nadir and height are the fields such a script does mean
+        to clear.
+
+        Hence: **losing a value must be stated, not defaulted.** Pass the field
+        names in ``clearing`` when a script means to invalidate them, and this
+        raises otherwise. Adding a field to ``Calibration`` later cannot
+        re-open the hole, because the check reads whatever is on disk rather
+        than a list someone has to remember to extend.
+        """
+        path = Path(path)
+        if path.exists():
+            try:
+                # utf-8-sig: at least one archived calibration carries a BOM,
+                # and a parse failure here must not be the thing that turns the
+                # check off.
+                previous = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError) as exc:
+                raise CalibrationError(
+                    f"cannot read the existing {path} to check what this save "
+                    f"would drop: {exc}. Move it aside if it is truly junk"
+                ) from exc
+            allowed = set(clearing)
+            lost = [f for f in cleared_fields(previous, self.__dict__)
+                    if f not in allowed]
+            if lost:
+                had = ", ".join(f"{f}={previous[f]!r}" for f in lost)
+                raise CalibrationError(
+                    f"this save would drop {len(lost)} measured value(s) from "
+                    f"{path}: {had}. Carry them over (dataclasses.replace on "
+                    "the loaded calibration is the safe way), or say the loss "
+                    f"is deliberate with save(clearing={tuple(lost)!r})"
+                )
         path.write_text(json.dumps(self.__dict__, indent=2), encoding="utf-8")
 
 
@@ -318,8 +441,8 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> Calibration:
             f"no calibration at {path} -- run: python calibrate_vision.py"
         )
     data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    # Ignore unknown / retired keys (e.g. removed j4_face_offset_deg) so old
-    # JSON files still load; the next save drops them.
+    # Ignore keys that are not fields (e.g. j4_face_offset_deg) so a
+    # calibration file carrying them still loads; the next save drops them.
     known = {f.name for f in fields(Calibration)}
     return Calibration(**{k: v for k, v in data.items() if k in known})
 

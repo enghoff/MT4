@@ -2,7 +2,7 @@
 """Manual J4 origin calibration via firmware ``j4zero``.
 
 J4 has no home switch: its step counter starts at 0 wherever the wrist sat
-at boot (and used to be wiped again on every ``home``). Face-aligned picks
+at boot. Face-aligned picks
 need a known relationship between "jaws along the arm" and world-frame J4.
 
 This script parks the TCP on the arm axis (y=0), lets the operator jog until

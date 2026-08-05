@@ -13,7 +13,7 @@ extern "C" {
 
 /* +1 if positive step count increases firmware joint angle, -1 if inverted.
  * J3 confirmed inverted 2026-07-06: a +299-step probe raised the forearm
- * tip instead of lowering it as the old -1.0 sign predicted (photo-confirmed). */
+ * tip rather than lowering it, which is what -1.0 predicts (photo-confirmed). */
 #define MT4_J1_STEP_SIGN 1.0f
 #define MT4_J2_STEP_SIGN (-1.0f)
 #define MT4_J3_STEP_SIGN 1.0f

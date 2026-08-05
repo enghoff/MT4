@@ -26,21 +26,20 @@ COLOR_RANGES: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]]
     "blue": [((90, 100, 60), (128, 255, 255))],
 }
 # Reject blobs smaller than this (px^2) -- noise, shadows, cable ties.
-# At the closer overhead mount (post-2026-07-20), real cube blobs are
-# ~1600-3600px^2 (the old far-mount range was ~150-650, hence the old 120
-# floor). Keep a 2x margin below the smallest real cube: sub-cube blobs are
-# never cubes here, and 120 let a 263px^2 specular glare on a laminated
-# marker (reflecting the wall) pass as a blue cube -- calibrate_height then
-# "picked" and "placed" that phantom and recorded its pixels as probe data.
+# At this overhead mount real cube blobs are ~1600-3600px^2 (measured
+# 2026-07-20). Keep a 2x margin below the smallest real cube: sub-cube blobs
+# are never cubes here, and a floor near 120 lets a 263px^2 specular glare on
+# a laminated marker (reflecting the wall) pass as a blue cube -- which
+# calibrate_height then "picks" and "places", recording the phantom's pixels
+# as probe data.
 MIN_BLOB_AREA = 800.0
 # Reject blobs larger than this -- the arm's own orange/red body still reads
-# as "red", but after moving the camera closer a real on-pad cube is
-# ~2800-3600px^2 (measured 2026-07-20) while the old MAX of 900 dropped
-# it as "too big" and left only arm-paint flecks. Arm-scale blobs that
-# survive are still rejected downstream by keep-out / marker-hull / reach
-# (scene.is_phantom_detection). detect_cubes sorts largest-first, so this
-# cap still matters when an uncapped wall/arm smear would otherwise
-# outrank every cube.
+# as "red", but a real on-pad cube is ~2800-3600px^2 (measured 2026-07-20), so
+# a cap anywhere near cube size drops the cube as "too big" and leaves only
+# arm-paint flecks. Arm-scale blobs that survive are still rejected downstream
+# by keep-out / reach / work region (scene.is_phantom_detection). detect_cubes
+# sorts largest-first, so this cap still matters when an uncapped wall/arm
+# smear would otherwise outrank every cube.
 MAX_BLOB_AREA = 6000.0
 # Reject blobs whose bounding-box aspect is far from square (cubes are square
 # from above; this drops elongated glare streaks and desk-edge artifacts).
@@ -257,15 +256,101 @@ def _robot_edge_yaw_deg(
     return math.degrees(math.atan2(dy, dx))
 
 
+def color_ranges_for(calibration: Calibration | None) -> dict[str, list]:
+    """The named HSV bands in force, defaults overlaid with the calibration's.
+
+    One place, because ``classify_color`` and ``detect_cubes`` must agree about
+    what "green" is: ``instruct`` refuses a task when a named colour
+    contradicts an entity's, and a colour that meant one thing for a cube and
+    another for a statue would refuse correct answers.
+    """
+    ranges: dict[str, list] = dict(COLOR_RANGES)
+    if calibration is not None:
+        ranges.update(calibration.color_ranges)
+    return ranges
+
+
+def band_mask(hsv: np.ndarray, bands: list) -> np.ndarray:
+    """Union of one colour's HSV bands. Red needs two -- it wraps the hue axis."""
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lo, hi in bands:
+        mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+    return mask
+
+
+# A colour must own this much of the sampled pixels to be claimed, and beat the
+# runner-up by this margin. Both are deliberately blunt: the answer this
+# function must get right is "I don't know", not "which of two greens". A
+# stapler is grey plastic and chrome and matches nothing; a two-tone toy
+# matches two things weakly; wood desk leaking into a loose mask matches
+# nothing. All three have to come back None, because the caller turns a colour
+# into a word that a task is then *refused* against.
+COLOR_MIN_SHARE = 0.35
+COLOR_MARGIN = 0.15
+
+
+def classify_color(
+    frame: np.ndarray,
+    mask: np.ndarray | None = None,
+    origin: tuple[int, int] = (0, 0),
+    calibration: Calibration | None = None,
+) -> str | None:
+    """Which named colour is this region, or None when it is not clearly one.
+
+    The **same** named HSV bands ``detect_cubes`` uses, including any override
+    in ``Calibration.color_ranges``, so "green" means one measured thing across
+    the whole stack rather than one thing for a cube and another for a statue.
+    That shared meaning is the entire point: ``instruct`` refuses a task when a
+    named colour contradicts an entity's own, and a colour word that meant
+    something slightly different for registered objects would refuse correct
+    answers instead.
+
+    ``mask`` is the object's silhouette (as ``locate`` stores it) with its
+    top-left at ``origin`` in frame pixels. Without one, the middle of ``frame``
+    is sampled instead -- a detector box's centre is overwhelmingly object,
+    and anything the desk leaks in matches no band and pushes the answer
+    toward None, which is the safe direction.
+    """
+    ranges = color_ranges_for(calibration)
+
+    if mask is not None and mask.size:
+        h, w = mask.shape[:2]
+        x0, y0 = int(origin[0]), int(origin[1])
+        crop = frame[y0 : y0 + h, x0 : x0 + w]
+        if crop.shape[:2] != (h, w):  # mask ran off the frame edge
+            mask = mask[: crop.shape[0], : crop.shape[1]]
+        sel = mask.astype(bool)
+    else:
+        h, w = frame.shape[:2]
+        # Central half by each side, i.e. the middle quarter by area.
+        crop = frame[h // 4 : h - h // 4, w // 4 : w - w // 4]
+        sel = np.ones(crop.shape[:2], dtype=bool)
+    if crop.size == 0 or not sel.any():
+        return None
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    total = int(sel.sum())
+    shares = {
+        color: float((band_mask(hsv, bands).astype(bool) & sel).sum()) / total
+        for color, bands in ranges.items()
+    }
+
+    ranked = sorted(shares.items(), key=lambda kv: kv[1], reverse=True)
+    if not ranked or ranked[0][1] < COLOR_MIN_SHARE:
+        return None
+    runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+    if ranked[0][1] - runner_up < COLOR_MARGIN:
+        return None
+    return ranked[0][0]
+
+
 def detect_cubes(
     frame: np.ndarray,
     calibration: Calibration | None = None,
     colors: list[str] | None = None,
 ) -> list[CubeDetection]:
     """Detect colored cubes; robot XY filled in when a calibration is given."""
-    ranges: dict[str, list] = dict(COLOR_RANGES)
-    if calibration is not None:
-        ranges.update(calibration.color_ranges)
+    ranges = color_ranges_for(calibration)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     # Close first to heal ragged threshold edges, then a small open for
     # speckle -- a bigger open kernel eats the ~15-20px cube blobs whole.
@@ -279,9 +364,7 @@ def detect_cubes(
     for color, bands in ranges.items():
         if colors is not None and color not in colors:
             continue
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lo, hi in bands:
-            mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+        mask = band_mask(hsv, bands)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

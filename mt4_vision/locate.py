@@ -20,15 +20,20 @@ Two consequences worth knowing:
 * An object's own **height** cannot be ignored, even for "thin" things. The base
   projection is the flat table-plane homography, exact for a point *on* the
   table -- but a silhouette's centroid is not on the table, and this camera is
-  steeply oblique (nadir ~360-490mm away, 244mm up), so the flat inverse is off
+  steeply oblique (nadir ~360-490mm away, 242mm up), so the flat inverse is off
   by ~1.5x the height. A 12mm pen reads ~9mm from where it is, past the ~10mm
   the jaws tolerate: measured on hardware, the arm shoved the pen aside instead
   of gripping it, in exactly the direction this predicts. So the centroid is
   unprojected at half the object's height and the width is de-inflated by the
-  whole of it. One view cannot separate height from width, so the height is
-  *assumed* equal to the width unless ``object_height_mm`` says otherwise --
-  right for pens, markers and tools, wrong for a flat sheet. It is reported on
-  ``LocatedObject.height_mm`` because it is an assumption, not a measurement.
+  whole of it.
+
+  One view cannot measure height, so it is inferred from two independent cues
+  and the **smaller** of the two is taken -- see :func:`_height_corrected`.
+  Each cue is an over-estimate under a different shape, and each is tight
+  where the other is loose, so the minimum is right for both a 20mm cube and a
+  sheet of paper. It is reported on ``LocatedObject.height_mm`` because it is
+  an inference, not a measurement, and ``object_height_mm`` overrides it for a
+  caller that knows better.
 
 Extents also clip where an object's own contrast against the desk runs out: the
 white end of a white pen on light wood is not separable, so ``long_mm`` reads
@@ -47,12 +52,9 @@ import cv2
 import numpy as np
 
 from mt4_vision.calib import Calibration
+from mt4_vision.detect import classify_color
 from mt4_vision.wrist import j4_for_long_axis
-from mt4_vision.workspace import (
-    MAX_REACH_MM,
-    work_region_block_reason,
-    is_mp_reachable_xy,
-)
+from mt4_vision.workspace import work_region_block_reason
 
 # Crop side (px) segmented around a hint. At this mount (~0.5mm/px) 280px spans
 # ~150mm, enough for a pen end to end.
@@ -71,7 +73,7 @@ L_WEIGHT = 0.35
 MIN_DEVIATION = 10.0
 # Half-side (mm) of the region around each marker treated as scene furniture.
 # The tags sit on ~67mm paper held by white tape; all of it is background. This
-# is why a pen beside a tag no longer fuses with it -- but it also means an
+# is why a pen beside a tag does not fuse with it -- but it also means an
 # object resting ON a marker cannot be measured. Move it off the tag.
 PAPER_HALF_MM = 42.0
 # A measurement is only returned if two window sizes agree within these bounds.
@@ -109,13 +111,42 @@ class LocatedObject:
     long_mm: float
     short_mm: float
     confidence: float
-    # Height above the table assumed when unprojecting the centroid. Reported
-    # because it is an assumption, not a measurement, and it moves the grasp
-    # point by ~1.5x itself at this mount -- see _assumed_height_mm.
+    # Height above the table inferred when unprojecting the centroid. Reported
+    # because it is an inference, not a measurement, and it moves the grasp
+    # point by ~1.5x itself at this mount -- see _height_corrected.
     height_mm: float = 0.0
     # BGR crop around the object, for re-acquiring it in a later frame.
     template: np.ndarray = field(repr=False, default_factory=lambda: np.zeros((1, 1, 3), np.uint8))
     mask_area_px: float = 0.0
+    # The silhouette itself, and where its top-left sits in the full frame.
+    # Kept because ``long_mm``/``short_mm`` describe the whole outline and say
+    # nothing about the width at any particular point on it -- which is the
+    # only question that decides whether the jaws can close. See
+    # ``mt4_vision.grasp``. Empty when the measurement predates this field.
+    mask: np.ndarray = field(
+        repr=False, default_factory=lambda: np.zeros((0, 0), np.uint8)
+    )
+    mask_origin_px: tuple[int, int] = (0, 0)
+    # Measured colour, from the same named HSV bands the cube detector uses, or
+    # None when the object is not clearly one of them. Distinct from anything in
+    # ``label``: the label is the noun a language model supplied, this is a
+    # measurement. Keeping them apart is what lets ``instruct`` tell "the task
+    # says green and this thing is red" (a real contradiction, refuse) from
+    # "the task says green and nobody has established what colour this is"
+    # (unknowable, abstain). Conflating those refused "the green statue" on a
+    # desk that had a green statue on it -- see entities.object_entity.
+    color: str | None = None
+
+    def footprint_offset_mm(self, calib) -> tuple[float, float]:
+        """Height correction applied to the centroid, as a plane offset.
+
+        ``x``/``y`` are unprojected at the object's assumed height; the mask is
+        in raw pixels. Grasp planning maps mask pixels through the table plane
+        and then shifts them by this, so a planned point lands in the same
+        frame of reference the rest of the stack uses for this object.
+        """
+        rx, ry = calib.pixel_to_robot(self.px, self.py)
+        return self.x - float(rx), self.y - float(ry)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -179,14 +210,8 @@ def marker_paper_mask(
     return out.astype(bool)
 
 
-def _segment(
-    frame: np.ndarray,
-    px: float,
-    py: float,
-    win: int,
-    exclude: np.ndarray | None,
-) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
-    """Foreground component under the hint, by deviation from the local desk.
+def desk_deviation(crop: np.ndarray, kernel: int = BG_MEDIAN_KERNEL_PX) -> np.ndarray:
+    """Per-pixel distance from the locally-estimated desk, in weighted Lab units.
 
     The desk is estimated *locally*, with a large median filter, rather than as
     one colour with a tolerance. That matters more than any threshold choice:
@@ -196,7 +221,36 @@ def _segment(
     half the desk). A local estimate absorbs the gradient and soft shadows into
     the background, leaving only what is small and high-frequency -- an object.
 
-    The split then comes from Otsu on the deviation map, so there is no tuned
+    Consequently the method is indifferent to what colour the desk is, and to
+    wood grain, gradients and soft shadows. What it *is* sensitive to is scale:
+    anything wider than ``BG_MEDIAN_KERNEL_PX`` survives its own background
+    estimate and disappears. That is the real scope limit, not desk uniformity.
+
+    Shared by :func:`_segment` (one window around a hint) and
+    :mod:`mt4_vision.discover` (the whole desk, no hint), so the two cannot
+    drift into different definitions of "unlike the desk". ``kernel`` is
+    exposed for discover's coarse second pass, which deliberately probes a
+    much larger scale to recognise structures too big for the default one;
+    every other caller should leave it alone.
+    """
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    desk = cv2.medianBlur(lab, int(kernel) | 1)
+    scale = np.array([L_WEIGHT, 1.0, 1.0], np.float32)
+    return np.linalg.norm(
+        (lab.astype(np.float32) - desk.astype(np.float32)) * scale, axis=2
+    )
+
+
+def _segment(
+    frame: np.ndarray,
+    px: float,
+    py: float,
+    win: int,
+    exclude: np.ndarray | None,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """Foreground component under the hint, by deviation from the local desk.
+
+    The split comes from Otsu on :func:`desk_deviation`, so there is no tuned
     colour tolerance to go stale when the lighting changes.
     """
     x0, y0, x1, y1 = _window(frame, px, py, win)
@@ -206,12 +260,7 @@ def _segment(
     hx = max(0, min(int(round(px)) - x0, crop.shape[1] - 1))
     hy = max(0, min(int(round(py)) - y0, crop.shape[0] - 1))
 
-    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-    desk = cv2.medianBlur(lab, BG_MEDIAN_KERNEL_PX)
-    scale = np.array([L_WEIGHT, 1.0, 1.0], np.float32)
-    dev = np.linalg.norm(
-        (lab.astype(np.float32) - desk.astype(np.float32)) * scale, axis=2
-    )
+    dev = desk_deviation(crop)
 
     ex = (
         exclude[y0 : y0 + crop.shape[0], x0 : x0 + crop.shape[1]]
@@ -340,7 +389,33 @@ def _segment_grabcut(
     if exclude is not None:
         ex = exclude[cy0:cy1, cx0:cx1]
         if ex.shape[:2] == gc.shape:
-            gc[ex.astype(bool)] = cv2.GC_BGD
+            paper = ex.astype(bool)
+            inside = np.zeros_like(paper)
+            inside[ly0:ly1, lx0:lx1] = True
+            # Outside the detector box, marker paper is background and that is
+            # the end of it.
+            gc[paper & ~inside] = cv2.GC_BGD
+            # Inside the box it is only a PRIOR. The mask is geometric -- a
+            # quad around each marker's calibrated position -- so it cannot
+            # tell paper from something lying on top of paper, and the box is
+            # a strong statement that the object is right here.
+            #
+            # Measured 2026-08-02: the stapler was resting ON marker 0's paper
+            # (the arm had placed it there). The exclusion covered 53.8% of
+            # Qwen's box, including the stapler itself, so GrabCut found no
+            # foreground at all -- 8 grounding calls out of 8. Every
+            # measurement then fell through to the raw box, reporting the
+            # AABB's dimensions as the object's: 150x74mm for a stapler, with
+            # no silhouette for grasp planning to use.
+            #
+            # GC_PR_BGD lets GrabCut reclaim pixels its colour model says are
+            # not paper, which is exactly the object on top of it, while still
+            # steering it away from the high-contrast black-and-white tag that
+            # made this exclusion necessary in the first place.
+            gc[paper & inside] = cv2.GC_PR_BGD
+            # The sure-FG seed has to survive: it is the only thing telling
+            # GrabCut what the object's colour actually is.
+            cv2.circle(gc, (hx, hy), r, int(cv2.GC_FGD), thickness=-1)
 
     bgd = np.zeros((1, 65), np.float64)
     fgd = np.zeros((1, 65), np.float64)
@@ -399,8 +474,13 @@ def refine_at_box(
 
 def _rect_from_mask(
     mask: np.ndarray, origin: tuple[int, int]
-) -> tuple[tuple[float, float], list[tuple[float, float]]]:
-    """(centroid, 4 corners) in FRAME pixels from a crop-local mask."""
+) -> tuple[tuple[float, float], list[tuple[float, float]], np.ndarray]:
+    """(centroid, 4 corners, outline) in FRAME pixels from a crop-local mask.
+
+    The outline is the silhouette contour itself, not the rectangle's corners.
+    It is what :func:`_table_extents_mm` measures the radial sweep from, and a
+    minAreaRect around a swept shape is looser than the shape.
+    """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         raise LocateError("mask has no contour")
@@ -410,7 +490,8 @@ def _rect_from_mask(
     corners = [(float(cx) + ox, float(cy) + oy) for cx, cy in box]
     ys, xs = np.nonzero(mask)
     centroid = (float(xs.mean()) + ox, float(ys.mean()) + oy)
-    return centroid, corners
+    outline = contour.reshape(-1, 2).astype(np.float64) + np.array([ox, oy], np.float64)
+    return centroid, corners, outline
 
 
 def _parallax_gain(calib: Calibration, x: float, y: float) -> float:
@@ -446,18 +527,69 @@ def _unproject(
     return cam[0] + (fx - cam[0]) * k, cam[1] + (fy - cam[1]) * k
 
 
+def _radial_basis(
+    calib: Calibration, x: float, y: float
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Unit vectors (outward from the nadir, across it) at (x, y), or None.
+
+    Height displaces a silhouette purely along the outward vector, so this is
+    the frame every height cue is measured in. None when the camera geometry is
+    unmeasured, or when the point sits on the nadir itself and "outward" has no
+    direction.
+    """
+    cam = calib.cam_xy_robot
+    if not cam:
+        return None
+    dx, dy = x - float(cam[0]), y - float(cam[1])
+    n = math.hypot(dx, dy)
+    if n < 1e-6:
+        return None
+    return (dx / n, dy / n), (-dy / n, dx / n)
+
+
+def _table_extents_mm(
+    calib: Calibration,
+    outline_px: np.ndarray,
+    u: tuple[float, float],
+    v: tuple[float, float],
+) -> tuple[float, float]:
+    """Outline width (mm) along the outward radial axis, and across it.
+
+    Both measured on the flat table plane, which is the plane the sweep happens
+    in -- the outline is projected through ``pixel_to_robot`` before either
+    extent is taken, so lens and perspective foreshortening are already undone.
+    """
+    pts = np.array(
+        [
+            calib.pixel_to_robot(float(px), float(py), on_cube_top=False)
+            for px, py in outline_px
+        ],
+        dtype=np.float64,
+    )
+    if not len(pts):
+        return 0.0, 0.0
+    pu = pts @ np.array(u, dtype=np.float64)
+    pv = pts @ np.array(v, dtype=np.float64)
+    return float(pu.max() - pu.min()), float(pv.max() - pv.min())
+
+
 def _assumed_height_mm(
     silhouette_mm: float, gain: float, cos_radial: float
 ) -> float:
-    """Object height inferred from how much its own height inflated its width.
+    """Height inferred from how much the object's own height inflated its width.
 
     A silhouette is the union of the footprint and the top outline, the latter
     thrown outward from the nadir by ``h * gain``, so across the grasp axis it
     measures ``w + h * gain * cos_radial``. One view cannot separate w from h, so
     this assumes a cross-section **as tall as it is wide** -- true of pens,
-    markers and tools lying on a table, which is what this module is for, and
-    false of a flat sheet, which would be reported as thicker and nearer than it
-    is. Pass ``object_height_mm=0`` for something genuinely flat.
+    markers and tools lying on a table, false of a flat sheet, which it reports
+    as thicker and nearer than it is. Synthetic prisms through this
+    calibration: 0.1-3.9mm across the grasp axis for a 12mm pen, 5.2-25.1mm for
+    a 90x60x0.5mm sheet. Live on ArUco paper, which is flat and whose position
+    is known: it invents 15-22mm of height and moves the point 13.0-14.6mm.
+
+    Tight where the object really is round in section, loose for anything flat,
+    which is the half :func:`_height_from_sweep` answers.
     """
     if gain <= 0.0:
         # No measured camera geometry, so there is no correction to make and
@@ -465,6 +597,32 @@ def _assumed_height_mm(
         return 0.0
     denom = 1.0 + gain * max(0.0, min(1.0, cos_radial))
     return max(0.0, silhouette_mm / denom) if denom > 1e-6 else 0.0
+
+
+def _height_from_sweep(radial_mm: float, cross_mm: float, gain: float) -> float:
+    """Height inferred from how far the silhouette is stretched radially.
+
+    An object standing on the table images as its footprint unioned with its
+    top outline, and the top is thrown outward from the nadir by exactly
+    ``h * gain``. That stretch lands **entirely** on the radial axis: the
+    across-radial extent of the silhouette is the footprint's own, untouched.
+    So the difference between the two extents is the stretch, and the height
+    follows -- given a footprint about as deep as it is wide, which is what
+    ``cross_mm`` stands in for.
+
+    Tight for anything compact, whatever its height, and tight for anything
+    flat, whatever its outline: a sheet has no stretch to find and this returns
+    zero. Loose for a long object pointing at the camera, where the footprint's
+    own length is counted as stretch -- 42-108mm of invented height for a
+    140mm pen. That is the half :func:`_assumed_height_mm` answers.
+
+    Synthetic prisms through this calibration, error across the grasp axis:
+    0.0-1.2mm for a 20mm cube (the flat projection gives 2.6-17.6mm), 0.1-3.0mm
+    for a 60x40x1mm card, 0.1-1.8mm for a 45x40x30mm rock.
+    """
+    if gain <= 0.0:
+        return 0.0
+    return max(0.0, radial_mm - cross_mm) / gain
 
 
 def _median_width_px(mask: np.ndarray, long_axis_deg_px: float) -> float:
@@ -486,6 +644,124 @@ def _median_width_px(mask: np.ndarray, long_axis_deg_px: float) -> float:
     return float(np.median(nz)) if nz.size else 0.0
 
 
+def _check_plausible(long_mm: float, short_mm: float, what: str) -> None:
+    """Refuse an implausible extent rather than picking at it.
+
+    A mask that has flooded the desk yields a huge "object" whose centroid is
+    meaningless, and the arm acts on whatever comes back. ``what`` names the
+    path that produced the measurement, because which segmenter flooded is the
+    first thing worth knowing.
+    """
+    if MIN_PLAUSIBLE_LONG_MM <= long_mm <= MAX_PLAUSIBLE_LONG_MM:
+        return
+    raise LocateError(
+        f"{what} measured {long_mm:.0f}x{short_mm:.0f}mm, outside the plausible "
+        f"{MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm range -- the "
+        "mask has most likely flooded the desk, so its centroid means nothing"
+    )
+
+
+def _is_cube_height(calib: Calibration, height_mm: float) -> bool:
+    """True when ``height_mm`` is the configured cube height and a map exists.
+
+    The one condition under which the measured cube-top map applies: it was fitted
+    at ``cube_height_mm`` and says nothing about any other height.
+    """
+    return bool(calib.cube_top_homography) and abs(
+        height_mm - float(calib.cube_height_mm)
+    ) < 1e-6
+
+
+def _height_corrected(
+    calib: Calibration,
+    centroid_px: tuple[float, float],
+    cx: float,
+    cy: float,
+    axis_yaw: float,
+    short_mm: float,
+    outline_px: np.ndarray,
+    object_height_mm: float | None,
+) -> tuple[float, float, float, float]:
+    """Apply the object's own height to its centre and width. (cx, cy, short, h).
+
+    One copy, because both segmentation paths need it and they had it written
+    out identically. See the module docstring for why height cannot be ignored:
+    this camera is steeply oblique, so the flat table inverse puts a silhouette
+    centroid ~1.5x its height away from the thing itself -- past what the jaws
+    tolerate for a 12mm pen.
+
+    **The height is the smaller of two cues**, :func:`_assumed_height_mm` from
+    the width inflation and :func:`_height_from_sweep` from the radial stretch.
+    Both are upper bounds that go loose under opposite shapes -- the first
+    invents height for anything flat, the second for anything long pointing at
+    the camera -- and neither is ever tight on the shape that defeats the
+    other, so the minimum is the one number that is close for a cube, a card
+    and a pen alike. Measured across the grasp axis over 84 synthetic prisms
+    through this calibration: mean 3.9mm, and 9 of 84 outside the ~10mm the
+    jaws tolerate, against 7.2mm / 23 of 84 for the flat projection and
+    11.0mm / 32 of 84 for the width cue alone.
+
+    Taking the minimum means erring toward **under**-correction, and one shape
+    gets no correction at all: something long lying across the camera azimuth,
+    where the stretch cue reads no radial elongation and wins the minimum. A
+    140x12x12mm pen there stays 6.1-12.1mm outward, exactly where the flat
+    projection puts it. That is a genuine one-view ambiguity -- the same
+    silhouette is cast by a flat strip three times as wide, whose centre is
+    ~10mm away -- and resolving it in the pen's favour would over-correct every
+    flat object instead.
+
+    What defeats both cues is a mask that is not one object: two red cubes 44mm
+    apart segment as a 121mm blob, and every rule then aims at the gap. That is
+    the segmentation's job to refuse -- see :func:`_check_plausible` and the
+    two-window stability check in :func:`measure`.
+
+    ``cos_radial`` is how much of the object's short axis points along the
+    camera azimuth. Only that component is inflated by height, so a pen lying
+    across the view direction needs no de-inflation and one lying along it
+    needs all of it.
+    """
+    gain = _parallax_gain(calib, cx, cy)
+    basis = _radial_basis(calib, cx, cy)
+    cos_radial = 1.0
+    if basis is not None:
+        u, v = basis
+        ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
+        cos_radial = abs(ax * u[0] + ay * u[1])
+    if object_height_mm is not None:
+        height = max(0.0, float(object_height_mm))
+    else:
+        height = _assumed_height_mm(short_mm, gain, cos_radial)
+        if basis is not None and len(outline_px):
+            radial_mm, cross_mm = _table_extents_mm(calib, outline_px, u, v)
+            height = min(height, _height_from_sweep(radial_mm, cross_mm, gain))
+    if _is_cube_height(calib, height):
+        # The calibrated map for exactly this case, fitted by
+        # calibrate_height.py against cubes the arm placed at known
+        # coordinates. It carries the detector's centroid bias as well as the
+        # parallax, which the analytic form cannot know about, and it is the
+        # map the cube detector and stacking already aim with. Measured
+        # 2026-08-04 against the cube detector's own reading over three objects
+        # with a snug box: 3.2mm mean, against 14.3mm for the analytic
+        # contraction at the same height.
+        #
+        # The width is left as the silhouette measured it. De-inflating by a
+        # height nobody measured subtracts more than the silhouette was
+        # actually inflated by -- on the same frame it took a 20mm cube's 20mm
+        # reading down to the 1mm clamp, which would retire the only test for
+        # an object too wide to fit between the jaws. A silhouette width reads
+        # wide, so leaving it alone errs toward refusing, and closing on air is
+        # the failure with no detector.
+        cx, cy = calib.pixel_to_robot(
+            centroid_px[0], centroid_px[1], on_cube_top=True
+        )
+    elif height > 0.0:
+        short_mm = max(1.0, short_mm - height * gain * cos_radial)
+        # The silhouette's centroid lies midway between the footprint and the
+        # top outline, so it unprojects at half the object's height.
+        cx, cy = _unproject(calib, centroid_px[0], centroid_px[1], height / 2.0)
+    return cx, cy, short_mm, height
+
+
 def _object_from_mask(
     frame: np.ndarray,
     mask: np.ndarray,
@@ -496,7 +772,7 @@ def _object_from_mask(
     """Geometry from a crop-local mask; None if the silhouette is degenerate."""
     x0, y0 = origin
     try:
-        centroid, corners = _rect_from_mask(mask, (x0, y0))
+        centroid, corners, outline = _rect_from_mask(mask, (x0, y0))
     except LocateError:
         return None
     robot = [calib.pixel_to_robot(cx, cy, on_cube_top=False) for cx, cy in corners]
@@ -528,24 +804,9 @@ def _object_from_mask(
     # Undo the object's own height. Both the grasp point and the width need it:
     # the centroid of a silhouette sits half the object's height up, and the
     # width is inflated by the whole of it.
-    gain = _parallax_gain(calib, cx, cy)
-    cam = calib.cam_xy_robot
-    cos_radial = 1.0
-    if cam:
-        d = math.hypot(cam[0] - cx, cam[1] - cy)
-        if d > 1e-6:
-            ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
-            cos_radial = abs(ax * (cam[0] - cx) + ay * (cam[1] - cy)) / d
-    height = (
-        _assumed_height_mm(short_mm, gain, cos_radial)
-        if object_height_mm is None
-        else max(0.0, float(object_height_mm))
+    cx, cy, short_mm, height = _height_corrected(
+        calib, centroid, cx, cy, axis_yaw, short_mm, outline, object_height_mm
     )
-    if height > 0.0:
-        short_mm = max(1.0, short_mm - height * gain * cos_radial)
-        # The silhouette's centroid lies midway between the footprint and the
-        # top outline, so it unprojects at half the object's height.
-        cx, cy = _unproject(calib, centroid[0], centroid[1], height / 2.0)
 
     th, tw = mask.shape[:2]
     return LocatedObject(
@@ -561,6 +822,17 @@ def _object_from_mask(
         height_mm=height,
         template=np.ascontiguousarray(frame[y0 : y0 + th, x0 : x0 + tw]),
         mask_area_px=float(mask.sum()),
+        # Carried so grasp planning can ask about the width at a *point* on the
+        # object. long_mm/short_mm describe the whole outline and cannot answer
+        # that -- see mt4_vision.grasp.
+        mask=np.ascontiguousarray(mask.astype(np.uint8)),
+        mask_origin_px=(int(x0), int(y0)),
+        # Through the silhouette, not the bounding box: the box around anything
+        # elongated is mostly desk, and desk matches no band, which would drag
+        # every honest colour under COLOR_MIN_SHARE.
+        color=classify_color(
+            frame, mask.astype(np.uint8), (int(x0), int(y0)), calib
+        ),
     )
 
 
@@ -608,10 +880,12 @@ def measure(
     the mask, and segmentation is by far the least reliable step in the chain, so
     a disagreement between scales has to abstain rather than pick a winner.
 
-    ``short_mm`` is a silhouette width, so for anything with height it reads
-    *wide*: this camera is steeply oblique, and an object's side face projects
-    onto the table plane next to it (a 12mm round pen measures ~24mm). Treat it
-    as an upper bound, and verify the grasp rather than trusting it.
+    ``short_mm`` starts as a silhouette width, which reads *wide* for anything
+    with height: this camera is steeply oblique, and an object's side face
+    projects onto the table plane next to it (a 12mm round pen measures ~24mm).
+    It is de-inflated by the inferred height, so it is only as good as that
+    inference. Treat it as an upper bound, and verify the grasp rather than
+    trusting it.
     """
     exclude = marker_paper_mask(frame, calib, marker_xy) if marker_xy else None
     primary = _measure_one(frame, px, py, calib, win, exclude, object_height_mm)
@@ -623,14 +897,7 @@ def measure(
         )
     obj, _mask = primary
 
-    if not MIN_PLAUSIBLE_LONG_MM <= obj.long_mm <= MAX_PLAUSIBLE_LONG_MM:
-        raise LocateError(
-            f"measured {obj.long_mm:.0f}x{obj.short_mm:.0f}mm at "
-            f"({px:.0f}, {py:.0f}), outside the plausible "
-            f"{MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm range -- "
-            "the mask has most likely flooded the desk, so its centroid means "
-            "nothing"
-        )
+    _check_plausible(obj.long_mm, obj.short_mm, f"the window at ({px:.0f}, {py:.0f})")
 
     second_win = max(BG_MEDIAN_KERNEL_PX, int(win * STABILITY_WINDOW_RATIO))
     if second_win != win:
@@ -728,29 +995,18 @@ def measure_box(
         long_v, long_mm, short_mm = e1, len1, len0
     if long_mm < 1e-6:
         raise LocateError("detector box projects to a degenerate rect")
-    if not MIN_PLAUSIBLE_LONG_MM <= long_mm <= MAX_PLAUSIBLE_LONG_MM:
-        raise LocateError(
-            f"box measures {long_mm:.0f}x{short_mm:.0f}mm, outside the plausible "
-            f"{MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm range"
-        )
+    _check_plausible(long_mm, short_mm, "the box")
     axis_yaw = math.degrees(math.atan2(long_v[1], long_v[0]))
 
-    gain = _parallax_gain(calib, cx, cy)
-    cam = calib.cam_xy_robot
-    cos_radial = 1.0
-    if cam:
-        d = math.hypot(cam[0] - cx, cam[1] - cy)
-        if d > 1e-6:
-            ax, ay = -math.sin(math.radians(axis_yaw)), math.cos(math.radians(axis_yaw))
-            cos_radial = abs(ax * (cam[0] - cx) + ay * (cam[1] - cy)) / d
-    height = (
-        _assumed_height_mm(short_mm, gain, cos_radial)
-        if object_height_mm is None
-        else max(0.0, float(object_height_mm))
+    # The box corners stand in for the outline there is no mask to supply. An
+    # image-aligned AABB is looser than a silhouette in both directions at
+    # once, so the radial-stretch cue reads high here and the width cue is
+    # usually what the minimum picks -- which is this path's historical
+    # behaviour, and appropriate for a last-resort measurement.
+    cx, cy, short_mm, height = _height_corrected(
+        calib, centroid, cx, cy, axis_yaw, short_mm,
+        np.array(corners, dtype=np.float64), object_height_mm,
     )
-    if height > 0.0:
-        short_mm = max(1.0, short_mm - height * gain * cos_radial)
-        cx, cy = _unproject(calib, centroid[0], centroid[1], height / 2.0)
 
     ix0, iy0 = int(math.floor(xa)), int(math.floor(ya))
     ix1, iy1 = int(math.ceil(xb)), int(math.ceil(yb))
@@ -767,6 +1023,10 @@ def measure_box(
         height_mm=height,
         template=np.ascontiguousarray(frame[iy0:iy1, ix0:ix1]),
         mask_area_px=float((xb - xa) * (yb - ya)),
+        # No silhouette on this path, so the box interior stands in -- see
+        # classify_color. Desk showing at the box edges only makes the answer
+        # None, never a wrong colour.
+        color=classify_color(frame[iy0:iy1, ix0:ix1], calibration=calib),
     )
 
 
@@ -799,12 +1059,7 @@ def measure_grabcut(
     obj = _object_from_mask(frame, mask, (ox, oy), calib, object_height_mm)
     if obj is None:
         raise LocateError("GrabCut mask produced a degenerate silhouette")
-    if not MIN_PLAUSIBLE_LONG_MM <= obj.long_mm <= MAX_PLAUSIBLE_LONG_MM:
-        raise LocateError(
-            f"GrabCut measured {obj.long_mm:.0f}x{obj.short_mm:.0f}mm, outside "
-            f"the plausible {MIN_PLAUSIBLE_LONG_MM:.0f}-{MAX_PLAUSIBLE_LONG_MM:.0f}mm "
-            "range -- the mask has most likely flooded the desk"
-        )
+    _check_plausible(obj.long_mm, obj.short_mm, "GrabCut")
     return replace(obj, label=label, confidence=float(confidence))
 
 
@@ -874,9 +1129,43 @@ def relocate(
     that merely rotated the object returns None too, which reads as success. Ask
     instead whether the place it used to occupy still looks unlike bare desk.
     """
+    again, _why = relocate_detail(
+        frame, obj, calib, search_px=search_px, min_score=min_score,
+        win=win, marker_xy=marker_xy,
+    )
+    return again
+
+
+def relocate_detail(
+    frame: np.ndarray,
+    obj: LocatedObject,
+    calib: Calibration,
+    *,
+    search_px: int = RELOCATE_SEARCH_PX,
+    min_score: float = RELOCATE_MIN_SCORE,
+    win: int = DEFAULT_WINDOW_PX,
+    marker_xy: Sequence[tuple[float, float]] = (),
+) -> tuple[LocatedObject | None, str]:
+    """:func:`relocate`, plus which of its four failures happened.
+
+    The reason matters because they call for opposite responses. "It moved" is
+    a scene problem the caller should report; "found it, could not re-measure
+    it" is ours, and telling a user their stationary stapler moved sends them
+    looking at the desk instead of at the code.
+
+    **The re-measure runs through the matched template's own bounds.** That box
+    is a tight, true outline of the object in this frame -- it is the crop the
+    object was registered from, found again -- so it seeds GrabCut exactly the
+    way a detector box does. The plain desk-deviation :func:`measure` cannot
+    segment a stapler at all (measured 2026-08-02: one that had not moved
+    template-matched at **0.993** on the identical pixel), so without the
+    template bounds any object that only GrabCut could find in the first place
+    is permanently un-re-acquirable: registration succeeds, and every attempt
+    to act on it is refused.
+    """
     th, tw = obj.template.shape[:2]
     if th < 2 or tw < 2:
-        return None
+        return None, "no usable template was stored for this object"
     h, w = frame.shape[:2]
     x0 = max(0, int(obj.px) - tw // 2 - search_px)
     y0 = max(0, int(obj.py) - th // 2 - search_px)
@@ -884,20 +1173,29 @@ def relocate(
     y1 = min(h, int(obj.py) + th // 2 + search_px)
     region = frame[y0:y1, x0:x1]
     if region.shape[0] < th or region.shape[1] < tw:
-        return None
+        return None, (
+            f"the {tw}x{th}px template does not fit the search area at the "
+            "frame edge"
+        )
     scores = cv2.matchTemplate(region, obj.template, cv2.TM_CCOEFF_NORMED)
     _minv, maxv, _minl, maxl = cv2.minMaxLoc(scores)
     if maxv < min_score:
-        return None
-    hint_x = x0 + maxl[0] + tw / 2.0
-    hint_y = y0 + maxl[1] + th / 2.0
-    try:
-        return measure(
-            frame, hint_x, hint_y, calib, obj.label,
-            win=win, confidence=float(maxv), marker_xy=marker_xy,
+        return None, (
+            f"best template match {maxv:.2f} is under {min_score:.2f} -- it "
+            "moved, rotated, or something is over it"
         )
-    except LocateError:
-        return None
+    bx0, by0 = x0 + maxl[0], y0 + maxl[1]
+    box = (float(bx0), float(by0), float(bx0 + tw), float(by0 + th))
+    hint_x, hint_y = bx0 + tw / 2.0, by0 + th / 2.0
+    try:
+        return measure_with_box_fallback(
+            frame, hint_x, hint_y, calib, obj.label,
+            box=box, win=win, confidence=float(maxv), marker_xy=marker_xy,
+        ), ""
+    except LocateError as exc:
+        return None, (
+            f"matched it at {maxv:.2f} but could not re-measure it: {exc}"
+        )
 
 
 def grasp_feasibility(
@@ -909,21 +1207,81 @@ def grasp_feasibility(
     two checks specific to a non-cube: the jaws must be able to span its short
     axis, and a wrist angle must exist that closes across its long axis.
     """
-    r = math.hypot(obj.x, obj.y)
     region = work_region_block_reason(obj.x, obj.y, calib)
     if region is not None:
         return False, region
-    span_open = _span_mm(calib, int(calib.grip_open_s))
-    if span_open is not None and obj.short_mm > span_open:
-        return False, (
-            f"wider than jaws ({obj.short_mm:.0f}>{span_open:.0f}mm)"
-        )
+    span = jaw_span_block_reason(obj.short_mm, calib)
+    if span is not None:
+        return False, span
     if is_compact(obj.long_mm, obj.short_mm):
         # Near-square: jaw orientation is not load-bearing (90° period).
         return True, None
     if j4_for_long_axis(obj.axis_yaw_deg, x=obj.x, y=obj.y) is None:
         return False, "no J4 angle in soft limits"
     return True, None
+
+
+def plan_object_grasp(obj: LocatedObject, calib: Calibration):
+    """Best jaw placement on ``obj``, or (None, why not).
+
+    Falls back to the outline when no silhouette was stored -- ``measure_box``
+    has no mask, and neither do objects measured before the mask was carried --
+    so the answer degrades to "close across the short axis at the centroid"
+    rather than to a refusal.
+    """
+    from mt4_vision.grasp import GraspPlan, footprint_mm, plan_grasp
+
+    span = _span_mm(calib, int(calib.grip_open_s))
+    if span is None:
+        # Nothing to plan against. Keep the historical behaviour rather than
+        # inventing a jaw width -- see jaw_span_block_reason.
+        return GraspPlan(
+            x=obj.x, y=obj.y, yaw_deg=obj.axis_yaw_deg,
+            width_mm=obj.short_mm, length_mm=obj.long_mm, offset_mm=0.0,
+        ), ""
+    mask = getattr(obj, "mask", None)
+    if mask is None or getattr(mask, "size", 0) == 0:
+        reason = jaw_span_block_reason(obj.short_mm, calib)
+        if reason is not None:
+            return None, reason
+        return GraspPlan(
+            x=obj.x, y=obj.y, yaw_deg=obj.axis_yaw_deg,
+            width_mm=obj.short_mm, length_mm=obj.long_mm, offset_mm=0.0,
+        ), ""
+    pts = footprint_mm(
+        obj.mask, obj.mask_origin_px, calib,
+        offset_mm=obj.footprint_offset_mm(calib),
+    )
+    return plan_grasp(pts, max_span_mm=span)
+
+
+def jaw_span_block_reason(short_mm: float, calib: Calibration) -> str | None:
+    """"Too wide for the jaws" in prose, or None. The single width test.
+
+    Lives here so ``grasp_feasibility`` (CLI, MCP server) and
+    ``entities.object_entity`` (the policy loop) cannot drift into two
+    different answers about whether the arm can hold something -- which they
+    had, because ``object_entity`` had no width test at all.
+
+    Silent when ``grip_span_s_*`` are unmeasured, which is a deliberate
+    fail-open: inventing a jaw width would refuse real objects on a rig whose
+    gripper nobody has measured. It is not a safe default, only the least
+    wrong one, and it is why measuring the span matters. Measured on this rig
+    2026-08-02 by photographing the jaws at table height across S 140..230:
+    ``span_mm = (205.0 - S) / 1.797``, so 36mm at ``grip_open_s`` = 140.
+
+    Note ``short_mm`` is a *silhouette* width and reads wide for anything with
+    height on this oblique mount, so the comparison already errs toward
+    refusing. That is the right direction: closing on air is the failure with
+    no detector.
+    """
+    span_open = _span_mm(calib, int(calib.grip_open_s))
+    if span_open is None or short_mm <= span_open:
+        return None
+    return (
+        f"it measures {short_mm:.0f}mm across the grasp and the jaws open to "
+        f"{span_open:.0f}mm -- they would close beside it, not on it"
+    )
 
 
 def _span_mm(calib: Calibration, s: int) -> float | None:

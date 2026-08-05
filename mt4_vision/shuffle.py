@@ -7,10 +7,9 @@ of pick candidates; they are never "handled" as grips.
 
 The one deliberate exception is `last_place`: the destination of the last
 completed move is passed to plan_shuffle so it deprioritizes (never
-excludes) re-picking that same cube next cycle. Unlike the old removed
-"LastAttempt" stigma -- which hid grasp/vision bugs by refusing to repeat a
-move at all -- this only prefers variety and always falls back to the same
-cube if it is the only pickable one.
+excludes) re-picking that same cube next cycle. It only prefers variety, and
+always falls back to the same cube if it is the only pickable one: a stigma
+that refused to repeat a move outright would hide grasp and vision bugs.
 
 Lookahead: before executing a planned move, also ask plan_shuffle (via
 _lookahead_action) whether a *second*, independent move is already visible

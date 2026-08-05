@@ -74,13 +74,18 @@ def snap(cubes, visible=None, objects=()):
 class FakeObject:
     """Duck-typed stand-in for locate.LocatedObject."""
 
-    def __init__(self, x, y, *, label="pen", axis=37.0, long_mm=138.0, short_mm=9.0):
+    def __init__(
+        self, x, y, *, label="pen", axis=37.0, long_mm=138.0, short_mm=9.0,
+        color=None,
+    ):
         self.label = label
         self.px, self.py = 742.0, 388.0
         self.x, self.y = x, y
         self.axis_yaw_deg = axis
         self.long_mm, self.short_mm = long_mm, short_mm
         self.confidence = 0.81
+        # Default None, the honest answer for a pen nobody colour-classified.
+        self.color = color
 
 
 # -- the core invariant ---------------------------------------------------
@@ -162,8 +167,8 @@ def test_reason_outside_the_camera_frame() -> None:
 
 
 def test_far_desk_cube_is_pickable_now() -> None:
-    # The measured regression: on the desk, in reach, in frame -- and until
-    # 2026-08-02 silently absent because it sat outside the marker hull.
+    # Measured live 2026-08-02: on the desk, in reach, in frame, and outside
+    # the marker hull, which does not gate a pick.
     s = scene([cube("blue", 266.5, -52.7)])
     assert pick_block_reason(s.raw_cubes[0], s) is None
 
@@ -302,6 +307,44 @@ def test_object_entity_is_long_axis_periodic() -> None:
     assert obj.yaw_deg == 37.0
     assert obj.extent_mm == (138.0, 9.0)
     assert obj.pickable and obj.reason is None
+
+
+def test_object_wider_than_the_jaws_is_not_pickable() -> None:
+    """The gap that let a 75mm stapler through.
+
+    ``grasp_feasibility`` has had a width test for a while, but only the MCP
+    server and the CLI call it -- ``object_entity`` had none, and the policy
+    loop acts on ``object_entity``. Measured live 2026-08-02: the loop reported
+    obj_1 pickable at 150x75mm, the 36mm jaws closed beside the stapler, and
+    the run went on to report a successful pick and then DONE.
+    """
+    from dataclasses import replace
+
+    from mt4_vision.entities import object_entity
+
+    # The rig, plus the jaw model measured on it: span = (205 - S) / 1.797,
+    # so 36mm at grip_open_s = 140.
+    calib = replace(CALIB, grip_span_s_at_zero_mm=205.0, grip_span_s_per_mm=1.797)
+    sc = replace(scene([]), calib=calib)
+
+    narrow = object_entity(FakeObject(213.4, -58.1, short_mm=20.0), 1, scene=sc)
+    assert narrow.pickable and narrow.reason is None
+
+    wide = object_entity(FakeObject(213.4, -58.1, short_mm=75.0), 1, scene=sc)
+    assert not wide.pickable
+    assert "75mm" in wide.reason and "36mm" in wide.reason
+
+
+def test_object_width_gate_is_silent_without_the_jaw_model() -> None:
+    """Fail-open when unmeasured, on purpose: inventing a jaw width would
+    refuse real objects on a rig whose gripper nobody has measured. It is the
+    least wrong default, not a safe one -- see locate.jaw_span_block_reason."""
+    from mt4_vision.entities import object_entity
+
+    sc = scene([])
+    assert sc.calib.grip_span_s_at_zero_mm is None
+    wide = object_entity(FakeObject(213.4, -58.1, short_mm=75.0), 1, scene=sc)
+    assert wide.pickable
 
 
 def test_cube_entity_is_square_periodic() -> None:

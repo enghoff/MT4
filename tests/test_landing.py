@@ -55,7 +55,7 @@ def test_landing_ok_refuses_off_desk_and_off_camera():
 
 def test_landing_ok_accepts_the_far_desk_the_marker_hull_rejected():
     # Measured live 2026-08-02: on the desk, in reach, in frame, and outside
-    # the old marker-centre hull. A cube parked here used to be unfindable.
+    # the marker-centre hull, which does not bound a landing.
     assert landing_ok(266.5, -52.7, CALIB)
     assert landing_ok(176.1, -213.6, CALIB)
 
@@ -95,10 +95,10 @@ def test_random_landing_stays_in_shared_band():
 
 
 def test_random_landing_can_use_the_widened_region():
-    """Scatter used to be capped at a 240mm circle.
+    """Scatter is not capped at a 240mm circle.
 
-    Over many draws it should now reach past that, since the cap was camera
-    coverage stated as a radius and the camera reaches much further off-axis.
+    Over many draws it should reach past that: camera coverage is not a radius
+    about the base, and the camera sees much further off-axis.
     """
     site = next(m for m in MARKERS if m.marker_id == 4)
     radii = []
@@ -111,4 +111,4 @@ def test_random_landing_can_use_the_widened_region():
         if xy is not None:
             radii.append(math.hypot(*xy))
     assert radii, "scatter found no landing at all"
-    assert max(radii) > 240.0, f"never left the old radius cap (max {max(radii):.0f}mm)"
+    assert max(radii) > 240.0, f"never left the 240mm radius (max {max(radii):.0f}mm)"

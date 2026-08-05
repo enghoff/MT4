@@ -91,8 +91,8 @@ from mt4_vision.workspace import (
 # Cubes this close to the stack marker are moved aside before building.
 SITE_CLEAR_MM = 70.0
 # Clear landings sit this far past the keep-clear radius so release drag /
-# vision scatter can't bounce them straight back into the zone (the old
-# free-slot path parked at ~70mm and re-cleared the same cube forever).
+# vision scatter can't bounce them straight back into the zone; parking at
+# ~70mm re-clears the same cube forever.
 CLEAR_MARGIN_MM = 40.0
 CLEAR_PARK_MM = SITE_CLEAR_MM + CLEAR_MARGIN_MM  # 110mm from marker
 # Finger clearance from other cubes when parking a cleared cube.
@@ -110,10 +110,9 @@ SITE_CLEAR_ATTEMPTS = 6
 # the camera than the site. Ignore pick candidates in that corridor.
 # Measured 2026-07-21 on marker 3, level 4: true (179,180) -> phantom
 # ~(115,227) (~79mm along, ~8mm lateral). The phantom spreads laterally as
-# well as along as the stack grows, not just along -- field case 2026-07-24
-# marker 2 level 6 put a phantom at ~49mm lateral, past the old fixed 45mm
-# cutoff, and it slipped through as a real pick candidate. Both axes now
-# scale with stack height.
+# well as along as the stack grows -- field case 2026-07-24, marker 2 level
+# 6: a phantom at ~49mm lateral, past a fixed 45mm cutoff, slips through as a
+# real pick candidate. Both axes scale with stack height.
 STACK_SHADOW_LATERAL_MIN_MM = 45.0
 STACK_SHADOW_LATERAL_PER_LEVEL_MM = 10.0
 STACK_SHADOW_ALONG_MIN_MM = 25.0
@@ -121,12 +120,11 @@ STACK_SHADOW_ALONG_PER_LEVEL_MM = 35.0
 STACK_SHADOW_ALONG_FLOOR_MM = 90.0
 
 
-# Field case 2026-07-24: the old +-110 deg cap only ever tried a narrow fan
-# off the marker->cube bearing. At a corner site (marker 0) that fan mostly
-# fell outside the pick hull, leaving exactly one valid landing -- which the
-# previously-cleared cube had just taken, stranding the next clear with
-# "no reachable clear spot" even though open table space existed elsewhere
-# around the site. A full-circle sweep finds those spots.
+# A full circle, not a fan off the marker->cube bearing. Field case
+# 2026-07-24: at a corner site (marker 0) a +-110 deg fan falls mostly
+# outside the work region, leaving exactly one valid landing -- and once a
+# cleared cube takes it, the next clear strands with "no reachable clear
+# spot" while open table space remains elsewhere around the site.
 _CLEAR_ANGLES_DEG = expanding_angles_deg()
 _PARK_GRID = annulus_grid()
 
@@ -355,48 +353,6 @@ def in_stack_camera_shadow(
     )
 
 
-# Off-corridor detections this close to the site mid-build mean a cube is
-# lying beside / leaning against the column. Closer readings are the stack's
-# own base; corridor-aligned ones are mapped side faces of the stacked cubes
-# themselves (levels 1..built each cast one, at ~26mm/level along the
-# camera LOS) and must never be treated as fallen -- they hold perfectly
-# still as the stack grows, unlike the top phantom. A "static in corridor
-# means fallen" rule was tried 2026-07-24 and false-positived on exactly
-# those side faces; only the off-corridor test is trustworthy.
-NEAR_SITE_MIN_MM = 25.0
-CORRIDOR_ALIGN_COS = math.cos(math.radians(35.0))
-
-
-def stack_integrity_issues(
-    scene: Scene,
-    sx: float,
-    sy: float,
-    behind_u: tuple[float, float] | None,
-) -> list[str]:
-    """Evidence that the column shed a cube: a detection beside the site
-    that is not corridor-aligned (i.e. cannot be the stack's own mapped
-    side faces)."""
-    issues: list[str] = []
-    for c in scene.raw_cubes:
-        if c.x is None or c.y is None:
-            continue
-        dx, dy = float(c.x) - sx, float(c.y) - sy
-        d = math.hypot(dx, dy)
-        if not (NEAR_SITE_MIN_MM <= d < SITE_CLEAR_MM):
-            continue
-        aligned = (
-            behind_u is not None
-            and (dx * behind_u[0] + dy * behind_u[1]) / max(d, 1e-6)
-            >= CORRIDOR_ALIGN_COS
-        )
-        if not aligned:
-            issues.append(
-                f"{c.color} cube {d:.0f}mm from the site at "
-                f"({c.x:.0f},{c.y:.0f}) -- likely shed from the stack"
-            )
-    return issues
-
-
 # A pick "succeeded" but a same-color cube still sits within this radius of
 # the pick spot on the next scan: the grab missed (edge-of-hull vision skew
 # or lost steps) and usually just shoved the cube. Pick targets require
@@ -432,15 +388,26 @@ def stack_candidates(
     *,
     calib=None,
     stack_levels: int = 0,
+    planner: StackPlanner | None = None,
 ) -> list[CubeDetection]:
     """Reachable pickable cubes outside the site keep-clear radius.
 
-    When the stack already has cubes, also drop detections in the camera
-    line-of-sight shadow behind the site (stack-top phantoms).
+    When the stack already has cubes, two more things drop out. Detections in
+    the camera line-of-sight shadow behind the site are stack-top phantoms,
+    not cubes. Cubes in the column's forearm shadow are real, but the arm
+    cannot reach over the standing column to grab them
+    (``StackPlanner.column_shadow``) -- taking one as the next pick makes the
+    approach transit fail with no route, so they are held back until the run
+    ends or the operator moves them.
     """
     behind_u = None
     if stack_levels > 0 and calib is not None:
         behind_u = stack_shadow_behind_unit(calib, sx, sy)
+    past_column = (
+        planner.column_shadow(stack_levels)
+        if planner is not None
+        else (lambda x, y: False)
+    )
     out: list[CubeDetection] = []
     for c in scene.pickable(scene.cubes):
         if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
@@ -452,6 +419,8 @@ def stack_candidates(
                 stack_levels=stack_levels,
             )
         ):
+            continue
+        if past_column(float(c.x), float(c.y)):
             continue
         out.append(c)
     return out
@@ -526,7 +495,7 @@ def place_on_stack(
     hz = planner.hover_z(level)
     if hz is None:
         raise Mt4ClientError(f"level {level}: hover height unreachable")
-    # Same axis-square wrist as the old along-arm place (assumes j4zero).
+    # The axis-square wrist an along-arm place uses (assumes j4zero).
     j4 = j4_for_face_align(0.0, current_j4_deg=None, x=sx, y=sy)
     tcp = client.get_tcp()
     if tcp is None:
@@ -547,8 +516,7 @@ def place_on_stack(
     # covers the column, not the table); the hop clears the column by
     # construction (hz = hover height, fingers above the top cube); the
     # descend is a pure vertical drop down the column axis to rz, run slow
-    # (approach speed) like the old standalone _approach so the cube seats
-    # at the same speed.
+    # (approach speed) so the cube seats gently.
     legs = plan_route_legs(
         calib, planner, (float(tcp.x), float(tcp.y), float(tcp.z)),
         stage[0], stage[1], hz, built,
@@ -881,7 +849,6 @@ def main() -> int:
         # places ``built + 1``. The loop runs one extra pass after the last
         # placement so the final level is verified too.
         current_color: str | None = None
-        integrity_failed = False
         last_pick: tuple[str, float, float] | None = None
         pick_fail_streak = 0
         while built < target_levels or last_pick is not None:
@@ -935,22 +902,6 @@ def main() -> int:
                 behind_u = (
                     stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
                 )
-                if built > 0:
-                    issues = stack_integrity_issues(scene, sx, sy, behind_u)
-                    if issues:
-                        print(
-                            "Stack integrity check failed:\n  "
-                            + "\n  ".join(issues),
-                            file=sys.stderr,
-                        )
-                        print(
-                            f"Stopping -- the stack likely shed a cube "
-                            f"around level {built}; the physical stack "
-                            "may be shorter than reported.",
-                            file=sys.stderr,
-                        )
-                        integrity_failed = True
-                        break
                 if behind_u is not None:
                     for c in scene.pickable(scene.cubes):
                         if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
@@ -969,6 +920,7 @@ def main() -> int:
                     )
                 cands = stack_candidates(
                     scene, sx, sy, calib=calib, stack_levels=built,
+                    planner=planner,
                 )
                 if not cands:
                     print(f"level {level}: no reachable cube outside site")
@@ -1034,12 +986,6 @@ def main() -> int:
             print(f"  placed level {level}")
 
         print(f"\nBuilt {built} level(s) on marker {marker.marker_id}")
-        if integrity_failed:
-            print(
-                "Warning: stack integrity was compromised -- the physical "
-                "stack is likely shorter than the built count.",
-                file=sys.stderr,
-            )
         try:
             go_camera_park(client, calib, planner, built)
         except Mt4ClientError as exc:
@@ -1047,7 +993,7 @@ def main() -> int:
                 _run_home(client, watcher)
             else:
                 print(exc, file=sys.stderr)
-        return 1 if integrity_failed else 0
+        return 0
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
         return 1

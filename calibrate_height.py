@@ -42,6 +42,7 @@ from mt4_vision.calib import (
     CalibrationError,
     fit_transform,
     load_calibration,
+    update_calibration,
     reprojection_errors,
 )
 from mt4_vision.camera import capture_frame
@@ -65,8 +66,9 @@ from mt4_vision.workspace import (
 )
 
 # Always include calibrated marker centers in the height-probe grid when they
-# aren't already covered. Markers 0/1 (x~35-50) sat ~100mm outside the old
-# PLACEMENT_SLOTS hull; cube-top picks there missed by ~26mm (2026-07-21).
+# aren't already covered. Markers 0/1 (x~35-50) sit ~100mm outside the
+# PLACEMENT_SLOTS hull; unprobed, cube-top picks there miss by ~26mm
+# (measured 2026-07-21).
 MARKER_PROBE_COVER_MM = 25.0
 
 
@@ -117,9 +119,9 @@ GRID_POINTS = PLACEMENT_SLOTS + [
 MATCH_RADIUS_PX = 120.0
 # pick() is open-loop -- no force/current sensing, so a closed gripper isn't
 # proof of a grasp. If the cube is still within this many px of where it sat
-# before the pick, the grasp almost certainly failed (confirmed happening:
-# multiple "successful" placements turned out to be the untouched cube still
-# sitting at its very first starting position).
+# before the pick, the grasp almost certainly failed (seen live: several
+# "successful" placements were the untouched cube still sitting at its very
+# first starting position).
 GRASP_FAIL_RADIUS_PX = 30.0
 # Vision-bootstrap picks (no arm-known position yet) go through the table
 # homography, which reads a cube-top ~this much low in X (height parallax,
@@ -336,7 +338,17 @@ def main() -> int:
                     o for o in new if json.dumps(o, sort_keys=True) not in seen
                 ]
             calib.probe_observations = new
-            calib.save(Path(args.calib))
+            # Only what this script measures, merged onto the file as it stands
+            # now. This closure fires REPEATEDLY through a probe run that takes
+            # minutes, and saving the whole object made every one of those
+            # writes revert the file to its state when the run started --
+            # silently undoing any other calibration finished in between. See
+            # calib.update_calibration.
+            measured = {"probe_observations": calib.probe_observations}
+            if calib.cube_top_homography is not None:
+                measured["cube_top_homography"] = calib.cube_top_homography
+                measured["cube_top_residual"] = calib.cube_top_residual
+            update_calibration(Path(args.calib), based_on=calib, **measured)
 
         def locate_probe(near_xy: tuple[float, float]) -> CubeDetection | None:
             """Re-detect the probe fresh (never trust a carried-over

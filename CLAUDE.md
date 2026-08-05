@@ -15,6 +15,96 @@ Cursor rules with full detail:
 - `.cursor/rules/hardware-investigate.mdc` — investigation workflow, error mapping, recovery
 - `.cursor/rules/flash-ok.mdc` — flash firmware without asking
 
+## Explaining your work (required)
+
+Chat replies are explanations for a competent colleague who has **not** read the code. Written deliverables — docs, plans, code comments — stay dense, thorough and complete. Simplify the prose *around* the work, never the work.
+
+- **Lead with the headline or correction**, in ordinary words.
+- **One idea per sentence.** Short sentences beat compressed ones.
+- **Explain the mechanism before the term.** "The camera looks at the desk from an angle, so a tall object appears shifted sideways" — *then* say parallax.
+- **No metaphors or wordplay standing in for an explanation.** Clever phrasing makes the reader decompress it before they can judge the claim.
+- **Keep every number and observed fact.** Plain does not mean vague, and a measured value beats an adjective.
+- **Bold lead-ins, short paragraphs.** Decisions the user owns go in their own section at the end, stated as choices with consequences.
+
+## Code comments describe the present (required)
+
+A comment says what the code does now, and why it has to be that way. It is not
+a changelog. Git already records what changed and when — `git log`, `git blame`
+and PR descriptions are the history. Someone reading the file wants the current
+contract, not a diff narrative they have to subtract from what they see.
+
+- **No before/after framing.** Do not write "previously", "used to", "no longer",
+  "changed from", "old behaviour was", "as of <date>", "fixed <date>", "this was
+  a literal `True` until", "two things used to stand here". If the sentence only
+  makes sense to someone who saw the old version, cut it.
+- **Keep the constraint, drop the history.** A rule learned from a past bug is
+  worth documenting — as a rule, in the present tense. Write "The guard compares
+  the predicted pose against the current one, so an already-violating pose can
+  still move toward legality." Not "This used to refuse every violating pose,
+  which froze the arm after a reset."
+- **Never narrate removals.** A comment about code that is not there wastes the
+  reader's attention. Delete the code and the comment together.
+- **Keep every number and measured fact** (see "Explaining your work" above).
+  Plain, present-tense comments are still dense. A date stays only when it is
+  part of a live fact — when a calibration was measured, which firmware a
+  constant was verified against — not as a marker of when an edit happened.
+- **Nothing addressed to a reviewer.** No "note the fix here", "as requested",
+  "per feedback", "this is the new version".
+- **One exception:** a compatibility shim, migration path or deprecation really
+  is about the past. State in one line what it is compatible with and the
+  condition for deleting it.
+
+Same rule for docstrings and for comments in firmware, tests and config. It does
+**not** apply to project docs like this file, `docs/`, or commit messages, where
+recording why a decision was made is the point.
+
+## Checks, guards and gates need a reason (required)
+
+Add a check, guard, gate, clamp, retry, fallback or validation for exactly two
+reasons:
+
+1. **The user asked for it.**
+2. **There is empirical evidence it resolves an identified scenario** — an
+   observed failure, a log, a failing test, a measurement, a field case. The
+   scenario has to be nameable: which input, which pose, which state, and what
+   went wrong.
+
+Nothing else qualifies. Do not add one because a failure seems possible, because
+the input "could" be `None`, because a caller "might" pass the wrong type,
+because defensive code feels safer, or because a boundary is untested. A guard
+against an imagined case costs the same as a guard against a real one — a branch
+to read, a path that never runs, and a claim of protection nobody verified — and
+it hides the real failure when it finally arrives.
+
+- **Let unhandled cases fail loudly at the place they occur.** A traceback from
+  the actual line names the scenario for you. A swallowed exception, a silent
+  `return None`, or a clamp to a plausible default destroys that evidence and
+  turns a five-minute fix into a hunt.
+- **No second gate for something already gated.** One predicate, one place —
+  see "Where pick/place is allowed" above, where two convex hulls with different
+  allowances in two files cost 1409 cm² of usable table and dropped three
+  visible cubes from `mt4_scene`.
+- **When a guard is warranted, document the scenario it answers**, in the
+  present tense, with the number or date that established it. A guard whose
+  scenario cannot be stated is a candidate for deletion, not for keeping "just
+  in case".
+- **If you are unsure whether a case is real, say so in the reply** and leave
+  the code assuming the invariant holds. Raising the question costs a sentence;
+  a speculative guard costs a permanent branch and a false sense of coverage.
+
+This does not license removing existing guards. The envelope limits, the work
+region predicate and the column shadow veto all trace to measured failures and
+stay. It governs what gets *added*.
+
+## Reporting task completion (required)
+
+This governs the reply once you've *finished doing* something — not planning, analysis, or investigation replies, which follow "Explaining your work" above.
+
+- **Be brief.** A few sentences, not a report. Skip the step-by-step of what you tried.
+- **Lead with what the user needs to do next.** If something is blocking — you need an approval, a physical check at the arm, a decision only they can make — say that first, in plain terms. If nothing is blocking, say so in one line or drop the section; don't invent a next step to fill space.
+- **Summarize the result in one or two sentences** when it matches what was asked. Add detail only when the result differs from the request or something unexpected happened along the way.
+- **Skip code-level detail.** The user reads code casually, not in depth. Don't name functions, files, or internal mechanisms unless they asked about them directly — say what changed in terms of what it now does, not how the code does it.
+
 ## Primary tools
 
 | Tool | Use |
@@ -50,10 +140,19 @@ reset the arm sits at r = 124.6 mm, already inside the cylinder, so a guard
 that refused every violating pose would freeze it there. Homing is unaffected:
 it pulses the step pins directly and never touches the DDA.
 
-**`GROUND_Z_MM` = 115 sits ~12 mm below actual desk contact (~127).** The
+**`GROUND_Z_MM` = 115 sits ~5 mm below actual desk contact (~120).** The
 guard enforces the floor faithfully; the floor itself is deliberately slack so
-picks at `table_z` = 127.2 have room. Raising it would make the guard prevent
+picks at `table_z` = 120 have room. Raising it would make the guard prevent
 contact rather than limit it, but it would also squeeze every pick.
+
+Desk contact was measured 2026-08-04 by a camera-tracked descent at robot
+(230, −60) and (205, −52): the closed gripper's silhouette advances ~2 px/mm
+while airborne and goes flat from z = 119 down, so commanding 117 or 115 only
+presses harder without moving. **Do not measure the desk by jogging down until
+the arm stops** — it stops at the 115 guard clamp, which feels exactly like the
+desk and is what wrote `table_z` = 115.0 into the calibration. `table_z` = 115
+costs real workspace: it lifts the innermost holdable radius from 140 mm (the
+J1 keep-out) to 157 mm.
 
 ## Where pick/place is allowed
 
@@ -68,7 +167,7 @@ must all hold, and `work_region_block_reason` names the first that fails:
 Do not add a fifth gate somewhere else. The thing this replaced was a convex
 hull of the ArUco marker centres applied twice with different allowances, in
 two files; measured 2026-08-02 it admitted 828 cm² of a table where the arm can
-safely work 2278 cm², and three cubes plainly on the desk were missing from
+safely work 2237 cm², and three cubes plainly on the desk were missing from
 `mt4_scene` entirely. Marker positions describe where paper was taped down,
 not where the desk, the arm, or the camera end.
 
@@ -83,6 +182,7 @@ the arm clear of the back of the frame first.
 - **Empty scene / no cubes** — arm blocking camera, wrong camera index, or cold camera frame.
 - **Serial busy** — stop MCP and other clients before flash or a second script.
 - **`stack_cubes.py`: "No reachable clear spot for <color>"** — the clear/park search came up empty near the stack site; fixed 2026-07-24 (full-circle angle sweep in `clear_aside_xy` + annulus grid fallback in `choose_park_slot`, since corner markers and 8 fixed `PLACEMENT_SLOTS` could exhaust all candidates). If it recurs, the site is likely boxed in on all sides (occupied + work region + shadow), not a hardware fault.
+- **`no stack-safe route` while a stack is standing** — the target sits in the column's *forearm shadow*: further from the base than the stack and within ~40 mm of its bearing, so the forearm would cross over the column. Field case 2026-08-03, `unstack_cubes.py --marker 3`: landing (202, 239) is 93 mm beyond marker 3 and 16 mm off its bearing; with 3 cubes left the forearm reaches 187.3 mm where 192.2 mm is needed. `StackPlanner.column_shadow(levels)` is the shared up-front veto — unstack applies it to scatter landings, stack to pick candidates, so neither commits to a target that will fail routing. It costs ~1.5% of otherwise-valid landings. A recurrence means a *new* place that chooses a table XY without it.
 - **A cube on the desk is missing from `mt4_scene`** — check the summary's `off_table_blobs` count. Non-zero means `detect_cubes` discarded blobs as behind the desk edge; if a real cube is among them the desk polygon is stale, so re-run `calibrate_table_edge.py`.
 
 ## Project context

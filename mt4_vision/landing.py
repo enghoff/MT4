@@ -1,11 +1,11 @@
 """Shared reachable-table XY search for stack clear/park and unstack scatter.
 
 Both scripts need the same underlying gate -- a point the arm can reach, the
-camera can still see, clear of markers/cubes/hull-edge -- and historically
-each reimplemented it with its own hard-won constants. One incident
-(``CLAUDE.md``'s "no reachable clear spot") already came from that drift.
-The search *strategies* still differ (directional push vs random annulus);
-only the predicate and the shared floors live here.
+camera can still see, clear of markers and cubes -- and one copy of it is the
+point of this module. Two hand-tuned copies drift apart, and the drift surfaces
+as ``CLAUDE.md``'s "no reachable clear spot". The search *strategies* still
+differ (directional push vs random annulus); only the predicate and the shared
+floors live here.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from mt4_vision.workspace import (
 # cube parked close to the J1 keep-out was occluded by the arm's own
 # camera-park silhouette and never seen again by later scans.
 LANDING_MIN_RADIUS_MM = 170.0
-# Outer bound for a landing. No longer a radius: camera coverage on this
+# Outer bound for a landing, and a reach bound only. Camera coverage on this
 # oblique mount is not a circle about the base, so ``in_work_region``'s frame
 # projection is what decides how far out a cube may be put down. This constant
 # only stops the search wasting candidates past any possible reach.
@@ -56,12 +56,10 @@ def landing_ok(
 ) -> bool:
     """True when (x, y) is a workable, unconflicted table landing.
 
-    ``calib`` is positional and required on purpose. It used to be a
-    ``require_hull`` flag over the marker-centre hull, defaulting to on, which
-    meant a caller could silently opt out of the only gate that kept a parked
-    cube findable. The work region is not optional for a landing -- putting a
-    cube where it cannot be picked up again is the exact failure this module
-    was written to prevent.
+    ``calib`` is positional and required on purpose: the work region is not
+    optional for a landing. Putting a cube where it cannot be picked up again
+    is the exact failure this module exists to prevent, and a gate a caller can
+    switch off is one that will be switched off.
 
     ``blocked`` is an optional extra veto (stack's camera-LOS shadow corridor).
     ``marker_clearance_mm`` defaults to off so stack can keep relying on the
@@ -204,8 +202,13 @@ def random_landing(
     min_radius_mm: float = LANDING_MIN_RADIUS_MM,
     max_radius_mm: float = LANDING_MAX_RADIUS_MM,
     marker_clearance_mm: float = MARKER_PAPER_CLEARANCE_MM,
+    blocked: Callable[[float, float], bool] | None = None,
 ) -> tuple[float, float] | None:
-    """Random reachable table XY clear of site/markers/avoid, or None."""
+    """Random reachable table XY clear of site/markers/avoid, or None.
+
+    ``blocked`` is the same extra veto ``landing_ok`` takes -- unstack passes
+    the standing column's forearm shadow through it.
+    """
     for _ in range(attempts):
         r = rng.uniform(min_radius_mm, max_radius_mm)
         theta = rng.uniform(0.0, 2.0 * math.pi)
@@ -216,7 +219,7 @@ def random_landing(
             marker_clearance_mm=marker_clearance_mm,
             site_xy=(sx, sy), site_avoid_mm=site_avoid_mm,
             min_radius_mm=min_radius_mm, max_radius_mm=max_radius_mm,
-            avoid_camera_park=True,
+            avoid_camera_park=True, blocked=blocked,
         ):
             return (x, y)
     return None

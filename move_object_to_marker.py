@@ -28,7 +28,6 @@ Example::
 from __future__ import annotations
 
 import argparse
-import shutil
 import sys
 import threading
 import time
@@ -41,6 +40,7 @@ import numpy as np
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import DEFAULT_CALIB_PATH, Calibration, load_calibration
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX, FrameStream, CameraError, capture_frame
+from mt4_vision.console import BottomUI
 from mt4_vision.entities import object_entity
 from mt4_vision.grounding import Detection, GroundingError, detect, health
 from mt4_vision.locate import (
@@ -219,168 +219,6 @@ def _annotate_track(
 def _park(client: Mt4Client, calib: Calibration) -> None:
     retreat_for_camera(client, calib)
     time.sleep(CAMERA_SETTLE_S)
-
-
-def _enable_vt() -> bool:
-    """Turn on ANSI cursor control on Windows consoles; True if usable."""
-    if not sys.stdout.isatty():
-        return False
-    if sys.platform != "win32":
-        return True
-    import ctypes
-
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-    mode = ctypes.c_uint()
-    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-        return False
-    return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
-
-
-class BottomUI:
-    """Fixed prompt (2nd-to-last line) + status (last line); no scroll chatter.
-
-    Background threads call ``set_status``; the main thread blocks in
-    ``read_object`` editing the prompt line in place.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._status = "ready"
-        self._buf = ""
-        self._live = _enable_vt()
-        if self._live:
-            # Reserve the bottom two lines once so history stays above.
-            sys.stdout.write("\n\n")
-            sys.stdout.flush()
-            self._redraw()
-
-    @property
-    def live(self) -> bool:
-        return self._live
-
-    def _size(self) -> tuple[int, int]:
-        sz = shutil.get_terminal_size((80, 24))
-        return max(2, sz.lines), max(20, sz.columns)
-
-    def _redraw(self) -> None:
-        rows, cols = self._size()
-        prompt_row = rows - 1
-        status_row = rows
-        with self._lock:
-            buf = self._buf
-            status = self._status
-        # Truncate so we never wrap (wrapping would scroll).
-        label = "object: "
-        max_buf = max(0, cols - len(label) - 1)
-        if len(buf) > max_buf:
-            buf = buf[-max_buf:]
-        status = status.replace("\n", " ")
-        if len(status) > cols - 1:
-            status = status[: cols - 1]
-        col = len(label) + len(buf) + 1
-        sys.stdout.write(
-            "\033[?25l"
-            f"\033[{prompt_row};1H\033[2K{label}{buf}"
-            f"\033[{status_row};1H\033[2K{status}"
-            f"\033[{prompt_row};{col}H\033[?25h"
-        )
-        sys.stdout.flush()
-
-    def set_status(self, msg: str) -> None:
-        with self._lock:
-            self._status = msg
-        if self._live:
-            self._redraw()
-        else:
-            print(msg, flush=True)
-
-    def read_object(self) -> str | None:
-        """Edit the prompt line until Enter. None on EOF."""
-        if not self._live:
-            try:
-                raw = input("\nobject: ")
-            except EOFError:
-                print()
-                return None
-            return raw.strip()
-
-        with self._lock:
-            self._buf = ""
-        self._redraw()
-
-        if sys.platform == "win32":
-            return self._read_win()
-        return self._read_posix()
-
-    def _read_win(self) -> str | None:
-        import msvcrt
-
-        while True:
-            ch = msvcrt.getwch()
-            if ch in ("\r", "\n"):
-                with self._lock:
-                    line = self._buf.strip()
-                    self._buf = ""
-                self._redraw()
-                return line
-            if ch == "\x03":
-                raise KeyboardInterrupt
-            if ch == "\x1a":
-                return None
-            if ch in ("\x08", "\x7f"):
-                with self._lock:
-                    self._buf = self._buf[:-1]
-                self._redraw()
-                continue
-            if ch in ("\x00", "\xe0"):
-                msvcrt.getwch()
-                continue
-            if ch.isprintable():
-                with self._lock:
-                    self._buf += ch
-                self._redraw()
-
-    def _read_posix(self) -> str | None:
-        import termios
-        import tty
-
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while True:
-                ch = sys.stdin.read(1)
-                if ch in ("\r", "\n"):
-                    with self._lock:
-                        line = self._buf.strip()
-                        self._buf = ""
-                    self._redraw()
-                    return line
-                if ch == "\x04":  # Ctrl+D
-                    return None
-                if ch == "\x03":
-                    raise KeyboardInterrupt
-                if ch in ("\x7f", "\b"):
-                    with self._lock:
-                        self._buf = self._buf[:-1]
-                    self._redraw()
-                    continue
-                if ch.isprintable():
-                    with self._lock:
-                        self._buf += ch
-                    self._redraw()
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-    def close(self) -> None:
-        if not self._live:
-            return
-        rows, _cols = self._size()
-        sys.stdout.write(
-            f"\033[{rows - 1};1H\033[2K\033[{rows};1H\033[2K\033[?25h\n"
-        )
-        sys.stdout.flush()
 
 
 class PickSearch:
@@ -740,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             if tracker is not None and tracker.stopped_by_user():
                 break
-            prompt = ui.read_object()
+            prompt = ui.read_line()
             if prompt is None:
                 break
             if not prompt:

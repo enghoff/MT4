@@ -785,7 +785,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             calib = load_calibration()
             # Omitted yaw squares to the world axes; a bare Grasp would instead
             # preserve whatever wrist the pick left, which is not what "put it
-            # down at (x, y)" means (and not what this tool used to do).
+            # down at (x, y)" means.
             dst = square_place(x, y) if yaw_deg is None else Grasp(x, y, yaw_deg=yaw_deg)
             return place_at(get_client(), calib, dst)
         except Exception as exc:  # noqa: BLE001

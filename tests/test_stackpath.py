@@ -219,6 +219,38 @@ def test_with_site_still_applies_the_column_model():
     assert StackPlanner.free_space(CALIB).pose_safe(*over_column, 3)
 
 
+def test_column_shadow_matches_the_route_it_predicts():
+    """The shadow is the up-front form of "route() will return None", so on
+    the field case that produced that error -- marker 3, 3 levels standing,
+    a table point 93mm radially beyond the site and 16mm off its bearing --
+    the two must agree, and agree the other way for a point off the bearing.
+    """
+    p = planner()
+    behind, beside = (202.0, 239.0), (250.0, -134.0)
+    shadow = p.column_shadow(3)
+    assert shadow(*behind)
+    assert p.route((154.0, 97.0, 216.0), (*behind, CALIB.safe_z), 3) is None
+    assert not shadow(*beside)
+    assert p.route((154.0, 97.0, 216.0), (*beside, CALIB.safe_z), 3) is not None
+
+
+def test_column_shadow_is_empty_without_a_column():
+    behind = (202.0, 239.0)
+    assert not planner().column_shadow(0)(*behind)
+    assert not StackPlanner.free_space(CALIB).column_shadow(3)(*behind)
+
+
+def test_column_shadow_z_defaults_to_the_lowest_height_worked():
+    """table_z is the default because it is the strictest: a point that
+    clears the column at grip height clears it at every carry height above."""
+    p = planner()
+    x, y = 202.0, 239.0
+    assert p.column_shadow(3, z=CALIB.table_z)(x, y)
+    assert p.column_shadow(3)(x, y)
+    # Carrying high enough lifts the forearm over the 3-cube top (187.2mm).
+    assert not p.column_shadow(3, z=190.0)(x, y)
+
+
 def test_stack_only_helpers_refuse_without_a_site():
     p = StackPlanner.free_space(CALIB)
     for call in (
