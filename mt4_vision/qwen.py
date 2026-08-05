@@ -3,7 +3,7 @@
 An HTTP service reached at ``MT4_QWEN_URL`` (default
 ``http://127.0.0.1:8766``). It may run on this machine or on another host --
 if the latter and you reach it by SSH forward, see
-``scripts/start_qwen_tunnel.ps1``. Setup: ``docs/QWEN3-VL.md``.
+``scripts/start_tunnel.ps1``. Setup: ``docs/QWEN3-VL.md``.
 
 Unlike :mod:`mt4_vision.grounding`, which returns boxes, this returns free
 text -- the model answers a question about a frame. When the prompt asks for
@@ -47,7 +47,7 @@ TEMPORAL_PATCH_SIZE = 2
 _UNREACHABLE_HINT = (
     "start the service (`systemctl start qwen3-vl` on the GPU host), or -- if "
     "it runs on another host reached by SSH forward -- "
-    ".\\scripts\\start_qwen_tunnel.ps1"
+    ".\\scripts\\start_tunnel.ps1"
 )
 
 

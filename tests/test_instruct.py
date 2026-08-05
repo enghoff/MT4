@@ -813,7 +813,7 @@ def test_tag_at_names_a_tag_underfoot_and_nothing_further_off():
 #
 # "Find all the pickable objects" has no answer in prose. Which things the arm
 # can take depends on reach, the J1 keep-out, ground Z, the desk polygon and the
-# jaw width, and a model looking at a photograph can see none of them. So the
+# grasp plan, and a model looking at a photograph can see none of them. So the
 # answer is one box per object and the stack measures each and runs the real
 # gate.
 #
@@ -1011,7 +1011,7 @@ def test_the_decision_schema_names_no_object_list():
 
 def test_the_enumeration_prompt_carries_the_task_and_forbids_pre_filtering():
     """The one thing the model must not do here. Reach, the keep-out, the desk
-    edge and the jaw width decide what can be picked up and none is in the
+    edge and the grasp plan decide what can be picked up and none is in the
     photograph -- and the decision prompt's own attempt at a list came back
     reasoning that "the red cube is the only object ... that can be picked up",
     which is the model ruling on geometry it cannot see."""
@@ -1043,7 +1043,7 @@ def test_measure_report_runs_the_pick_gate_on_every_object():
 
     def _fake_measure(_obs, g, *, label=None, object_height_mm=None):
         if g.label == "smudge":
-            return None, "GrabCut found no foreground in that box"
+            return None, "nothing was segmented in that box"
         return _Obj(), ""
 
     def _fake_entity(_obs, _obj, *, eid="obj_1"):
@@ -1068,7 +1068,7 @@ def test_measure_report_runs_the_pick_gate_on_every_object():
     assert [f.pickable for f in found] == [True, False, False]
     assert found[0].note == "pickable"
     assert "max reach" in found[1].note
-    assert "no foreground" in found[2].note
+    assert "nothing was segmented" in found[2].note
     # The unmeasurable one keeps its row rather than shrinking the answer.
     assert "could not be measured" in found[2].line()
     assert "beyond the 350mm max reach" in found[1].line()
@@ -1175,13 +1175,13 @@ def test_a_report_recap_carries_the_gate_verdict_in_model_coordinates():
                           reason="r=356mm is beyond the 350mm max reach"),
         ),
         Finding(3, "smudge", Grounding("smudge", (0.0, 0.0)),
-                trouble="GrabCut found no foreground in that box"),
+                trouble="nothing was segmented in that box"),
     )
     line = instruct.report_recap(obs, rows)
     assert line.startswith("looked at the desk and found 3: ")
     assert "red cube at (500, 500) -- pickable" in line
     assert "stapler at (1000, 1000) -- r=356mm is beyond the 350mm max reach" in line
-    assert "smudge at (0, 0) -- GrabCut found no foreground" in line
+    assert "smudge at (0, 0) -- nothing was segmented" in line
     # Nothing in robot millimetres: the model cannot act in that frame.
     assert "200" not in line and "190" not in line
 

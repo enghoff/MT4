@@ -570,27 +570,23 @@ def object_entity(
     registry whose keys must not be re-derived from list position -- see
     ``build_snapshot``.
 
-    Elongated objects are 180°-periodic (the jaws close *across* the long
-    axis). Compact / near-square extents use the 90° square period instead --
-    grip orientation is not critical when there is no obvious shaft.
+    Objects are 180°-periodic: the yaw is a major axis and the jaws close
+    *across* it, which repeats every half turn and not every quarter.
 
     ``require_clearance=False`` keeps every envelope test and drops only the
     neighbour check. ``scene`` must still be passed either way: it carries the
     calibration that ``_reach_block_reason`` and ``plan_object_grasp`` need,
     and without it the reach test degrades to keep-out and max reach alone.
     """
-    from mt4_vision.locate import is_compact, plan_object_grasp
+    from mt4_vision.locate import plan_object_grasp
 
     reason: str | None = None
     calib = None if scene is None else scene.calib
     reason = _reach_block_reason(obj.x, obj.y, calib)
-    # Where on it can the jaws close, and at what angle? This is the question
-    # that decides a non-cube pick, and the outline's short axis is not an
-    # answer to it -- that says nothing about the width at the point being
-    # gripped. Measured live
-    # 2026-08-02: a stapler picked cleanly when segmentation happened to return
-    # only its 16mm rail, and closed on air when it returned the whole 73mm
-    # body. Same object, same arm, no deliberate choice either time.
+    # Where the jaws go, how they are turned, and how wide the grip will be:
+    # the silhouette's own centre and its own narrow axis. The width is reported
+    # and never gated -- see ``mt4_vision.grasp`` for why a silhouette width is
+    # not a number worth refusing on.
     plan = None
     if reason is None and calib is not None:
         plan, why = plan_object_grasp(obj, calib)
@@ -626,11 +622,13 @@ def object_entity(
         moved = work_region_block_reason(gx, gy, calib)
         if moved is not None:
             reason = f"the best grip on it is at ({gx:.0f}, {gy:.0f}), where {moved}"
-    period = (
-        YAW_PERIOD_SQUARE
-        if is_compact(obj.long_mm, obj.short_mm)
-        else YAW_PERIOD_LONG_AXIS
-    )
+    # 180°, whatever the aspect ratio. The yaw is a major axis and the jaws have
+    # to travel across it, so a half turn is the same grasp and a quarter turn is
+    # a different one. Folding it on the 90° square lattice instead commands a
+    # wrist a quarter turn away for half of all angles -- measured 2026-08-05, a
+    # major axis of 0° resolves to 0° on the square lattice against -90° on this
+    # one -- which closes the jaws along the object rather than across it.
+    period = YAW_PERIOD_LONG_AXIS
     # Measured colour first, then the noun -- the same shape a cube's label has
     # ("green cube"), and for the same reason: the first word is something the
     # detector established and the rest is what the thing is called. The label

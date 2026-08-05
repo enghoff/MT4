@@ -49,8 +49,8 @@ Each step is one capture, one decision, one motion:
     park clear of the camera
         -> one frame -> pixel grid + the decoded ArUco ids drawn on it
         -> Qwen3-VL picks an action and draws a box round what it means
-        -> GrabCut inside that box -> position, size and angle in millimetres
-        -> the physical gates: reach, keep-out, ground, jaw clearance, desk
+        -> SAM 2.1 segments inside that box -> position, size and angle in mm
+        -> the physical gates: reach, keep-out, ground, finger clearance, desk
         -> motion.transfer / pick_at / place_at, off that same frame
         -> park clear of the camera again
 
@@ -70,7 +70,7 @@ nothing to refuse over a name. The box goes straight to the segmenter that
 turns pixels into millimetres.
 
 **Every object is gripped at table height.** The jaws close at ``table_z``, as
-low as they go, oriented by the GrabCut mask's long axis. Nothing on this desk
+low as they go, oriented by the mask's long axis. Nothing on this desk
 is taller than the jaws' vertical clearance, so the lowest grip is always
 available and no pick has to know how tall a thing is to decide its Z.
 
@@ -102,7 +102,7 @@ arrive.
 pickable objects" gets a ``REPORT``, and its list comes from a second call on
 the same frame whose only job is to enumerate. Every box it returns is segmented
 and put through the same gates a pick goes through -- reach, the keep-out,
-ground, the jaw-width plan, the desk polygon. Each object comes back as a
+ground, the grasp plan, the desk polygon. Each object comes back as a
 numbered row with its position, the width the jaws will close across, and either
 "pickable" or the gate that stopped it, with the same numbers drawn on the frame
 in green and red. Nothing moves.
@@ -113,8 +113,8 @@ This is the only place a gate's verdict travels back to the model; everywhere
 else the gates answer the operator and the model decides again blind. A report
 that was the whole answer says so and stops there.
 
-**A refused step is told to the next one.** Reach, the keep-out, ground, jaw
-width and the desk edge all speak in the words of the gate that refused, and
+**A refused step is told to the next one.** Reach, the keep-out, ground, the
+grasp plan and the desk edge all speak in the words of the gate that refused, and
 that sentence goes into the same history. Without it the loop re-decides as
 though nothing had been refused, which is how one out-of-reach blob came to be
 chosen twice running.
@@ -144,7 +144,7 @@ only thing the model does; every millimetre and every safety gate is the
 existing stack's.
 
 Prereqs:
-  * the Qwen3-VL service reachable (``.\\scripts\\start_qwen_tunnel.ps1``)
+  * the Qwen3-VL and SAM 2.1 services reachable (``.\\scripts\\start_tunnel.ps1``)
   * arm free on the serial port, vision calibration present
 """
 

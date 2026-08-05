@@ -15,6 +15,28 @@ Cursor rules with full detail:
 - `.cursor/rules/hardware-investigate.mdc` — investigation workflow, error mapping, recovery
 - `.cursor/rules/flash-ok.mdc` — flash firmware without asking
 
+## Stop the services you start (required)
+
+Starting the MCP server yourself for testing (`python -m mt4_mcp`, in a
+background shell or task) is fine and needs no permission. Shutting it down
+before the turn ends is part of the same job.
+
+- **The server owns the serial port for as long as it lives.** It opens
+  `Mt4Client` at startup and holds it. A copy you started and forgot makes the
+  next flash, `jog.py`, calibration script or second server fail on a busy
+  port — see "Serial busy" under "Typical failure patterns", where the symptom
+  reads as a hardware fault.
+- **Track what you launched** — the background task id or PID — and kill it in
+  the turn where you finish using it, including when the test fails or you
+  change approach mid-way.
+- **Only stop what you started.** The user's own MCP server, editor-managed or
+  launched from their terminal, stays up. If you cannot tell which one you are
+  looking at, say so instead of killing it.
+- **Same rule for any other client that takes the port**: `jog.py`, a
+  `calibrate_*.py` left mid-run, a REPL holding `Mt4Client`.
+- **If something has to stay running** because the user asked for it or the
+  next step needs it, say so in the reply and name how to stop it.
+
 ## Explaining your work (required)
 
 Chat replies are explanations for a competent colleague who has **not** read the code. Written deliverables — docs, plans, code comments — stay dense, thorough and complete. Simplify the prose *around* the work, never the work.

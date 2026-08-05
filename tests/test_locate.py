@@ -21,6 +21,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -316,9 +317,9 @@ def test_measure_falls_back_to_box_when_mask_is_unstable() -> None:
         )
 
     mod._measure_one = shifted
-    # Force GrabCut to fail so we exercise desk then final AABB fallback.
-    real_gc = mod._segment_grabcut
-    mod._segment_grabcut = lambda *a, **k: None
+    # Force the mask path to fail so we exercise desk then final AABB fallback.
+    real_seg = mod._segment_sam
+    mod._segment_sam = lambda *a, **k: None
     try:
         # Mask path would refuse; box around the pen still yields a pose.
         half_l, half_s = PEN_LONG_PX / 2.0, PEN_SHORT_PX / 2.0
@@ -332,88 +333,136 @@ def test_measure_falls_back_to_box_when_mask_is_unstable() -> None:
         )
     finally:
         mod._measure_one = real
-        mod._segment_grabcut = real_gc
+        mod._segment_sam = real_seg
     assert abs(obj.x - PEN_CX * MM_PER_PX) < 6.0
     assert abs(obj.y - PEN_CY * MM_PER_PX) < 6.0
 
 
-def test_grabcut_measures_pen_from_loose_box() -> None:
-    """GrabCut turns a DINO-style AABB (of the rotated silhouette) into a mask."""
-    from mt4_vision.locate import measure_grabcut, refine_at_box
-
+def pen_box(pad: float = 12.0) -> tuple[float, float, float, float]:
+    """The AABB a detector would draw around the rotated pen, loosened by ``pad``."""
     pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
-    pad = 12.0
-    box = (
+    return (
         float(pts[:, 0].min()) - pad,
         float(pts[:, 1].min()) - pad,
         float(pts[:, 0].max()) + pad,
         float(pts[:, 1].max()) + pad,
     )
-    mask, _origin = refine_at_box(pen_frame(), *box)
-    assert mask.sum() > 2000
-    # Mask should be tighter than the padded box area.
-    box_area = (box[2] - box[0]) * (box[3] - box[1])
-    assert mask.sum() < 0.7 * box_area
 
-    obj = measure_grabcut(pen_frame(), *box, CALIB, "pen", confidence=0.55)
+
+def fake_sam(mask: np.ndarray):
+    """Stand in for the SAM service, answering every box with ``mask``.
+
+    The service is a network call, so the box path is exercised here against a
+    known silhouette. What is under test is the plumbing either side of it --
+    box in, crop bounds and millimetres out -- not the model.
+    """
+    from mt4_vision.sam import Mask
+
+    ys, xs = np.nonzero(mask)
+    bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+    def segment(_frame, **_kwargs):
+        return [Mask(object_index=0, score=0.97, area=int(mask.sum()), bbox=bbox, mask=mask)]
+
+    return segment
+
+
+def pen_mask() -> np.ndarray:
+    """The pen's true silhouette, full frame."""
+    m = np.zeros((FRAME_H, FRAME_W), dtype=bool)
+    pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
+    filled = np.zeros((FRAME_H, FRAME_W), dtype=np.uint8)
+    cv2.fillPoly(filled, [np.int32(pts)], 1)
+    m[filled.astype(bool)] = True
+    return m
+
+
+def test_sam_measures_pen_from_loose_box() -> None:
+    """A detector AABB becomes a mask, and the mask becomes millimetres."""
+    from mt4_vision import locate as mod
+    from mt4_vision.locate import measure_sam, refine_at_box
+
+    box = pen_box()
+    real = mod.sam_segment
+    mod.sam_segment = fake_sam(pen_mask())
+    try:
+        mask, origin = refine_at_box(pen_frame(), *box)
+        assert mask.sum() > 2000
+        # The mask is tighter than the padded box it was prompted with.
+        box_area = (box[2] - box[0]) * (box[3] - box[1])
+        assert mask.sum() < 0.7 * box_area
+        # The crop covers the box with its margin, so the stored template has
+        # desk context around the object.
+        assert origin[0] <= box[0] and origin[1] <= box[1]
+
+        obj = measure_sam(pen_frame(), *box, CALIB, "pen", confidence=0.55)
+    finally:
+        mod.sam_segment = real
     assert abs(obj.x - PEN_CX * MM_PER_PX) < 8.0
     assert abs(obj.y - PEN_CY * MM_PER_PX) < 8.0
     assert obj.short_mm < 25.0
     assert obj.confidence == 0.55
 
 
-def test_measure_prefers_grabcut_when_box_given() -> None:
-    """With a detector box, GrabCut runs first (desk measure is not needed)."""
+def test_measure_prefers_the_mask_when_box_given() -> None:
+    """With a detector box, the mask path runs first (desk measure is not needed)."""
     from mt4_vision import locate as mod
     from mt4_vision.locate import measure_with_box_fallback
 
     real = mod.measure
+    real_sam = mod.sam_segment
 
     def boom(*_a, **_k):
-        raise LocateError("desk path should not run when GrabCut succeeds")
+        raise LocateError("desk path should not run when the mask succeeds")
 
-    pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
-    pad = 12.0
-    box = (
-        float(pts[:, 0].min()) - pad,
-        float(pts[:, 1].min()) - pad,
-        float(pts[:, 0].max()) + pad,
-        float(pts[:, 1].max()) + pad,
-    )
+    box = pen_box()
     mod.measure = boom
+    mod.sam_segment = fake_sam(pen_mask())
     try:
         obj = measure_with_box_fallback(
             pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", box=box,
         )
     finally:
         mod.measure = real
+        mod.sam_segment = real_sam
     assert abs(obj.x - PEN_CX * MM_PER_PX) < 8.0
     assert abs(obj.y - PEN_CY * MM_PER_PX) < 8.0
     box_area = (box[2] - box[0]) * (box[3] - box[1])
     assert obj.mask_area_px < 0.7 * box_area
 
 
-def test_measure_falls_back_to_desk_when_grabcut_fails() -> None:
+def test_unreachable_service_refuses_rather_than_measuring_the_box() -> None:
+    """A service outage stops the ladder; the weaker rungs would answer wrongly."""
+    from mt4_vision import locate as mod
+    from mt4_vision.locate import measure_with_box_fallback
+    from mt4_vision.sam import SamError
+
+    def down(*_a, **_k):
+        raise SamError("sam service unreachable at http://127.0.0.1:8767")
+
+    real = mod.sam_segment
+    mod.sam_segment = down
+    try:
+        with pytest.raises(LocateError, match="unreachable"):
+            measure_with_box_fallback(
+                pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", box=pen_box(),
+            )
+    finally:
+        mod.sam_segment = real
+
+
+def test_measure_falls_back_to_desk_when_the_mask_fails() -> None:
     from mt4_vision import locate as mod
     from mt4_vision.locate import measure_with_box_fallback
 
-    real_gc = mod._segment_grabcut
-    mod._segment_grabcut = lambda *a, **k: None
+    real_seg = mod._segment_sam
+    mod._segment_sam = lambda *a, **k: None
     try:
-        pts = cv2.boxPoints(((PEN_CX, PEN_CY), (PEN_LONG_PX, PEN_SHORT_PX), PEN_ANGLE))
-        pad = 12.0
         obj = measure_with_box_fallback(
-            pen_frame(), PEN_CX, PEN_CY, CALIB, "pen",
-            box=(
-                float(pts[:, 0].min()) - pad,
-                float(pts[:, 1].min()) - pad,
-                float(pts[:, 0].max()) + pad,
-                float(pts[:, 1].max()) + pad,
-            ),
-            win=PEN_WIN,
+            pen_frame(), PEN_CX, PEN_CY, CALIB, "pen", box=pen_box(), win=PEN_WIN,
         )
     finally:
-        mod._segment_grabcut = real_gc
+        mod._segment_sam = real_seg
     assert abs(obj.x - PEN_CX * MM_PER_PX) < 6.0
     assert abs(obj.y - PEN_CY * MM_PER_PX) < 6.0
 
@@ -538,27 +587,15 @@ def test_infeasible_past_the_cameras_coverage() -> None:
     assert ok_side, "a 240mm radius cap refuses this; the camera sees it fine"
 
 
-def test_infeasible_wider_than_the_jaws_open() -> None:
+def test_width_never_refuses_a_grasp() -> None:
+    """No width gate anywhere. The jaws open to ~64mm under this model and an
+    80mm silhouette is still feasible: the servo stops on resistance, and a
+    silhouette width reads wide for anything tall (the live stapler measured
+    50mm across on 2026-08-05, wider than the jaws, gripped fine)."""
     calib = _span_calib()
-    # Jaws open to (285-140)/2.25 ~ 64mm.
-    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=40.0), calib)
-    assert ok
-    ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=80.0), calib)
-    assert not ok
-    # The wording comes from locate.jaw_span_block_reason, the one place the
-    # width test lives now -- entities.object_entity shares it, so the policy
-    # loop and the MCP server cannot disagree about what the jaws can hold.
-    assert "80mm" in reason and "64mm" in reason
-
-
-def test_too_open_check_is_skipped_when_uncalibrated() -> None:
-    """Without the measured jaw model there is no jaws-open limit to compare
-    against, and inventing one would refuse valid grasps. Closing too FAR on a
-    wide object only squeezes, which the jaws tolerate."""
-    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=80.0), RIG_CALIB)
-    assert ok
-    ok, _ = grasp_feasibility(_obj(200.0, -60.0, short=17.0), RIG_CALIB)
-    assert ok
+    for short in (9.0, 40.0, 80.0):
+        ok, reason = grasp_feasibility(_obj(200.0, -60.0, short=short), calib)
+        assert ok, f"{short}mm refused: {reason}"
 
 
 def test_narrow_object_allowed_when_the_jaw_model_is_uncalibrated() -> None:

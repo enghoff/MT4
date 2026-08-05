@@ -1,11 +1,11 @@
-"""Tests for antipodal grasp planning (no hardware, no camera).
+"""Tests for grasp planning (no hardware, no camera).
 
-The behaviour under test is the one the stapler exposed on 2026-08-02: the
-narrowest part of the *whole outline* is not the width at the point being
-gripped, and the centroid is often the one place the jaws cannot close.
+The behaviour under test: the jaws go to the object's own centre and close
+across the narrow axis of its silhouette, whatever that axis measures. Width is
+reported and never refused on.
 
-Shapes here are built in robot millimetres directly, so the expected answers
-are arithmetic rather than empirical.
+Shapes here are built in robot millimetres directly, so the expected answers are
+arithmetic rather than empirical.
 
 Run: python tests/test_grasp.py  (or pytest)
 """
@@ -20,14 +20,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mt4_vision.grasp import (
-    FINGER_WIDTH_MM,
-    MIN_GRASP_MM,
-    SPAN_MARGIN_MM,
-    plan_grasp,
-)
-
-JAWS_MM = 36.0
+from mt4_vision.grasp import plan_grasp
 
 
 def _rect(cx, cy, long_mm, short_mm, deg=0.0, step=1.0):
@@ -46,163 +39,117 @@ def _yaw_close(got, want, period=180.0, tol=8.0):
     return min(d, period - d) <= tol
 
 
-# ------------------------------------------------------------- simple cases
+def _plan(shape, *, x=None, y=None):
+    """Plan at the shape's own centroid unless a point is given."""
+    if x is None:
+        x, y = shape.mean(axis=0)
+    return plan_grasp(shape, x=float(x), y=float(y))
 
 
-def test_a_cube_is_grasped_at_its_centre():
-    plan, why = plan_grasp(_rect(200.0, -60.0, 25.0, 25.0), max_span_mm=JAWS_MM)
+# ----------------------------------------------------------- the grasp point
+
+
+def test_the_grasp_point_is_the_point_it_was_given():
+    """Not the mean of the samples. The caller's centre is height-corrected and
+    the mean of a projected cloud is not the projection of its mean."""
+    shape = _rect(200.0, 0.0, 40.0, 25.0)
+    plan, why = _plan(shape, x=213.5, y=-58.25)
     assert plan is not None, why
-    assert abs(plan.x - 200.0) < 3.0 and abs(plan.y + 60.0) < 3.0
-    assert plan.width_mm <= 26.0
-    assert plan.offset_mm < 3.0
+    assert (plan.x, plan.y) == (213.5, -58.25)
 
 
-def test_a_pen_is_grasped_across_its_short_axis():
-    """A 140x9mm pen along the x axis: the jaws must close across y."""
-    plan, why = plan_grasp(_rect(200.0, 0.0, 140.0, 9.0), max_span_mm=JAWS_MM)
+# ----------------------------------------------------------------- the angle
+
+
+def test_a_pen_yaw_is_its_long_axis():
+    """A 140x9mm pen along the x axis. ``yaw_deg`` is the axis the jaws close
+    ACROSS, so it is the pen's long axis and the jaws travel along y."""
+    plan, why = _plan(_rect(200.0, 0.0, 140.0, 9.0))
     assert plan is not None, why
-    assert plan.width_mm < 12.0
-    # yaw_deg is the axis the jaws close ACROSS, i.e. the pen's long axis.
     assert _yaw_close(plan.yaw_deg, 0.0)
-    assert plan.offset_mm < 8.0
+    assert abs(plan.width_mm - 9.0) < 1.5
+    assert abs(plan.length_mm - 140.0) < 1.5
 
 
 def test_a_rotated_pen_is_found_at_its_own_angle():
-    plan, why = plan_grasp(
-        _rect(200.0, 0.0, 140.0, 9.0, deg=35.0), max_span_mm=JAWS_MM
-    )
+    for deg in (35.0, 90.0, 125.0, 170.0):
+        plan, why = _plan(_rect(200.0, 0.0, 140.0, 9.0, deg=deg))
+        assert plan is not None, why
+        assert _yaw_close(plan.yaw_deg, deg), f"{deg}deg read as {plan.yaw_deg}"
+
+
+def test_the_axis_does_not_depend_on_where_the_object_sits():
+    """The PCA is run on the shape, so a translation of the samples -- which is
+    all a height correction is -- moves no axis and no extent."""
+    a, why_a = _plan(_rect(200.0, 0.0, 90.0, 20.0, deg=55.0))
+    shifted = _rect(200.0, 0.0, 90.0, 20.0, deg=55.0) + np.array([27.0, -13.0])
+    b, why_b = _plan(shifted, x=200.0, y=0.0)
+    assert a is not None and b is not None, (why_a, why_b)
+    assert abs(a.yaw_deg - b.yaw_deg) < 1e-6
+    assert abs(a.width_mm - b.width_mm) < 1e-6
+    assert abs(a.length_mm - b.length_mm) < 1e-6
+
+
+def test_a_square_is_planned_at_its_centre_whatever_the_axis():
+    """A square has no meaningful major axis, and it does not need one: every
+    angle is the same grasp, so only the point and the width have to be right."""
+    plan, why = _plan(_rect(200.0, -60.0, 25.0, 25.0))
     assert plan is not None, why
-    assert plan.width_mm < 13.0
-    assert _yaw_close(plan.yaw_deg, 35.0)
-
-
-# ------------------------------------------- the shape that motivated this
-
-
-def _stapler(cx=140.0, cy=-200.0, deg=0.0):
-    """A wide base with a narrow rail on top of it, like the real one.
-
-    150mm long. The base is 70mm across -- wider than the jaws. The rail runs
-    the same length but is only 18mm across. There is no angle at which the
-    whole outline fits between the jaws, and the centroid sits in the base.
-    """
-    base = _rect(cx, cy, 150.0, 70.0, deg=deg)
-    rail = _rect(cx, cy - 0.0, 150.0, 18.0, deg=deg)
-    return np.vstack([base, rail])
-
-
-def test_the_whole_stapler_outline_does_not_fit_the_jaws():
-    """Sanity: the outline's short axis is 70mm, so a whole-outline rule refuses."""
-    pts = _stapler()
-    short = pts[:, 1].max() - pts[:, 1].min()
-    assert short > JAWS_MM
-
-
-def test_a_narrow_handle_is_found_when_the_body_is_too_wide():
-    """A saucepan in plan view: a 60mm body with a 14mm handle off one side.
-
-    The handle is the only grippable part and it is nowhere near the centroid.
-    This is the property the stapler exposed, reduced to something a top-down
-    silhouette can actually express.
-    """
-    body = _rect(140.0, -215.0, 60.0, 60.0)          # y -245 .. -185
-    handle = _rect(140.0, -150.0, 14.0, 70.0)        # y -185 .. -115, 14mm wide
-    plan, why = plan_grasp(np.vstack([body, handle]), max_span_mm=JAWS_MM)
-    assert plan is not None, why
-    assert plan.width_mm <= 18.0, f"gripped {plan.width_mm:.0f}mm"
-    # The grip has to be on the handle, not the body.
-    assert plan.y > -185.0, f"grasp at y={plan.y:.0f} is in the body"
-    assert plan.offset_mm > 5.0, "expected an off-centre grasp"
-
-
-def test_a_corner_is_never_returned_as_a_grasp():
-    """Why CONTACT_FLATNESS_MM exists.
-
-    A diagonal slice near the corner of a 25mm cube is 22mm across -- narrower
-    than any face -- so "minimise the width" alone chooses it. Closing there
-    squeezes a wedge the jaws push out. The grasp must be two facing surfaces.
-    """
-    plan, why = plan_grasp(_rect(200.0, -60.0, 25.0, 25.0), max_span_mm=JAWS_MM)
-    assert plan is not None, why
-    assert _yaw_close(plan.yaw_deg, 0.0, period=90.0), (
-        f"yaw {plan.yaw_deg} is a diagonal, not a face"
-    )
-    assert plan.width_mm > 23.0, f"{plan.width_mm:.1f}mm is a corner, not a face"
-
-
-def test_a_uniformly_too_wide_object_is_refused_with_its_narrowest_width():
-    plan, why = plan_grasp(_rect(200.0, 0.0, 120.0, 70.0), max_span_mm=JAWS_MM)
-    assert plan is None
-    assert "70mm" in why or "69mm" in why or "71mm" in why
-    assert "no angle" in why
-
-
-# ------------------------------------------------------------ finger width
-
-
-def test_a_thin_neck_narrower_than_the_finger_is_not_reported_as_the_grip():
-    """A dumbbell: two 60mm blobs joined by a 6mm neck 4mm long.
-
-    The neck is narrow, but the fingers are 12mm wide, so they straddle it and
-    meet the blobs. The plan must report what the fingers ACTUALLY close on,
-    not the narrowest cross-section anywhere.
-    """
-    # Blobs meet the neck at y = +-2, so a 12mm finger centred on the neck
-    # covers 4mm of each blob as well.
-    left = _rect(200.0, -32.0, 40.0, 60.0)   # y -62 .. -2
-    right = _rect(200.0, 32.0, 40.0, 60.0)   # y   2 ..  62
-    neck = _rect(200.0, 0.0, 6.0, 4.0)       # y  -2 ..   2, 6mm across
-    plan, why = plan_grasp(
-        np.vstack([left, neck, right]), max_span_mm=200.0,
-        finger_width_mm=FINGER_WIDTH_MM,
-    )
-    assert plan is not None, why
-    # A 12mm finger centred on a 4mm neck also covers 4mm of each blob, so the
-    # honest width is the blob width, not 6mm.
-    assert plan.width_mm > 20.0, f"reported {plan.width_mm:.1f}mm across a neck"
+    assert abs(plan.x - 200.0) < 1e-9 and abs(plan.y + 60.0) < 1e-9
+    assert abs(plan.width_mm - 25.0) < 1.5
 
 
 # ----------------------------------------------------------------- refusals
 
 
+def test_a_wide_object_is_planned_not_refused():
+    """No width gate. A 70mm narrow axis is reported and the plan stands: the
+    servo stops on resistance, and a silhouette width reads wide for anything
+    tall (the live stapler measured 50mm across on 2026-08-05)."""
+    plan, why = _plan(_rect(200.0, 0.0, 120.0, 70.0))
+    assert plan is not None, why
+    assert abs(plan.width_mm - 70.0) < 1.5
+    assert _yaw_close(plan.yaw_deg, 0.0)
+
+
+def test_a_stapler_is_gripped_at_its_middle_across_its_body():
+    """A wide base with a narrow rail along it, like the real one.
+
+    The grasp is the centre and the body's cross axis, not the tapered end. A
+    search for the narrowest band instead settles on the handle tip, whose local
+    direction is 39 deg off the body's cross axis -- measured 2026-08-05, that
+    grips the object by one end and lets it swing.
+    """
+    base = _rect(140.0, -200.0, 150.0, 70.0)
+    rail = _rect(140.0, -200.0, 150.0, 18.0)
+    shape = np.vstack([base, rail])
+    plan, why = _plan(shape)
+    assert plan is not None, why
+    assert abs(plan.x - 140.0) < 1.0 and abs(plan.y + 200.0) < 1.0
+    assert _yaw_close(plan.yaw_deg, 0.0), "the jaws must close across the body"
+
+
+def test_a_saucepan_handle_is_not_hunted_for():
+    """A 60mm body with a 14mm handle off one side. The grasp is the centre of
+    the whole mask -- this deliberately does not go looking for the handle."""
+    body = _rect(140.0, -215.0, 60.0, 60.0)
+    handle = _rect(140.0, -150.0, 14.0, 70.0)
+    shape = np.vstack([body, handle])
+    plan, why = _plan(shape)
+    assert plan is not None, why
+    cx, cy = shape.mean(axis=0)
+    assert abs(plan.x - cx) < 1e-9 and abs(plan.y - cy) < 1e-9
+
+
 def test_mask_noise_is_not_a_grasp():
-    speck = _rect(200.0, 0.0, 2.0, 1.0, step=0.25)
-    plan, why = plan_grasp(speck, max_span_mm=JAWS_MM)
+    plan, why = _plan(_rect(200.0, 0.0, 2.0, 1.0, step=0.25))
     assert plan is None
-    assert "noise" in why or "too small" in why or "not enough" in why
+    assert "noise" in why or "not enough" in why
 
 
 def test_too_few_points_is_refused():
-    plan, why = plan_grasp(np.zeros((2, 2)), max_span_mm=JAWS_MM)
+    plan, why = plan_grasp(np.zeros((2, 2)), x=0.0, y=0.0)
     assert plan is None and "not enough" in why
-
-
-def test_a_useless_jaw_range_is_refused():
-    plan, why = plan_grasp(
-        _rect(200.0, 0.0, 25.0, 25.0), max_span_mm=MIN_GRASP_MM + SPAN_MARGIN_MM - 1
-    )
-    assert plan is None and "approach margin" in why
-
-
-def test_the_margin_is_respected():
-    """An object exactly at the jaw limit must be refused, not planned."""
-    plan, _ = plan_grasp(_rect(200.0, 0.0, 60.0, JAWS_MM - 1.0), max_span_mm=JAWS_MM)
-    assert plan is None or plan.width_mm <= JAWS_MM - SPAN_MARGIN_MM
-
-
-# ------------------------------------------------------------- consistency
-
-
-def test_the_plan_lands_inside_the_object():
-    for shape in (
-        _rect(200.0, 0.0, 25.0, 25.0),
-        _rect(200.0, 0.0, 140.0, 9.0, deg=20.0),
-        np.vstack([_rect(140.0, -215.0, 60.0, 60.0), _rect(140.0, -150.0, 14.0, 70.0)]),
-    ):
-        plan, why = plan_grasp(shape, max_span_mm=JAWS_MM)
-        assert plan is not None, why
-        d = np.hypot(shape[:, 0] - plan.x, shape[:, 1] - plan.y).min()
-        assert d < 4.0, f"grasp point is {d:.1f}mm from any part of the object"
 
 
 if __name__ == "__main__":

@@ -1,0 +1,25 @@
+[Unit]
+Description=SAM 2.1 small prompted segmentation service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sam2
+Environment=SAM2_HOST=127.0.0.1
+Environment=SAM2_PORT=8767
+Environment=SAM2_MODEL=facebook/sam2.1-hiera-small
+Environment=SAM2_DEVICE=cuda
+Environment=SAM2_DTYPE=fp16
+Environment=SAM2_COMPILE=1
+Environment=SAM2_CACHE_FRAMES=8
+# Where torch.compile keeps its generated kernels. Compiling the image encoder
+# from nothing takes ~100 s; against a warm cache it takes 5 s, which is the
+# difference between a service that is ready a few seconds after boot and one
+# that is not. Persistent across restarts, rebuilt after a torch upgrade.
+Environment=TORCHINDUCTOR_CACHE_DIR=/opt/sam2/.inductor
+ExecStart=/opt/sam2/.venv/bin/python /opt/sam2/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

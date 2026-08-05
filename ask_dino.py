@@ -16,7 +16,7 @@ that cannot be segmented, are out of reach, fail grasp feasibility, or have no
 free marker are skipped. Loops until Ctrl+C / EOF.
 
 Prereqs:
-  * ``.\\scripts\\start_grounding_tunnel.ps1``
+  * ``.\\scripts\\start_tunnel.ps1``
   * Arm free on the serial port; vision calibration present
 
 Example::
@@ -52,6 +52,7 @@ from mt4_vision.locate import (
     refine_at_hint,
 )
 from mt4_vision.motion import Grasp, transfer
+from mt4_vision.sam import SamError
 from mt4_vision.pickplace import ensure_homed, retreat_for_camera
 from mt4_vision.preview import LivePreview, PreviewStopped
 from mt4_vision.scene import Scene, capture_scene
@@ -190,7 +191,10 @@ def _annotate_track(
         try:
             mask, origin = refine_at_box(frame, d.x1, d.y1, d.x2, d.y2)
             _overlay_mask(out, mask, origin, color=color)
-        except LocateError:
+        except (LocateError, SamError):
+            # The preview is decoration -- the measurement path says plainly
+            # when the segmentation service is down, so falling to the
+            # desk-deviation outline here loses nothing anyone is waiting on.
             try:
                 mask, origin = refine_at_hint(frame, d.cx, d.cy)
                 _overlay_mask(out, mask, origin, color=color)

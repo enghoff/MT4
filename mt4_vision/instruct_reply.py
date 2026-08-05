@@ -133,13 +133,14 @@ class Grounding:
     ``box_px`` is the whole point of asking for a box rather than a point, and
     it buys three things a point cannot:
 
-    * **GrabCut.** ``locate.measure_grabcut`` seeds a silhouette from the box.
-      Measured on one live frame, the desk-deviation path that a bare point
-      feeds segmented 1 of 4 objects; from the box, GrabCut segmented 4 of 4,
-      and landed 6.3-12.4mm from where the HSV cube detector puts the same
-      three cubes.
-    * **A bound on the mask.** Desk-deviation floods into shadow and adjacent
-      objects with nothing to stop it; the box says how far the object goes.
+    * **A segmentation prompt.** ``locate.measure_sam`` turns the box into a
+      silhouette. Measured on live frames, the desk-deviation path that a bare
+      point feeds segmented 1 of 4 objects; from a box the segmenter returns a
+      usable silhouette for every object tried, and lands 6.3-12.4mm from where
+      the HSV cube detector puts the same three cubes.
+    * **A statement of which object.** Desk-deviation floods into shadow and
+      adjacent objects with nothing to stop it; the box says which thing in the
+      frame is meant.
     * **A size check.** A box has an extent, so a reading that puts a stapler
       at 400mm long can be rejected before the arm moves. A point has no
       extent and cannot be sanity-checked at all.
@@ -357,8 +358,9 @@ def measure_grounding(
 ) -> tuple[Any | None, str]:
     """Turn a :class:`Grounding` into a measured object, or say why not.
 
-    Prefers GrabCut from the box and falls back to the desk-deviation point
-    path, which is what ``locate.measure_with_box_fallback`` already arranges.
+    Prefers the mask segmented from the box and falls back to the
+    desk-deviation point path, which is what
+    ``locate.measure_with_box_fallback`` already arranges.
     On failure it retries under the other coordinate reading rather than
     reporting -- the retry still has to survive segmentation, the two-window
     stability check and the work-region gate, so a wrong reading cannot buy

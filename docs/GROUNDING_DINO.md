@@ -118,7 +118,7 @@ ssh -N -L 8765:127.0.0.1:8765 user@gpu-host
 ```
 
 This repo ships a helper for it,
-[scripts/start_grounding_tunnel.ps1](../scripts/start_grounding_tunnel.ps1),
+[scripts/start_tunnel.ps1](../scripts/start_tunnel.ps1),
 which checks whether the port is already listening (printing `/health` if so),
 verifies the key exists, and adds `ExitOnForwardFailure` plus a keepalive.
 Its defaults match the reference deployment below, so override them for yours:
@@ -232,11 +232,15 @@ to the whole prompt string while boxes stay correct.
 
 Detection stops at a box; measurement is separate. Both the CLI and the MCP tool
 hand the box to `locate.measure_with_box_fallback`, which tries three things in
-order — **GrabCut inside the DINO box**, then desk-segment `measure` around the
-box centre, then the raw box AABB. Only the first two recover a true centre,
-long axis and mm size; the AABB fallback inherits whatever slop the box has. So
-a plausible box is not yet a pickable object, and `grasp_feasibility` is what
-decides.
+order — **the SAM 2.1 mask for the DINO box** ([docs/SAM2.md](SAM2.md)), then
+desk-segment `measure` around the box centre, then the raw box AABB. Only the
+first two recover a true centre, long axis and mm size; the AABB fallback
+inherits whatever slop the box has. So a plausible box is not yet a pickable
+object, and `grasp_feasibility` is what decides.
+
+Both services fit on one 8 GB card, so measurement works while DINO is the
+resident detector. If the SAM service is down the measurement refuses and says
+so, rather than dropping to the two weaker rungs.
 
 ---
 

@@ -171,6 +171,53 @@ def cmd_locate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sam(args: argparse.Namespace) -> int:
+    """Segment at a pixel or a box via the SAM 2.1 service (MT4_SAM_URL).
+
+    The mask is what a box or a click is not: an actual silhouette, with a
+    centre of area rather than a box centre. Saved tinted onto the frame so
+    the edge can be judged against the real object.
+    """
+    import numpy as np
+
+    from mt4_vision.sam import SamError, best_per_object, health, segment
+
+    try:
+        print(f"service: {health()}")
+    except SamError as exc:
+        print(exc)
+        return 1
+
+    frame = capture_frame(args.camera)
+    try:
+        masks = segment(
+            frame,
+            points=[args.pixel] if args.pixel else None,
+            boxes=[args.box] if args.box else None,
+        )
+    except SamError as exc:
+        print(exc)
+        return 1
+
+    overlay = frame.copy()
+    for m in masks if args.candidates else best_per_object(masks):
+        if m.bbox is None:
+            print(f"[{m.object_index}] score={m.score:.3f} empty mask")
+            continue
+        print(
+            f"[{m.object_index}] score={m.score:.3f} area={m.area} "
+            f"bbox={m.bbox} centroid=({m.cx:.0f},{m.cy:.0f})"
+        )
+        overlay[m.mask] = (0.55 * overlay[m.mask] + 0.45 * np.array([0, 255, 0])).astype(np.uint8)
+        contours, _ = cv2.findContours(
+            m.mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
+        cv2.circle(overlay, (int(m.cx), int(m.cy)), 5, (0, 0, 255), -1)
+    _save_annotated(overlay, "sam_frame.jpg")
+    return 0 if masks else 1
+
+
 def cmd_grounding(args: argparse.Namespace) -> int:
     """Open-vocab detect via the Grounding DINO service (MT4_GROUNDING_URL)."""
     from mt4_vision.grounding import GroundingError, detect, health
@@ -494,6 +541,22 @@ def main() -> None:
     p.add_argument("--pick", action="store_true", help="then pick top hit (moves the arm)")
     p.add_argument("--port", default="")
     p.set_defaults(func=cmd_grounding)
+
+    p = sub.add_parser(
+        "sam",
+        help="segment at a pixel or box via the SAM 2.1 service (MT4_SAM_URL)",
+    )
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pixel", type=float, nargs=2, metavar=("PX", "PY"))
+    g.add_argument(
+        "--box", type=float, nargs=4, metavar=("X1", "Y1", "X2", "Y2"),
+        help="e.g. a Grounding DINO box",
+    )
+    p.add_argument(
+        "--candidates", action="store_true",
+        help="draw all three candidate masks, not just the best-scoring one",
+    )
+    p.set_defaults(func=cmd_sam)
 
     p = sub.add_parser(
         "transfer",

@@ -1,7 +1,7 @@
 """Grounding DINO HTTP service for open-vocabulary detection.
 
 Binds to 127.0.0.1 by default -- reach it from the MT4 host via SSH tunnel
-(see scripts/start_grounding_tunnel.ps1).
+(see scripts/start_tunnel.ps1).
 """
 
 from __future__ import annotations

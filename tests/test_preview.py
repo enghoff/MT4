@@ -230,7 +230,7 @@ class _Found:
 
 def test_a_report_draws_every_object_and_splits_them_by_the_pick_verdict():
     """The split inside the list is the answer. Which things the arm can take
-    comes from reach, the keep-out, the desk edge and the jaw width -- none of
+    comes from reach, the keep-out, the desk edge and the grasp plan -- none of
     which is in the photograph -- so the picture is the only place the model's
     list and the arm's verdict can be compared."""
     frame = _blank()

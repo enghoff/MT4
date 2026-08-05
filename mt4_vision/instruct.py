@@ -29,7 +29,7 @@ it.** Three rules follow from that, and every one of them is load-bearing:
   object, and each box is measured and put to the pick gates exactly as a
   PICK's is (:func:`measure_report`). That is how "find all the pickable
   objects" gets a true answer: which things the arm can take is a fact about
-  reach, the keep-out, the desk edge and the jaw width, none of which is
+  reach, the keep-out, the desk edge and the grasp plan, none of which is
   visible in the photograph the model is looking at. The list needs its own
   call because a schema listing ``box_2d`` first collapses it to one object,
   and listing the list first sends a TRANSFER's *destination* into the pick
@@ -50,7 +50,7 @@ it.** Three rules follow from that, and every one of them is load-bearing:
 **What refuses, and why that is not second-guessing.** The measurement must
 survive segmentation, the two-window stability check and the plausibility band,
 and the resulting pose must clear reach, the J1 keep-out, ground Z, the
-jaw-width plan and the desk edge (``entities.object_entity``). Those gates read
+grasp plan and the desk edge (``entities.object_entity``). Those gates read
 geometry, never the model's judgement about *what* a thing is. They are what
 makes trusting the rest safe: nothing here can command a pose the envelope
 would reject.
@@ -73,13 +73,14 @@ rather than reporting a physical limit:
 None of the three can produce an illegal pose, and each failure they used to
 prevent is visible on the desk and recoverable.
 
-**Why a box and not a point.** ``box_2d`` unlocks GrabCut, measured at 4 of 4
-objects segmented on a frame where the bare-point desk-deviation path manages
-1 of 4. It also bounds the mask so it cannot flood the desk, and gives an extent
-that can be sanity-checked before the arm moves. See :class:`Grounding`.
+**Why a box and not a point.** ``box_2d`` is what the segmenter is prompted
+with, and from a box it returns a usable silhouette for every object tried on
+this desk -- 5 of 5 including a cube standing on a marker tag -- where the
+bare-point desk-deviation path manages 1 of 4. A box also gives an extent that
+can be sanity-checked before the arm moves. See :class:`Grounding`.
 
 **Grip geometry.** Every object is gripped at ``calib.table_z`` -- as low as the
-jaws go -- with the yaw of the GrabCut mask's long axis. Nothing about the grip
+jaws go -- with the yaw of the segmentation mask's long axis. Nothing about the grip
 *height* depends on how tall the thing is: no object here is taller than the
 jaws' vertical clearance, so the lowest grip is always available.
 
@@ -251,7 +252,7 @@ class Observation:
     # whether to explain refusals at all.
     history: tuple[str, ...] = ()
     # The detections the snapshot was built from. Passed to ``object_entity``
-    # for the calibration it carries, which the reach test and the jaw-width
+    # for the calibration it carries, which the reach test and the grasp
     # plan both need; its cube list is not read on this path. Never reaches
     # the prompt.
     scene: Any = None
@@ -306,7 +307,7 @@ class Action:
     label: str | None = None
     # The source box in frame pixels, and its centre. The box is what gets
     # measured; the centre is what the preview draws and what the desk-deviation
-    # path falls back to when GrabCut cannot cut the box.
+    # path falls back to when nothing can be segmented in the box.
     source: Grounding | None = None
     # Where to release, in frame pixels, and the same reply read as raw pixels
     # as a retry. This is the only destination form: landing on a tag means the
@@ -875,10 +876,11 @@ def measure_source(
 
     Three choices, all deliberate:
 
-    * **GrabCut from the box first.** ``measure_with_box_fallback`` prefers it,
-      falls back to desk-deviation at the box centre, then to the raw box.
-      Measured on one live frame, GrabCut from a box segmented 4 of 4 objects
-      where the point path managed 1 of 4.
+    * **The mask from the box first.** ``measure_with_box_fallback`` prompts
+      SAM 2.1 with the box, falls back to desk-deviation at the box centre,
+      then to the raw box. Measured on live frames, a box prompt segments every
+      object tried where the point path manages 1 of 4. When the service is
+      unreachable it refuses instead of dropping to those weaker rungs.
     * **Height assumed to be ``calib.cube_height_mm``**, not inferred from the
       silhouette. Height cannot be measured from one view, and on this steeply
       oblique mount every millimetre of error in it moves the aim point by
@@ -957,9 +959,10 @@ class Finding:
 
         The width quoted is ``grip_mm``, what the jaws will actually close
         across at the planned grasp point -- **not** the silhouette's extent.
-        GrabCut from a box takes in the object's shadow, so on the nine-cube
-        desk of 2026-08-04 the extent read 38-64mm long for 20mm cubes while
-        ``grip_mm`` read 20.5-28.7mm. The position is sound either way (0.3-8.2
+        A silhouette of a cube on this oblique mount spans its top and its
+        front face together, so on the nine-cube desk of 2026-08-04 the extent
+        read 38-64mm long for 20mm cubes while ``grip_mm`` read 20.5-28.7mm.
+        The position is sound either way (0.3-8.2
         mm from the HSV detector's reading on those nine), but a size column
         two to three times over is worse in an operator's hands than no size
         column, and the grip width is the number the pick is planned on.
@@ -978,11 +981,11 @@ def measure_report(obs: Observation, action: "Action") -> tuple[Finding, ...]:
     """Measure everything a REPORT boxed and ask the pick gates about each.
 
     Object for object, this is the same work :func:`measure_source` does for a
-    single pick: GrabCut inside the box the model drew, on the frame it drew it
-    on, at ``calib.cube_height_mm`` rather than a height read off the silhouette
+    single pick: segmented inside the box the model drew, on the frame it drew
+    it on, at ``calib.cube_height_mm`` rather than a height read off the silhouette
     (see :func:`measure_source` for what inferring it costs). Then
     :func:`source_entity`, which is where reach, the J1 keep-out, ground Z, the
-    desk polygon and the jaw-width plan live.
+    desk polygon and the grasp plan live.
 
     Running the real gate is the whole point of answering with boxes instead of
     prose. "Can the arm pick this up" is geometry the model cannot see, so the
@@ -1018,7 +1021,7 @@ def report_recap(obs: Observation, findings: Sequence["Finding"]) -> str:
 
     This is the only channel by which the model ever learns a physical fact
     about this desk. Every row carries the verdict of ``object_entity`` --
-    reach, the J1 keep-out, ground Z, the desk polygon and the jaw-width plan --
+    reach, the J1 keep-out, ground Z, the desk polygon and the grasp plan --
     which is exactly what the prompt tells it it cannot see in a photograph. A
     report that ends the task throws all of it away.
 
@@ -1043,7 +1046,7 @@ def refusal_recap(
     """A refused attempt as a history line. ``end`` is "source" or "destination".
 
     Without this the model is blind to every gate: history records only
-    completed motions, so a step refused for reach or jaw width leaves no trace
+    completed motions, so a step refused for reach or a grasp plan leaves no trace
     and the next decision is made as if it had never happened. Live, one
     out-of-reach blob was chosen twice running and refused at r=367mm and then
     r=373mm -- one problem, tried again because nothing had said it was a
@@ -1068,13 +1071,13 @@ def source_entity(obs: Observation, obj: Any, *, eid: str = "obj_1") -> Entity:
     """The measured object as an entity, so the pick gate is the shared one.
 
     ``object_entity`` is where reach, the J1 keep-out, ground Z, the desk
-    polygon, the jaw-width plan and neighbour clearance all live, and it is the
+    polygon, the grasp plan and neighbour clearance all live, and it is the
     same function the MCP registration path uses. Routing through it rather
     than re-deriving a pick test here is the reason a box from the model cannot
     command a pose the envelope would have refused.
 
     ``obs.scene`` is passed for the calibration it carries, which the reach
-    test and the jaw-width plan both need. The neighbour check it could also
+    test and the grasp plan both need. The neighbour check it could also
     feed is off here: it counts only ``scene.cubes``, so it refuses a grasp
     beside a cube and permits the identical grasp beside a pen, and this loop
     never tells the model that cubes are a category. A veto the model cannot

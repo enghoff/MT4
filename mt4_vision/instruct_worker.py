@@ -671,7 +671,7 @@ class TaskWorker:
             if action.kind == "REPORT":
                 # Not terminal. The rows carry the arm's verdict on every
                 # object the model boxed -- reach, keep-out, ground, the desk
-                # edge, jaw width -- and handing them to the next step is the
+                # edge, the grasp plan -- and handing them to the next step is the
                 # only way anything the arm knows gets back to the model.
                 findings = self._report(obs, action, instruction, step)
                 history.append(I.report_recap(obs, findings))
@@ -701,6 +701,10 @@ class TaskWorker:
             # stack asks.
             grasp = None
             dest_grasp = None
+            # The measurement behind `grasp`, kept so the live pane can draw
+            # the silhouette the jaws are being sent to. None for a PLACE,
+            # which measures no source.
+            picked = None
             trouble = ""
             # Which half of the move was refused, so the history line can name
             # the target rather than only the complaint. Set where the refusal
@@ -710,8 +714,8 @@ class TaskWorker:
             if action.kind in ("TRANSFER", "PICK"):
                 self._phase("measuring")
                 self._ui.set_status(f"step {step}: measuring the {action.label}")
-                # GrabCut inside the model's box, on the exact frame it drew the
-                # box on. No fresh capture: the arm is parked and nothing else
+                # Segmented inside the model's box, on the exact frame it drew
+                # the box on. No fresh capture: the arm is parked and nothing else
                 # on this desk moves. Height is taken to be the configured cube
                 # height rather than read off the silhouette -- see
                 # instruct.measure_source.
@@ -738,7 +742,7 @@ class TaskWorker:
                         grasp = entity.as_grasp(obs.calib)
                     else:
                         # The physical gate, quoted verbatim. It names reach,
-                        # the J1 keep-out, ground Z, jaw clearance or the desk
+                        # the J1 keep-out, ground Z, the grasp plan or the desk
                         # polygon -- the useful answer, and the only thing here
                         # entitled to override the model.
                         trouble = f"cannot pick it up: {entity.reason}"
@@ -778,7 +782,10 @@ class TaskWorker:
             # Where the jaws will close and open again, as pixels of the desk.
             # Projected with no z: both poses are at table height, where
             # robot_to_pixel is the exact table-plane inverse. The live pane
-            # draws these for as long as the arm is in flight.
+            # draws these for as long as the arm is in flight, together with
+            # the silhouette the pick was measured from -- the object is still
+            # on that spot until the jaws close, so the fill is a live check
+            # that the arm is going to the thing and not beside it.
             self._set(
                 move_from_px=(
                     None if grasp is None
@@ -787,6 +794,10 @@ class TaskWorker:
                 move_to_px=(
                     None if dest_grasp is None
                     else obs.calib.robot_to_pixel(dest_grasp.x, dest_grasp.y)
+                ),
+                move_mask=None if picked is None else picked.mask,
+                move_mask_origin_px=(
+                    (0, 0) if picked is None else picked.mask_origin_px
                 ),
             )
             self._phase("moving")
@@ -855,9 +866,13 @@ class TaskWorker:
                 self._set(error=f"{note}: {exc}")
                 break
             finally:
-                # The arm has stopped, wherever it got to. Leaving the rings up
-                # would draw the finished move over the park that follows it.
-                self._set(move_from_px=None, move_to_px=None)
+                # The arm has stopped, wherever it got to. Leaving the rings
+                # and the silhouette up would draw the finished move over the
+                # park that follows it.
+                self._set(
+                    move_from_px=None, move_to_px=None,
+                    move_mask=None, move_mask_origin_px=(0, 0),
+                )
         else:
             self._ui.emit(f"    -> gave up after {max_steps} steps")
             self._ui.set_status(f"gave up after {max_steps} steps")

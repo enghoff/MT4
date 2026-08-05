@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import cv2
@@ -38,11 +38,13 @@ if TYPE_CHECKING:  # duck-typed at runtime -- see the module docstring
     from mt4_vision.instruct_worker import PlainUI, TaskWorker
 
 from mt4_vision.preview import (
+    QWEN_MASK_BGR,
     LivePreview,
     PreviewStopped,
     VideoRecorder,
     annotate_qwen,
     draw_inset,
+    draw_mask,
     draw_move,
     draw_outlined_text,
     wrap_text,
@@ -143,6 +145,11 @@ class RunState:
     # space, and cleared when the motion call returns.
     move_from_px: tuple[float, float] | None = None
     move_to_px: tuple[float, float] | None = None
+    # The silhouette the grasp was measured from, as the sub-image `locate` cut
+    # out plus where its corner sits. Kept out of equality and repr: it is a
+    # picture, and comparing two states should not compare two arrays.
+    move_mask: np.ndarray | None = field(default=None, compare=False, repr=False)
+    move_mask_origin_px: tuple[int, int] = (0, 0)
     # Oldest first, the same sentences the model is told about on the next
     # step -- so the panel and the prompt cannot drift apart.
     outcomes: tuple[str, ...] = ()
@@ -365,15 +372,25 @@ def compose(
     leaves the window, so the comparison is always available -- what swaps is
     which one is worth the space.
 
-    The live pane carries the move itself while it is the large one -- rings on
-    where the jaws close and where they open again, an arrow between. Those are
-    the poses the arm was given, projected into pixels, so the arm can be
-    watched against its own plan rather than against a memory of the overlay
-    that is now two inches wide in the corner.
+    The live pane carries the move itself while it is the large one -- the
+    silhouette the grasp was measured from, rings on where the jaws close and
+    where they open again, an arrow between. Those are the poses the arm was
+    given, projected into pixels, so the arm can be watched against its own
+    plan rather than against a memory of the overlay that is now two inches
+    wide in the corner.
+
+    The silhouette is drawn where it was *measured*, on the decision frame, not
+    tracked forward. Up to the moment the jaws close that is where the object
+    still is, and the fill either sits on the object or visibly does not --
+    which is the check worth having, since nothing downstream re-measures.
+    After the lift it marks the place the object came from, and the desk
+    showing through it is the object having left.
     """
     if view is None or state.arm_moving:
         main = live.copy()
         draw_outlined_text(main, "LIVE", (14, 28), scale=0.55, color=(220, 220, 220))
+        # Under the rings: the fill is an area and they are marks on it.
+        draw_mask(main, state.move_mask, state.move_mask_origin_px, QWEN_MASK_BGR)
         draw_move(main, state.move_from_px, state.move_to_px)
         if view is not None:
             draw_inset(main, view, "DECIDED")
