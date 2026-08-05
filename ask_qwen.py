@@ -89,6 +89,18 @@ numbered row with its position, the width the jaws will close across, and either
 "pickable" or the gate that stopped it, with the same numbers drawn on the frame
 in green and red. Nothing moves.
 
+Those rows are then handed to the next step, so a task can look before it acts
+-- "find the cubes you can reach and move them" is one instruction, not two.
+This is the only place a gate's verdict travels back to the model; everywhere
+else the gates answer the operator and the model decides again blind. A report
+that was the whole answer says so and stops there.
+
+**A refused step is told to the next one.** Reach, the keep-out, ground, jaw
+width and the desk edge all speak in the words of the gate that refused, and
+that sentence goes into the same history. Without it the loop re-decides as
+though nothing had been refused, which is how one out-of-reach blob came to be
+chosen twice running.
+
 Enumeration needs its own call because the decision prompt cannot do both jobs.
 Measured on a nine-cube desk: asked for a list alongside its usual single-target
 fields it returned **1 of 9** objects, having boxed one cube and copied it into

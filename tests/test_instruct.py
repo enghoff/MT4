@@ -1090,6 +1090,184 @@ def test_a_report_is_saved_with_its_boxes():
     assert _close(d["objects"][0]["point_px"], (200.0, 100.0))
 
 
+# -- what the next step is told -------------------------------------------- #
+#
+# History is the only channel from the stack back to the model, and it carries
+# three kinds of entry: a completed motion, what a report measured, and a step
+# that was refused. The last two are what let a task look before it acts, and
+# stop it re-deciding into the same wall -- live, one out-of-reach blob was
+# chosen twice running and refused at r=367mm and then r=373mm.
+
+
+def test_a_report_does_not_end_the_task_unless_it_says_so():
+    """``finished`` is the whole difference, and absent means keep going.
+
+    The field case, 2026-08-05: "move all cubes to free markers" on a desk whose
+    five markers were all free. The model answered REPORT, giving as its reason
+    that none of them was free. A report that ends the task turns that into an
+    instruction that reports success with nothing moved.
+    """
+    plain = _decide_two_call(
+        REPORT_REPLY, _listing(("red cube", (180, 80, 220, 120))),
+        _desk(), "move all cubes to free markers",
+    )
+    assert plain.ok and not plain.finished
+
+    answered = _decide_two_call(
+        '{"action": "REPORT", "finished": true, "reason": "two things"}',
+        _listing(("red cube", (180, 80, 220, 120))),
+        _desk(), "what is on the desk?",
+    )
+    assert answered.ok and answered.finished
+    assert answered.as_dict()["finished"] is True
+
+
+def test_only_a_literal_true_finishes_a_report():
+    """Anything else leaves the task running, which is the recoverable
+    direction: one more step can still answer DONE, where a task ended early is
+    work never done. The model writes the string "null" for absent fields, so a
+    string-valued field is not evidence of anything."""
+    for said in ('"finished": "true"', '"finished": "yes"', '"finished": null',
+                 '"finished": 1'):
+        act = _decide_two_call(
+            '{"action": "REPORT", ' + said + ', "reason": "listing"}',
+            _listing(("red cube", (180, 80, 220, 120))),
+            _desk(), "move the cubes",
+        )
+        assert act.ok, said
+        assert not act.finished, said
+
+
+def test_finished_is_ignored_on_an_action_that_moves():
+    """A REPORT's list already exists when it claims to be the answer. The same
+    claim on a motion is a prediction about a move not yet made, decided on a
+    frame that predates it -- where DONE is decided on a frame taken after."""
+    act = _decide_on(
+        '{"action": "PICK", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
+        '"label": "cube", "finished": true, "reason": "the cube"}',
+        _desk(),
+        "pick up the cube",
+    )
+    assert act.ok and act.kind == "PICK"
+    assert not act.finished
+
+
+def test_a_report_recap_carries_the_gate_verdict_in_model_coordinates():
+    """The only physical fact about the desk that ever reaches the model.
+
+    Positions are on the 0-1000 grid because that is the space the model wrote
+    the boxes in; robot millimetres name a frame it has no access to. They are
+    what tells three rows all labelled "red cube" apart.
+    """
+    obs = _desk()
+    from mt4_vision.instruct import Finding, Grounding
+
+    rows = (
+        Finding(
+            1, "red cube", Grounding("red cube", (640.0, 360.0)),
+            entity=Entity(id="obj_1", kind="object", label="red cube",
+                          x=200.0, y=-40.0, pickable=True),
+        ),
+        Finding(
+            2, "stapler", Grounding("stapler", (1280.0, 720.0)),
+            entity=Entity(id="obj_2", kind="object", label="stapler",
+                          x=300.0, y=190.0, pickable=False,
+                          reason="r=356mm is beyond the 350mm max reach"),
+        ),
+        Finding(3, "smudge", Grounding("smudge", (0.0, 0.0)),
+                trouble="GrabCut found no foreground in that box"),
+    )
+    line = instruct.report_recap(obs, rows)
+    assert line.startswith("looked at the desk and found 3: ")
+    assert "red cube at (500, 500) -- pickable" in line
+    assert "stapler at (1000, 1000) -- r=356mm is beyond the 350mm max reach" in line
+    assert "smudge at (0, 0) -- GrabCut found no foreground" in line
+    # Nothing in robot millimetres: the model cannot act in that frame.
+    assert "200" not in line and "190" not in line
+
+
+def test_an_empty_report_recap_still_says_something():
+    """"Nothing to list" is a fact about the desk and the next step needs it;
+    an empty string would read as a step that did not happen."""
+    assert "nothing" in instruct.report_recap(_desk(), ())
+
+
+def test_a_refusal_recap_names_the_target_and_quotes_the_gate():
+    """The gate's own words go through verbatim -- the physical constraint it
+    names is the useful part -- and the target is named so the next step knows
+    which of three identical-looking cubes was refused."""
+    obs = _desk()
+    act = _decide_on(
+        '{"action": "PICK", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
+        '"label": "red cube", "reason": "that one"}',
+        obs, "pick up the red cube",
+    )
+    line = instruct.refusal_recap(
+        obs, act, "cannot pick it up: r=367mm is beyond the 350mm max reach",
+        "source",
+    )
+    assert line.startswith("refused ")
+    assert "picking up the red cube at (156, 139)" in line
+    assert "r=367mm is beyond the 350mm max reach" in line
+
+
+def test_a_refused_destination_is_recorded_as_the_destination():
+    """A transfer has two ends and they fail for different reasons. Recording a
+    refused destination as though the pick target were the problem would send
+    the next step looking for a different object when the object was fine."""
+    obs = _desk()
+    a, b = _norm(300.0, 500.0)
+    act = _decide_on(
+        '{"action": "TRANSFER", "box_2d": ' + _norm_box(180, 80, 220, 120) + ', '
+        f'"label": "red cube", "dest_2d": [{a:.4f}, {b:.4f}], '
+        '"reason": "over there"}',
+        obs, "put the red cube on marker 3",
+    )
+    line = instruct.refusal_recap(
+        obs, act, "the destination will not do: it is off the desk", "destination",
+    )
+    assert "putting it down at (234, 694)" in line
+    assert "red cube" not in line
+
+
+def test_refusals_are_explained_in_the_prompt_only_when_there_are_some():
+    """The one history entry a model could read as a general rule. Explaining it
+    when nothing was refused describes something that is not there; not
+    explaining it when something was invites the model to start ruling out
+    targets on geometry it cannot see."""
+    moved = instruct.build_prompt(
+        _desk(history=("moved the green cube onto marker_3",)),
+        "move all cubes to free markers",
+    )
+    assert "What has happened in this task so far" in moved
+    assert "A refused step is a fact about" not in moved
+
+    refused = instruct.build_prompt(
+        _desk(history=(
+            "moved the green cube onto marker_3",
+            "refused picking up the red cube at (900, 300) -- cannot pick it "
+            "up: r=367mm is beyond the 350mm max reach",
+        )),
+        "move all cubes to free markers",
+    )
+    assert "A refused step is a fact about" in refused
+    assert "Choose a different target" in refused
+    # And it must not turn into a licence to pre-filter.
+    assert "not something you can see in the image" in refused
+
+
+def test_the_prompt_says_a_report_does_not_end_the_task():
+    """Both halves of the correction that put this here: REPORT continues, and
+    an impossible movement task is STOP. Live, "move all cubes to free markers"
+    was answered REPORT with the reason that no marker was free -- on a desk
+    where all five were -- and the task ended as a success."""
+    prompt = instruct.build_prompt(_desk(), "move all cubes to free markers")
+    assert "does NOT end the task" in prompt
+    assert "STOP, never REPORT" in prompt
+    assert '"finished": false' in prompt
+    assert "finished belongs to REPORT" in prompt
+
+
 # -- grip geometry --------------------------------------------------------- #
 
 

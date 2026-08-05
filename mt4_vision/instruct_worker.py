@@ -6,7 +6,14 @@ thread never blocks on any of it, so ``/abort`` still lands mid-transfer.
 
 A REPORT resolves to a measurement instead of a motion. Every box the reply
 listed is segmented and put to the same gates a pick has to pass, and those rows
-are the answer -- see :meth:`TaskWorker._report`.
+are the answer -- see :meth:`TaskWorker._report`. It does not end the task: the
+rows go into the history the next step is told about, so a task can look before
+it acts. ``Action.finished`` is how a report that answered the whole question
+stops there.
+
+The history is also where refused steps are recorded. Without them the model
+decides each step as though nothing had ever been refused, which is how one
+out-of-reach blob came to be chosen twice running.
 
 Instructions queue FIFO because there is one arm. Arm chores (home, park, read
 status) go through the same queue rather than running on the prompt thread:
@@ -468,14 +475,13 @@ class TaskWorker:
 
     def _report(
         self, obs: I.Observation, action: I.Action, instruction: str, step: int
-    ) -> None:
+    ) -> tuple[I.Finding, ...]:
         """Measure everything the reply boxed, print the rows, draw the boxes.
 
-        Terminal, and counted as the instruction succeeding. The report *is* the
-        answer to a task that asked what is on the desk, so there is nothing
-        left to do, and another step would put the same question to the same
-        unchanged desk -- the argument a chosen STOP already runs on. A task
-        that wants something moved as well is two instructions.
+        Returns the rows so the caller can put them into the task history. That
+        is the point of running this at all inside a task that is still going:
+        the rows carry the arm's verdict on each object, which is the only
+        physical fact about the desk that ever reaches the model.
 
         Every row goes through the gates a PICK goes through
         (:func:`instruct.measure_report`), so "pickable" on a row is the arm's
@@ -507,6 +513,7 @@ class TaskWorker:
         self._record(obs, action, report=tuple(row.line() for row in findings))
         self._outcome(line)
         self._ui.set_status(line)
+        return findings
 
     def _refused(
         self, reason: str, held: str | None, step: int, max_steps: int
@@ -565,7 +572,12 @@ class TaskWorker:
         return False
 
     def _run_task(self, instruction: str) -> bool:
-        """One instruction to completion. True when the model reported DONE."""
+        """One instruction to completion.
+
+        True when the model called the task finished -- DONE, or a REPORT that
+        said its list was the whole answer. A refusal, a chosen STOP, a motion
+        failure and running out of steps are all False.
+        """
         with self._lock:
             self._publish_state(
                 instruction=instruction, step=0, action="", reason="",
@@ -657,9 +669,17 @@ class TaskWorker:
                 result = True
                 break
             if action.kind == "REPORT":
-                self._report(obs, action, instruction, step)
-                result = True
-                break
+                # Not terminal. The rows carry the arm's verdict on every
+                # object the model boxed -- reach, keep-out, ground, the desk
+                # edge, jaw width -- and handing them to the next step is the
+                # only way anything the arm knows gets back to the model.
+                findings = self._report(obs, action, instruction, step)
+                history.append(I.report_recap(obs, findings))
+                if action.finished:
+                    self._ui.set_status(f"done in {step} step(s)")
+                    result = True
+                    break
+                continue
             if action.declined:
                 self._declined(action.reason, held)
                 break
@@ -682,6 +702,11 @@ class TaskWorker:
             grasp = None
             dest_grasp = None
             trouble = ""
+            # Which half of the move was refused, so the history line can name
+            # the target rather than only the complaint. Set where the refusal
+            # happens: reading it back out of the message text would be one
+            # more place that has to agree with wording written two lines away.
+            refused_at = ""
             if action.kind in ("TRANSFER", "PICK"):
                 self._phase("measuring")
                 self._ui.set_status(f"step {step}: measuring the {action.label}")
@@ -693,6 +718,7 @@ class TaskWorker:
                 picked, why = I.measure_source(obs, action)
                 if picked is None:
                     trouble = f"could not measure what it boxed: {why}"
+                    refused_at = "source"
                 else:
                     entity = I.source_entity(obs, picked)
                     measured = (
@@ -716,10 +742,12 @@ class TaskWorker:
                         # polygon -- the useful answer, and the only thing here
                         # entitled to override the model.
                         trouble = f"cannot pick it up: {entity.reason}"
+                        refused_at = "source"
             if not trouble and action.kind in ("TRANSFER", "PLACE"):
                 dest_grasp, why = I.destination_grasp(obs, action)
                 if dest_grasp is None:
                     trouble = f"the destination will not do: {why}"
+                    refused_at = "destination"
             if trouble:
                 self._ui.emit(f"    {trouble}")
                 self._set(reason=trouble)
@@ -730,6 +758,11 @@ class TaskWorker:
                         (trouble, QWEN_REFUSED_BGR),
                     ],
                 )
+                # Told to the next step, which otherwise decides as if this had
+                # never happened. Only the physical refusals go in: a malformed
+                # reply is about the reply, and there is nothing in it for the
+                # model to route around.
+                history.append(I.refusal_recap(obs, action, trouble, refused_at))
                 if self._refused(trouble, held, step, max_steps):
                     continue
                 break

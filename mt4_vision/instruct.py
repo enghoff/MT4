@@ -34,6 +34,11 @@ it.** Three rules follow from that, and every one of them is load-bearing:
   call because a schema listing ``box_2d`` first collapses it to one object,
   and listing the list first sends a TRANSFER's *destination* into the pick
   field -- both measured; see :func:`build_report_prompt`.
+  A REPORT does not end the task. Its rows go into the next step's history
+  (:func:`report_recap`), which is the only route by which a gate's verdict
+  ever reaches the model -- everywhere else the gates speak to the operator and
+  the model is left guessing. ``Action.finished`` ends it when the list really
+  was the whole answer.
 * **A destination is a point, not an id.** ``dest_2d`` is the only destination
   channel there is, on the same 0-1000 grid the tag positions are printed in.
   Landing on a tag means echoing that tag's listed coordinates back. An id would
@@ -134,6 +139,7 @@ from mt4_vision.instruct_reply import (
     point_readings,
     region_groundings,
     to_frame_pixels,
+    to_model_coords,
 )
 from mt4_vision.preview import annotate_for_pointing
 from mt4_vision.qwen import DEFAULT_URL, QwenError, ask
@@ -145,7 +151,8 @@ __all__ = [
     "box_grounding", "box_readings", "build_prompt", "decide",
     "build_report_prompt", "destination_grasp", "enumerate_objects",
     "measure_grounding", "measure_report", "observe", "point_readings",
-    "region_groundings", "tag_at", "to_frame_pixels", "load_calibration",
+    "refusal_recap", "region_groundings", "report_recap", "tag_at",
+    "to_frame_pixels", "to_model_coords", "load_calibration",
 ]
 
 # A decision is an action, a box, a destination and whatever the model has to
@@ -201,6 +208,16 @@ RETRY_TEMPERATURE = 0.6
 # desk polygon and the width of the jaws, and a model looking at a photograph
 # can see none of those. Boxes can be measured and put to the real gates; a
 # sentence cannot.
+#
+# It does not end the task. Its rows carry those gate verdicts, and passing
+# them into the next step's history is the only way anything the arm knows
+# reaches the model. ``Action.finished`` is how a REPORT that really was the
+# whole answer stops there instead of costing a step to say DONE.
+#
+# DONE and STOP stay terminal. DONE is the success exit; STOP is the model's
+# judgement about the request, and re-asking gets the same judgement in
+# different words -- "open the gripper", which names nothing to look at, was
+# answered STOP six times running, each time reworded.
 ACTIONS = ("TRANSFER", "PICK", "PLACE", "REPORT", "DONE", "STOP")
 
 
@@ -223,9 +240,15 @@ class Observation:
     snapshot: Snapshot
     calib: Calibration
     held: str | None = None
-    # What this task has already done, oldest first, in prose. Without it the
+    # What has happened in this task, oldest first, in prose. Without it the
     # loop is memoryless: a completed task looks exactly like an untouched one,
     # since both show an empty gripper and the same instruction.
+    #
+    # Three kinds of entry, and the model is told what each means: a completed
+    # motion, a report's measured rows (:func:`report_recap`), and a refused
+    # attempt (:func:`refusal_recap`). A refusal entry begins with the word
+    # "refused", which is the contract :func:`build_prompt` reads to decide
+    # whether to explain refusals at all.
     history: tuple[str, ...] = ()
     # The detections the snapshot was built from. Passed to ``object_entity``
     # for the calibration it carries, which the reach test and the jaw-width
@@ -304,6 +327,12 @@ class Action:
     # than dropped because a report is a claim of completeness: "found 4" with a
     # fifth entry silently discarded is a wrong answer to "find all ...".
     report_notes: tuple[str, ...] = ()
+    # A REPORT saying the list is the whole answer, so the task ends here. Read
+    # only on REPORT: it is a claim about a list that already exists, where the
+    # same claim on a motion would be a prediction about a move not yet made,
+    # decided on a frame that predates it. DONE is decided on a frame taken
+    # AFTER the motion, which is the difference worth keeping.
+    finished: bool = False
     raw: str = ""
 
     @property
@@ -350,6 +379,8 @@ class Action:
             ]
         if self.report_notes:
             out["report_notes"] = list(self.report_notes)
+        if self.finished:
+            out["finished"] = True
         return out
 
 
@@ -441,11 +472,8 @@ def _marker_lines(obs: "Observation") -> str:
         pixel = e.pixel
         if pixel is None:
             pixel = obs.calib.robot_to_pixel(e.x, e.y)
-        w, h = obs.size
-        rows.append(
-            f"  {e.id} at ({pixel[0] * COORD_SCALE / w:.0f}, "
-            f"{pixel[1] * COORD_SCALE / h:.0f})"
-        )
+        x, y = to_model_coords(pixel, obs.size)
+        rows.append(f"  {e.id} at ({x:.0f}, {y:.0f})")
     return "\n".join(rows) or "  (no tags decoded in this frame)"
 
 
@@ -476,11 +504,24 @@ def build_prompt(obs: Observation, instruction: str) -> str:
     if obs.history:
         done = "\n".join(f"  {i}. {s}" for i, s in enumerate(obs.history, 1))
         progress = (
-            f"Already carried out for this task, in order:\n{done}\n"
-            "If those steps have completed the task, the answer is DONE. Do not "
-            "repeat work that is already done -- check the desk against the "
-            "task before choosing to act again.\n"
+            f"What has happened in this task so far, in order:\n{done}\n"
+            "If that has completed the task, the answer is DONE. Do not repeat "
+            "work that is already done -- check the desk against the task "
+            "before choosing to act again.\n"
         )
+        # Said only when there is a refusal to explain. A step that was refused
+        # is the one entry the model could read as a general rule, and reading
+        # it that way is how it starts deciding pickability for itself -- which
+        # is the thing it cannot see and is told twice over not to do.
+        if any(s.startswith("refused") for s in obs.history):
+            progress += (
+                "A refused step is a fact about that one target or that one "
+                "destination, and the words after it are the arm's own reason. "
+                "Choose a different target or a different destination rather "
+                "than the same one again. Do not rule anything else out on the "
+                "strength of it: what the arm can reach and grip is still not "
+                "something you can see in the image.\n"
+            )
     else:
         progress = "Nothing has been done for this task yet.\n"
     # Descriptive, not an order: TRANSFER really is one continuous motion where
@@ -531,16 +572,19 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "Choose one action:\n"
         f"{actions}"
         "  PLACE    - put down what is held. dest_2d says where\n"
-        "  REPORT   - the task asks what is on the desk rather than for "
-        "something to be moved: what is there, how many, which ones are a "
-        "certain colour. Nothing moves, and you will be asked separately to "
-        "point out the objects, so no box is needed here\n"
+        "  REPORT   - list what is on the desk: what is there, how many, which "
+        "ones are a certain colour. Nothing moves, and you will be asked "
+        "separately to point out the objects, so no box is needed here. It "
+        "does NOT end the task -- the next step is told what the list found, "
+        "including which of those things the arm can and cannot pick up\n"
         "  DONE     - the task is complete\n"
         "  STOP     - the task cannot be done, or you cannot tell which thing "
-        "is meant\n\n"
+        "is meant. A task that asks for something to be moved and cannot be "
+        "carried out is STOP, never REPORT\n\n"
         "Reply with ONLY a JSON object, no prose, no markdown fence:\n"
         '{"action": "...", "box_2d": [x1, y1, x2, y2], "label": "...", '
-        '"dest_2d": [x, y], "dest_axis_2d": [x, y], "reason": "..."}\n\n'
+        '"dest_2d": [x, y], "dest_axis_2d": [x, y], "finished": false, '
+        '"reason": "..."}\n\n'
         "Every coordinate you give is on a 0-1000 scale across the image: 0 is "
         "the left edge, 1000 the right edge, and the same top to bottom. The "
         "tag positions above are written that way too, and the numbered "
@@ -572,6 +616,13 @@ def build_prompt(obs: Observation, instruction: str) -> str:
         "the line from dest_2d to it is the direction the object should lie "
         "in. Give it only when the task says something about direction; null "
         "otherwise, and the object goes down square to the desk.\n"
+        "finished belongs to REPORT and is ignored everywhere else. It says "
+        "whether the list is the whole answer. A task that only asked what is "
+        "on the desk is answered once the things are listed, so say true. A "
+        "task that also wants something done is not: say false, and the next "
+        "step decides what to do knowing what the list found. When in doubt "
+        "say false -- a task that turns out to be over is one more step, and a "
+        "task ended early is work never done.\n"
         # The one text-derived rule left, and it is about the one datum we
         # supply rather than about the model's own grounding. Measured live
         # 2026-08-03, "place it on marker 0" on a desk of markers 1-4: the model
@@ -962,6 +1013,57 @@ def measure_report(obs: Observation, action: "Action") -> tuple[Finding, ...]:
     return tuple(out)
 
 
+def report_recap(obs: Observation, findings: Sequence["Finding"]) -> str:
+    """A REPORT's rows as one history line, for the next step's prompt.
+
+    This is the only channel by which the model ever learns a physical fact
+    about this desk. Every row carries the verdict of ``object_entity`` --
+    reach, the J1 keep-out, ground Z, the desk polygon and the jaw-width plan --
+    which is exactly what the prompt tells it it cannot see in a photograph. A
+    report that ends the task throws all of it away.
+
+    Positions are on the 0-1000 grid rather than in robot millimetres, because
+    that is the space the model wrote the boxes in and the only one it can act
+    on. They matter for telling rows apart: three cubes on one desk are three
+    rows all labelled "red cube", and a verdict attached to no place is a
+    verdict about nothing.
+    """
+    rows = []
+    for f in findings:
+        x, y = to_model_coords(f.grounding.point_px, obs.size)
+        rows.append(f"{f.label} at ({x:.0f}, {y:.0f}) -- {f.note}")
+    if not rows:
+        return "looked at the desk and found nothing to list"
+    return f"looked at the desk and found {len(rows)}: " + "; ".join(rows)
+
+
+def refusal_recap(
+    obs: Observation, action: "Action", trouble: str, end: str
+) -> str:
+    """A refused attempt as a history line. ``end`` is "source" or "destination".
+
+    Without this the model is blind to every gate: history records only
+    completed motions, so a step refused for reach or jaw width leaves no trace
+    and the next decision is made as if it had never happened. Live, one
+    out-of-reach blob was chosen twice running and refused at r=367mm and then
+    r=373mm -- one problem, tried again because nothing had said it was a
+    problem.
+
+    Begins with "refused", which is the contract :func:`build_prompt` reads to
+    decide whether to explain refusals; the gate's own words follow verbatim,
+    because the physical constraint it names is the useful part.
+    """
+    if end == "destination" and action.dest_point_px is not None:
+        x, y = to_model_coords(action.dest_point_px, obs.size)
+        where = f"putting it down at ({x:.0f}, {y:.0f})"
+    elif action.point_px is not None:
+        x, y = to_model_coords(action.point_px, obs.size)
+        where = f"picking up the {action.label or 'object'} at ({x:.0f}, {y:.0f})"
+    else:
+        where = f"the {action.kind}"
+    return f"refused {where} -- {trouble}"
+
+
 def source_entity(obs: Observation, obj: Any, *, eid: str = "obj_1") -> Entity:
     """The measured object as an entity, so the pick gate is the shared one.
 
@@ -1047,7 +1149,8 @@ def decide(
     **REPORT costs a second call**, :func:`enumerate_objects`, because its
     answer is a list and this prompt cannot produce one -- 1 of 9 objects on a
     nine-cube desk, against 9 of 9 from a prompt that only enumerates. See
-    :func:`build_report_prompt`.
+    :func:`build_report_prompt`. It also reads ``finished``, the one field that
+    decides whether a report ends the task or feeds the next step.
 
     A reply carrying no JSON at all is asked once more, **sampled**. Re-asking
     greedily would be pointless -- same prompt, same weights, same reply -- so
@@ -1106,12 +1209,18 @@ def decide(
         # nothing, so there is no pose to be wrong about, and "there are none"
         # is an answer to the question that was asked. What the list is worth
         # is settled by ``measure_report``, object by object, against the gates.
+        #
+        # ``finished`` is taken only as a literal JSON true. Any other spelling
+        # reads as False, which leaves the task running for one more step --
+        # the recoverable direction, since that step can still answer DONE,
+        # while a wrongly-ended task is work never done.
         found, notes = enumerate_objects(
             obs, instruction, url=url, max_new_tokens=max_new_tokens
         )
         return Action(
             kind, True, why or "report",
-            report=found, report_notes=notes, raw=raw,
+            report=found, report_notes=notes,
+            finished=got.get("finished") is True, raw=raw,
         )
 
     # No gate on the gripper. `held` is a belief typed in by hand (`/held`),
