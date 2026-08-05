@@ -249,7 +249,7 @@ python -m mt4_vision grounding --prompt "pen" --locate
 ```
 
 If the service is on another host and you tunnel to it, open the forward first
-and leave it running — `.\scripts\start_grounding_tunnel.ps1` does that.
+and leave it running — `.\scripts\start_tunnel.ps1` does that.
 
 Model `IDEA-Research/grounding-dino-base`. Full server setup — install,
 supervision, remote access, HTTP API, troubleshooting:
@@ -258,34 +258,24 @@ works without it.
 
 ### Silhouettes instead of boxes
 
-A third optional GPU service wraps `facebook/sam2.1-hiera-small`. Give it a
-pixel or a box and it returns the actual outline of what is there — on the
-reference desk, a click on a small Statue of Liberty figurine comes back as its
-silhouette including the raised torch, which no rectangle and no HSV colour
-threshold describes.
+A second GPU service wraps `facebook/sam2.1-hiera-small`. Give it a pixel or a
+box and it returns the outline of what is there — on the reference desk, a
+click on a small Statue of Liberty figurine comes back as its silhouette
+including the raised torch, which no rectangle and no HSV colour threshold
+describes.
 
 ```powershell
 python -m mt4_vision sam --pixel 737 570              # mask at a pixel
 python -m mt4_vision sam --box 671 523 787 647        # mask inside a box
 ```
 
-A single point is ambiguous — the cube, its top face, or the stack it sits on
-— so the model returns three candidates with its own confidence in each, and
-the client takes the best. The service keeps the encoded frame for the last
-eight images it saw, so a second question about one frame costs about 20 ms of
-service time against 50 for the first.
+Every measurement that starts from a box goes through it: a box from DINO, from
+Qwen, or from re-finding a registered object is a prompt, and the silhouette
+that comes back is what the centre, long axis and grip width are measured from.
+So the open-vocabulary half of this repo needs it running; cube pick/place,
+stacking and calibration never touch it.
 
-**This is also how every box becomes millimetres.** A detector box — from DINO,
-from Qwen, or from re-finding a registered object — is a prompt, and the
-silhouette that comes back is what the centre, long axis and width are measured
-from. Measured on five desk objects, that silhouette is right where a
-colour-model cut is not: a cube standing on a marker tag came back whole at
-3,183 px where a colour-prior cut kept a 353 px fragment of it, and a two-tone
-stapler came back whole rather than as its dark half. When the service is down,
-a box measurement says so rather than falling back to a weaker one.
-
-Setup, HTTP API and the measured fp16 / compile / cache choices:
-[docs/SAM2.md](docs/SAM2.md).
+Setup, HTTP API and the measured configuration: [docs/SAM2.md](docs/SAM2.md).
 
 ### Telling the arm what to do in English
 
@@ -306,9 +296,10 @@ The model is the eyes and nothing else. It gets the frame and the decoded ArUco
 tag numbers — a tag's printed number is the one thing no vision-language model
 can read off an image — and every other object on the desk is its job to see.
 No cube list, no object registry, no preprocessing of what you type. A target
-comes back as a box, which the SAM 2.1 service turns into a silhouette and then
-into a position, a size and a wrist angle in millimetres; reach, the J1 keep-out, ground Z, jaw clearance and the
-desk polygon are all checked before the gripper opens.
+comes back as a box, which the segmenter turns into a silhouette and that into
+a position, a size and a wrist angle in millimetres; reach, the J1 keep-out,
+ground Z, jaw clearance and the desk polygon are all checked before the gripper
+opens.
 
 A task that asks *what is on the desk* rather than for something to be moved is
 answered the same way, one box per object — from a second call whose only job is
@@ -528,14 +519,15 @@ Full hardware detail (board, drivers, flash path) is in
 | [mt4_mcp/](mt4_mcp/) | MCP server (HTTP or stdio) + OAuth |
 | [services/grounding_dino/](services/grounding_dino/) | Grounding DINO GPU service (deployed to a separate host) |
 | [services/qwen3_vl/](services/qwen3_vl/) | Qwen3-VL GPU service (deployed to a separate host) |
-| [scripts/](scripts/) | Diagnostics (`diagnose_pick_accuracy.py`, `validate_scene_live.py`), ngrok + grounding/Qwen tunnel launchers |
+| [services/sam2/](services/sam2/) | SAM 2.1 segmentation service (deployed to a separate host) |
+| [scripts/](scripts/) | Diagnostics (`diagnose_pick_accuracy.py`, `validate_scene_live.py`), ngrok and GPU-service tunnel launchers |
 | [tests/](tests/) | Unit tests |
-| [docs/](docs/) | Calibration guide, hardware reference, assumption audit, Grounding DINO and Qwen3-VL setup, OAuth setup, printable ArUco sheet |
+| [docs/](docs/) | Calibration guide, hardware reference, assumption audit, GPU service setup (Grounding DINO, Qwen3-VL, SAM 2.1), OAuth setup, printable ArUco sheet |
 | [backups/](backups/) | Stock flash/EEPROM images and archived calibrations |
 
 Key `mt4_vision` modules: `calib` (calibration + pixel↔robot transforms),
 `detect`/`scene` (cube detection), `entities` (the addressable snapshot),
-`locate`/`grounding` (non-cube objects), `qwen` (VLM client),
+`locate`/`grounding`/`sam` (non-cube objects), `qwen` (VLM client),
 `instruct`/`instruct_reply`/`instruct_view`/`instruct_worker` (the English
 instruction loop behind `ask_qwen.py`), `grasp`/`wrist` (grasp geometry and J4
 angles), `motion`/`pickplace` (grasp and place primitives),
