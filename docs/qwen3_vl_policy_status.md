@@ -1,45 +1,54 @@
-# Qwen3-VL action policy — build status, 2026-08-02 … 08-03
+# Qwen3-VL action policy — build ledger, 2026-08-02 … 08-03
 
 Companion to `qwen3_vl_mt4_repository_mapped_policy.md`. That document is the
-design; this one is the ledger. What exists, what was measured on hardware,
-what is broken, and what has to be decided.
+design; this one is the ledger. What was built, what was measured on hardware,
+what was broken, and what had to be decided.
 
-Nothing described here is committed. Branch `feature/qwen3-vl-harness`, working
-tree:
+**Read the measurements, not the instructions.** The value here is the hardware
+evidence behind each decision — the numbers, the failure modes, the things that
+were tried and did not work. The code moved on after the last entry, so where
+this document describes current behaviour, the code is the authority.
 
-```
- M CLAUDE.md
- M docs/qwen3_vl_mt4_repository_mapped_policy.md
- M mt4_vision/entities.py
- M mt4_vision/grasp.py
- M mt4_vision/locate.py
- M mt4_vision/preview.py
- M tests/test_entities.py
- M tests/test_locate.py
- M tests/test_preview.py
-?? docs/qwen3_vl_policy_status.md
-?? mt4_vision/discover.py
-?? mt4_vision/instruct.py
-?? run_instruction.py
-?? tests/test_discover.py
-?? tests/test_grasp.py
-?? tests/test_instruct.py
-```
+## Status
 
-Full suite last run: **415 passed** (2026-08-03, after §2v).
+Everything described here is **committed**, on branch `feature/qwen3-vl-harness`
+— it was uncommitted while the ledger was being written, which is why the
+entries read as a working diff. The entries stop at 2026-08-03. Since then:
+
+| Change | Effect on this document |
+|---|---|
+| `run_instruction.py` → **`ask_qwen.py`** (2026-08-04) | Every command line below is written against the current name. The program is continuous; it took the name from a probe harness that was deleted at the same time |
+| `mt4_vision/instruct.py` split into `instruct`, `instruct_reply`, `instruct_view`, `instruct_worker` | §1's table describes the whole layer, no longer one file |
+| A chosen `STOP` now ends the task on its first step | §2's re-asking behaviour is superseded |
+| Enumeration moved to its own service call | Bears directly on §3, which was written when the decision prompt was asked for a list |
+| Desk colour is learned from the frame rather than named | Relevant to §2's colour handling |
+
+Full suite at the last entry: **415 passed** (2026-08-03, after §2v). Currently
+**462 passed**.
+
+Two claims are worth re-checking against the rig before relying on them: §4's
+"nothing has moved the arm yet", and the ranking in §4 generally.
 
 `vision_calibration.json` is **not** version-controlled and was written to —
 `grip_span_s_at_zero_mm` and `grip_span_s_per_mm`, see §2f.
 
-> **Regression, 2026-08-03 07:22.** A `calibrate_*` run overwrote the file and
-> dropped four measured values to `null`: `cam_xy_robot` (was `[518.1, -35.0]`),
-> `cam_height_mm` (244.0), `grip_span_s_at_zero_mm` (212.3) and
-> `grip_span_s_per_mm` (1.881). The jaw-width refusal gate of §2f fails **open**
-> when unmeasured, so it is currently switched off; the nadir and height feed
-> the parallax and height correction in `locate.measure`, which is a candidate
-> for the mask instability in §2b. The previous file survives as
-> `backups/vision_calibration_pre_recalibrate_20260803_072222.json`. Whichever
-> script did this needs to merge rather than rewrite.
+> **Regression, 2026-08-03 07:22, since fixed.** A `calibrate_*` run overwrote
+> the file and dropped four measured values to `null`: `cam_xy_robot` (was
+> `[518.1, -35.0]`), `cam_height_mm` (244.0), `grip_span_s_at_zero_mm` (212.3)
+> and `grip_span_s_per_mm` (1.881). The jaw-width refusal gate of §2f fails
+> **open** when unmeasured, so it was switched off without complaint; the nadir
+> and height feed the parallax and height correction in `locate.measure`, which
+> made it a candidate for the mask instability in §2b. The previous file
+> survives as `backups/vision_calibration_pre_recalibrate_20260803_072222.json`.
+>
+> The cause was `recalibrate_camera.py` rebuilding a fresh `Calibration` naming
+> 16 of 22 fields, so the six it did not name took dataclass defaults —
+> including a jaw model that is a property of the *gripper*, which moving a
+> camera cannot invalidate. `Calibration.save()` now reads what is on disk and
+> raises rather than writing when a field that held a value would hold none. A
+> script that means to invalidate something says so with `save(clearing=(...))`,
+> and the check compares against the file rather than a list of field names, so
+> a field added later cannot re-open the hole.
 
 ---
 
@@ -53,8 +62,12 @@ motor.
 
 | Piece | What it does |
 |---|---|
-> Rewritten 2026-08-03 by §2v. The rows below describe the current code; the
-> pieces §2v deleted are listed there rather than here.
+> Rewritten 2026-08-03 by §2v. The rows below describe the code as of the last
+> entry; the pieces §2v deleted are listed there rather than here.
+>
+> The layer is now four modules — `instruct`, `instruct_reply`, `instruct_view`,
+> `instruct_worker` — and it has tests: `test_instruct.py`,
+> `test_instruct_reply.py`, `test_run_instruction.py`.
 
 | `Observation` | `frame`, `annotated`, `snapshot`, `calib`, `held`, `history`, `scene`. `snapshot` is the full detection and is **never** shown to the model; `.markers` is the model-facing half, and `build_prompt` and the overlay read only that. |
 | `Action` | `kind`, `ok`, `reason`, `label`, `source` (a `Grounding`), `dest_point_px`, `dest_alt_point_px`, `raw`. `ok` means *the reply is well formed for the action it chose* — not that anything was measured or is reachable. No ids at either end: a pick target is a box and a destination is a point. |
@@ -71,11 +84,11 @@ motor.
 Constants: `COORD_SCALE = 1000.0`, `MAX_NEW_TOKENS = 220`, `BIND_RADIUS_MM = 45`.
 (`MOVED_TOLERANCE_MM` went with `reacquire` — nothing re-measures now.)
 
-### `run_instruction.py` — the end-to-end script (new)
+### `ask_qwen.py` — the end-to-end script (new)
 
 ```
-python run_instruction.py --camera 1 "pick up the red cube and place it on marker 2"
-python run_instruction.py --dry-run "pick up the stapler"
+python ask_qwen.py --camera 1 "pick up the red cube and place it on marker 2"
+python ask_qwen.py --dry-run "pick up the stapler"
 ```
 
 Per step: `retreat_for_camera` → `observe` → ground any unmatched noun into
@@ -178,7 +191,7 @@ says the prompt still invites it.
 Reported symptom:
 
 ```
-python run_instruction.py --camera 1 "pick up the stapler and place it on marker 0"
+python ask_qwen.py --camera 1 "pick up the stapler and place it on marker 0"
 found a stapler but could not measure it: could not segment an object at (700, 687)
 ```
 
@@ -260,7 +273,7 @@ coordinate space. A point carries none.
 The command that started this, re-run on hardware after the fixes:
 
 ```
-python run_instruction.py --camera 1 "pick up the stapler and place it on marker 0"
+python ask_qwen.py --camera 1 "pick up the stapler and place it on marker 0"
 
 [1] cubes=2 blockers=0 free_markers=2 occupied=2 unknown=1 free_slots=15 ...
     registered obj_1: stapler at (169, 85) 68x16mm
@@ -415,7 +428,7 @@ alternative is guessing which marker the user meant.
 ### 2h. Live confirmation, everything wired
 
 ```
-python run_instruction.py --camera 1 "pick up the blue cube and put it on marker 3"
+python ask_qwen.py --camera 1 "pick up the blue cube and put it on marker 3"
 
 [1] PICK_ENTITY cube_2 (blue cube)
     -> picked, holding the blue cube -- the origin is clear
@@ -432,7 +445,7 @@ Confirmed by camera.
 The kind guard from §2g broke the main non-cube case within the hour:
 
 ```
-python run_instruction.py --camera 1 "pick up the stapler and place it on marker 4"
+python ask_qwen.py --camera 1 "pick up the stapler and place it on marker 4"
 STOP  reason: the task asks for a marker, which is a place target and cannot be
       picked up, and obj_1 is a object the task never mentions
 ```
@@ -543,7 +556,7 @@ something small looks plausible but wrong.
 ### 2m. Grasp planning on hardware — it works
 
 ```
-python run_instruction.py --camera 1 "pick up the stone and place it on marker 3"
+python ask_qwen.py --camera 1 "pick up the stone and place it on marker 3"
 
 [1] registered obj_1: stone at (213, -72) 49x28mm
     PICK_ENTITY obj_1 (stone)
@@ -690,7 +703,7 @@ at (750, 405), the arm base. See §5 for the decision this raises.
 point while saying nothing about what went wrong: a reply that named `marker_0`
 was refused with "it does not name anything in the list", and a `PLACE_ENTITY`
 naming a cube was refused for the point being 177 px from a slot. Both now say
-what they mean. And `run_instruction.py` now prints the executed grasp and its
+what they mean. And `ask_qwen.py` now prints the executed grasp and its
 offset from the snapshot position, because without it a failed grasp gives no
 way to tell a mis-measured target from a good one badly executed.
 
@@ -739,7 +752,7 @@ should be measured, and offered the alternate reading as a retry the way
 
 ### 2q. A preview window, on by default
 
-`run_instruction.py` opens a live window showing the frame the model looked at
+`ask_qwen.py` opens a live window showing the frame the model looked at
 with its own answer drawn on it (`--no-preview` to suppress; suppressed
 automatically when OpenCV has no GUI, since `LivePreview`'s PIL fallback would
 spawn a system image viewer per update).
@@ -806,7 +819,7 @@ The check added in §2e survived one day. On 2026-08-03 it reported this, with
 the stapler visibly clamped in the jaws:
 
 ```
-python run_instruction.py --camera 1 "pick up the stapler and place it on marker 3"
+python ask_qwen.py --camera 1 "pick up the stapler and place it on marker 3"
 
 [1] registered obj_1: stapler at (-4, 258) 82x36mm
     PICK_ENTITY  obj_1 (stapler)
@@ -858,7 +871,7 @@ the object is in the jaws, it has left the entity list, and where it should go
 was already settled. So `TRANSFER` names both ends in one decision and
 `motion.transfer` carries them out as one planned operation — the pick's lift
 and the carry are the same leg, so the arm never stops between having the object
-and being on its way. `run_instruction` then recalls the arm to camera park.
+and being on its way. `ask_qwen` then recalls the arm to camera park.
 
 Everything that was ever a *pre*-motion check still runs, and now runs on both
 ends before the gripper opens: reach, keep-out, ground, finger clearance, jaw
@@ -904,7 +917,7 @@ Reported symptom, 2026-08-03. The desk's calibration carries markers 1, 2, 3 and
 4, and no marker 0:
 
 ```
-python run_instruction.py --camera 1 "pick up the clamp and place it on marker 0"
+python ask_qwen.py --camera 1 "pick up the clamp and place it on marker 0"
 
 [1] registered obj_1: clamp at (48, 234) 153x25mm
     TRANSFER  obj_1 (clamp)  -> marker_3 (marker 3 (free))
@@ -965,7 +978,7 @@ It reads existence from the **calibration**, not from this frame's decode:
 legible, so a marker in shadow — or under the very object being moved — is still
 "on this desk" and never trips this. What trips it is a number nobody taped
 down. The same check now also runs on `DONE`, because `DONE` is the one claim in
-this layer nothing downstream re-examines: `run_instruction` returns success on
+this layer nothing downstream re-examines: `ask_qwen` returns success on
 it without looking at the desk, and step 3 above was making it.
 
 **2. The attribute check ran against the id the model wrote, never against the
@@ -1005,7 +1018,7 @@ thing, and an unnumbered destination the model remains free to choose.
 
 ### 2t. A run abandoned with the object in the jaws — three causes, fixed
 
-Reported symptom, 2026-08-03, on the newly interactive `run_instruction.py`:
+Reported symptom, 2026-08-03, on the newly interactive `ask_qwen.py`:
 
 ```
 > move stapler to center aruco marker
@@ -1068,7 +1081,7 @@ fix for being too broad.
 The discarded string is still reported as `model_entity_id`, printed as
 `[model said stapler]`, so a reply resolved this way is never silent about it.
 
-**3. A refusal ended the run while the gripper was full.** `run_instruction`
+**3. A refusal ended the run while the gripper was full.** `ask_qwen`
 broke out of the loop on any `ok=False`, which strands whatever is held. With the
 jaws full the step is now retried instead: the next one is a fresh park, a fresh
 frame and a fresh decision, and a refusal caused by the frame rather than the
@@ -1192,11 +1205,15 @@ uncalled (384 lines), along with the tests that pinned them; 11 tests now assert
 the new behaviour instead. Inline comments were rewritten to describe current
 behaviour rather than the history of changes — that history lives in this
 document and in git. Every file on the Qwen path is now under 1000 lines:
-`instruct.py` 900 (was 1611, with `instruct_reply.py` split off),
-`ask_qwen.py` 761 (was 1774, split into `qwen_panel`, `qwen_worker`,
-`qwen_watch`, `qwen_prompts`), `run_instruction.py` 429 (was 1488, split into
+`instruct.py` 900 (was 1611, with `instruct_reply.py` split off), the probe
+harness 761 (was 1774, split into `qwen_panel`, `qwen_worker`, `qwen_watch`,
+`qwen_prompts`), and the instruction script 429 (was 1488, split into
 `instruct_view` and `instruct_worker`). `locate.py` (1139) and `stack_cubes.py`
 (1075) are still over and are not Qwen-specific.
+
+The probe harness and its four modules were deleted on 2026-08-04, and the
+instruction script took its name — so both line counts above refer to files that
+no longer stand side by side.
 
 ---
 
@@ -1721,7 +1738,7 @@ case the gate tested. Backlog item 7 is closed by this rather than sidestepped.
 
 ### 2aa. A destination is a point, never a name — `dest_marker` removed
 
-**The failure.** `run_instruction.py "move the green cube and place it on the
+**The failure.** `ask_qwen.py "move the green cube and place it on the
 red cube"`, live 2026-08-03. Step 2 answered
 `{"action": "PLACE", "dest_marker": "marker_2", "reason": "green cube is
 already held and must be placed on the red cube which is at marker_2"}`. The
@@ -2043,7 +2060,7 @@ again at the moved grasp point. Each has a gate the other lacks. Five callers
 run **both** and hand-reconcile the answers (`mt4_mcp/server.py:445`, `:518`,
 `mt4_vision/__main__.py:147`, `:241`, `move_object_to_marker.py:133`), each with
 its own `if not ok and entity.reason is None:` merge. The acting paths —
-`mt4_pick`, `_reacquire`, `run_instruction` — read only `entity.pickable`, so
+`mt4_pick`, `_reacquire`, `ask_qwen` — read only `entity.pickable`, so
 **the J4 gate never runs where it matters** and an infeasible long-axis grasp is
 discovered by `motion.resolve_yaw_j4` raising mid-move. The two also disagree by
 3 mm about the same jaws: `jaw_span_block_reason` has no margin,
@@ -2066,7 +2083,7 @@ when a physical gate failed.
 label parsers, none of them `Entity`'s.** `unmatched_nouns`' vocabulary build,
 `instruction_attributes`' vocabulary build, `_matches_attributes`' three-way
 dispatch, `wrong_kind_block_reason`'s label split, `register_object`'s word-wise
-merge, the `f"marker {num}"` parse done twice, `run_instruction.py:208`'s
+merge, the `f"marker {num}"` parse done twice, `ask_qwen.py:208`'s
 substring test (inconsistent — substring where the others are word-wise), and
 `server.py:587`'s `label.split()[0]` to recover a colour `entity.color` already
 holds. Fix: compute `Entity.names: frozenset[str]` once at build time from kind
@@ -2079,7 +2096,7 @@ it exists precisely because the label could not answer a question (§2r).
 `discover`'s merge loop uses the same 12 mm but keeps the larger measurement and
 never merges labels; `server._register_object` has **no** dedupe at all, so two
 `mt4_locate_at_pixel` calls on one pen yield `obj_1` and `obj_2` — the exact
-failure `register_object`'s docstring exists to prevent. `run_instruction`'s
+failure `register_object`'s docstring exists to prevent. `ask_qwen`'s
 LOCATE_AT_PIXEL path also writes `objects[f"obj_{n}"]` directly, bypassing the
 deduplicating helper it uses on the grounding path.
 
@@ -2092,7 +2109,7 @@ is acted on with no stability evidence at all. `measure_box` also stores no
 that `grasp.py` was written to replace. Fix: one pipeline parameterised by
 segmentation strategy.
 
-**F. `instruct` depends on `run_instruction` having run the grounding
+**F. `instruct` depends on `ask_qwen` having run the grounding
 pre-pass.** The 75-line ground-measure-register loop lives in the CLI, and
 `_resolve_target` assumes it has already run — so an MCP-driven agent gets
 "register it with LOCATE_AT_PIXEL first" with no mechanism to satisfy it. The
@@ -2115,8 +2132,12 @@ which driver is running; two balanced-delimiter JSON scanners
 (`instruct._first_json_object` and `qwen._json_spans`, **not** drop-in
 equivalent — the fix is one scanner covering both); three entry points for
 "which reading of these numbers" plus two unrelated strategies for choosing
-between them; `ask_qwen.py` re-implements `preview.wrap_text`,
+between them; the probe harness re-implements `preview.wrap_text`,
 `preview.draw_lock_ring` and `preview.LiveFeed`'s threading skeleton.
+
+The last of those went with the probe harness on 2026-08-04 — `instruct_view`
+imports `wrap_text` from `preview`. The two JSON scanners
+(`instruct._first_json_object`, `qwen._json_spans`) both still stand.
 
 **I. Grounding fires once per unmatched *word*, not per noun phrase.** A
 two-word target costs ~1.5 s of extra model time and a second measurement, and

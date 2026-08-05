@@ -17,21 +17,22 @@ intrinsics.
 
 | Situation | Run |
 |-----------|-----|
-| Fresh setup, or the arm base moved | [Full sequence](#the-full-sequence) — all four steps |
+| Fresh setup, or the arm base moved | [Full sequence](#the-full-sequence) — every step |
 | Camera moved / bumped / drifted, base and markers did not | [`recalibrate_camera.py`](#camera-moved-only), then steps 3 and 4 |
 | Markers repositioned or re-printed | Full sequence from step 2 |
 | Cube picks miss by 15–30 mm in a consistent direction | [step 3](#step-3-cube-top-parallax) (`calibrate_height.py`) — this is the classic symptom of a missing cube-top map |
 | Overlay draws the arm's trajectory too low / offset | [step 4](#step-4-camera-nadir-and-lens-height) (`calibrate_camera_nadir.py`) |
-| Arm was power-cycled or reflashed | [step 5](#step-5-j4-wrist-zero) (`calibrate_j4.py`) — MCU state, not in the file |
+| The desk moved, or a cube plainly on it is missing from the scene | [step 5](#step-5-desk-edge) (`calibrate_table_edge.py`) — check `off_table_blobs` first |
+| Arm was power-cycled or reflashed | [step 6](#step-6-j4-wrist-zero) (`calibrate_j4.py`) — MCU state, not in the file |
 | Picks grab air on non-cube objects | [Gripper span model](#optional-gripper-span-model) — uncalibrated by default |
 | Different cube size | Full sequence (the cube edge length feeds the parallax model) |
 | Kinematic constants or step ratios changed | Flash, then full sequence |
 
 ---
 
-## The five layers
+## The six layers
 
-Calibration is not one transform. It is five independent measurements, each
+Calibration is not one transform. It is six independent measurements, each
 fixing a different error source. They stack, and a missing layer degrades
 silently rather than failing loudly.
 
@@ -40,11 +41,17 @@ silently rather than failing loudly.
 | 1 | **Table plane** | `homography`, `bundle_homography`, `table_z`, `safe_z` | Pixel → robot XY for anything lying on the table | Nothing works |
 | 2 | **Cube top** | `cube_top_homography`, `cube_top_residual` | Cubes are detected by their *top* face, 20 mm up — parallax shifts it | ~15–30 mm pick error, warning on stderr |
 | 3 | **Camera geometry** | `cam_xy_robot`, `cam_height_mm` | True parallax at *any* height — drives the trajectory overlay | Overlay draws low; also the cube-top fallback |
-| 4 | **J4 wrist zero** | *(MCU step counter — not in the file)* | "Jaws along the arm" = world J4 0°, so face-aligned picks work | Wrist angles are meaningless; picks hit cube corners |
-| 5 | **Gripper span** | `grip_span_s_at_zero_mm`, `grip_span_s_per_mm` | Closing distance for objects that are not 20 mm cubes | Jaws close on air, pick reports success |
+| 4 | **Desk extent** | `table_polygon_robot`, `frame_size_px` | Where the desk stops, so a pick or place is not sent past its edge | Gate is inert: every point counts as desk |
+| 5 | **J4 wrist zero** | *(MCU step counter — not in the file)* | "Jaws along the arm" = world J4 0°, so face-aligned picks work | Wrist angles are meaningless; picks hit cube corners |
+| 6 | **Gripper span** | `grip_span_s_at_zero_mm`, `grip_span_s_per_mm` | Closing distance for objects that are not 20 mm cubes | Jaws close on air, pick reports success |
 
-Layers 1–3 live in the JSON file. Layer 4 lives in the microcontroller and is
-lost on power cycle. Layer 5 is optional and currently unmeasured on this rig.
+Layers 1–4 live in the JSON file. Layer 5 lives in the microcontroller and is
+lost on power cycle. Layer 6 is optional and currently unmeasured on this rig.
+
+Layer 4 is the odd one: missing, it fails *open* rather than degrading. The
+other layers get less accurate without their measurement, but an absent desk
+polygon means `on_table` accepts everything, so nothing objects to a place
+beyond the edge until a cube is on the floor.
 
 ### Why layer 1 is fit the way it is
 
@@ -98,12 +105,14 @@ python -m mt4_vision markers        # 1. verify the markers are seen
 python calibrate_vision.py          # 2. table plane (interactive, ~5 min)
 python calibrate_height.py          # 3. cube-top parallax (automatic, ~10 min)
 python calibrate_camera_nadir.py    # 4. camera nadir + height (automatic, ~10 min)
-python calibrate_j4.py              # 5. J4 zero (interactive, ~1 min)
-python -m mt4_vision entities       # 6. verify
+python calibrate_table_edge.py      # 5. desk edge (automatic, ~5 s)
+python calibrate_j4.py              # 6. J4 zero (interactive, ~1 min)
+python -m mt4_vision entities       # 7. verify
 ```
 
-Steps 3 and 4 are fully autonomous — the arm places and sweeps its own probe
-cube. Only steps 2 and 5 need a human.
+Steps 3, 4 and 5 are fully autonomous — the arm places and sweeps its own probe
+cube for 3 and 4, and step 5 needs no motion at all. Only steps 2 and 6 need a
+human.
 
 ### Prerequisites
 
@@ -115,6 +124,8 @@ cube. Only steps 2 and 5 need a human.
   out, all within the arm's reach if possible. Sheet:
   [ArUco Markers A4 5x5cm.pdf](ArUco%20Markers%20A4%205x5cm.pdf).
 - Two or three coloured cubes on the desk for steps 3 and 4.
+- For step 5, the surface behind the desk visible above it across the frame,
+  and the arm parked clear of the back of the view.
 - Workspace clear enough to home safely.
 
 ---
@@ -134,8 +145,8 @@ Detects markers and saves an annotated frame. Check that:
 - The markers **span the working area**. The table map is most accurate inside
   their convex hull, and accuracy degrades with distance from it. Nothing is
   rejected for being outside it — where a pick or place is allowed is
-  `workspace.in_work_region`, and what counts as desk is
-  `table_polygon_robot` from `calibrate_table_edge.py`.
+  `workspace.in_work_region`, and what counts as desk is `table_polygon_robot`
+  from [step 5](#step-5-desk-edge).
 
 `--dict scan` tries every dictionary if the ids look wrong.
 
@@ -247,14 +258,16 @@ prompts from it — but these fields go back to defaults:
 |----------|-------|
 | `None` | `cube_top_homography`, `cube_top_residual`, `probe_observations` |
 | `None` | `grip_span_s_at_zero_mm`, `grip_span_s_per_mm` |
+| `None` | `table_polygon_robot`, `frame_size_px` |
 | `{}` | `color_xy_offset_mm` |
 | `700` / `2400` | `travel_speed_us`, `approach_speed_us` |
 | `True` | `face_align_picks` |
 
-So **steps 3 and 4 are not optional after step 2.** Nothing downstream fails
-when they are skipped; cube picks just silently regain 15–30 mm of parallax
-error. There is a one-shot stderr warning at first use, and that is the only
-signal you get.
+So **steps 3, 4 and 5 are not optional after step 2.** Nothing downstream fails
+when they are skipped. Cube picks silently regain 15–30 mm of parallax error,
+with a one-shot stderr warning at first use as the only signal you get. The
+missing desk polygon is quieter still: there is no warning at all, and the
+symptom is a place accepted past the back edge.
 
 ---
 
@@ -445,7 +458,144 @@ It refuses to write with fewer than 2 columns, fewer than 6 rungs, or under
 
 ---
 
-## Step 5: J4 wrist zero
+## Step 5: desk edge
+
+`calibrate_table_edge.py`. Everything up to here answers *where is that pixel in
+robot coordinates*. This step answers a different question: **where does the
+desk stop?** Pick and place need it, because a target that maps to a clean robot
+XY can still be past the back edge, in the air over the floor.
+
+```powershell
+python calibrate_table_edge.py
+```
+
+Takes about five seconds. No arm motion at all — it reads one frame.
+
+### Only the back edge is real
+
+The left, right and near sides run off the camera frame and lie past the arm's
+342 mm reach in every direction, so there is nothing out there to measure and
+nothing that could bind. The stored polygon has one measured side and three
+nominal ones at ±500 mm. `on_table` is a genuine point-in-polygon test, but on
+this rig it is a half-plane in disguise. Replace the desk with a smaller one and
+the other three sides become worth measuring.
+
+### The desk's colour is learned, never named
+
+No surface colour appears anywhere in the script, and none may be added. A
+colour written into the source is a claim about one desk under one light, and it
+survives neither changing. Measured 2026-08-04: a hue window of 8–30 with
+saturation ≥ 40, fitted to this exact desk, admitted **0.0%** of five clear
+patches of the same desk under brighter light, which read hue 4 saturation 27.
+The scan then found only sensor speckle, and seven captures of the static desk
+returned 1, 4, 2, 7, 0, 15 and 7 "clean" columns. A polygon fitted to speckle is
+worse than no polygon, because it is silent and it moves the desk toward the arm.
+
+So the reference comes from the frame being measured. A grid of robot points
+inside the reach envelope at `table_z`, mapped through the table homography,
+lands on desk by construction. Their robust median and spread in Lab is the
+reference, and every later comparison is in units of that spread.
+
+Comparison is on **chroma** (Lab a and b) where chroma will carry it, which the
+scan tries first. Illumination moves L and barely touches a and b: this desk's
+back strip sits in shade 60 L below its lit middle with its chroma right to
+within 1 spread, and judging on L there reports the edge 160 mm off — at +88 mm
+instead of −72 mm, with 138 agreeing columns at 7 mm residual, so nothing
+downstream would question it. Lightness is admitted only when chroma is measured
+to carry nothing, as on a white bench under a black curtain. The output says
+which pass was used.
+
+### Why clutter on the back edge is harmless
+
+The boundary is the top outline of the desk's own **connected region**, read off
+column by column. Nothing is assumed about what stands behind the desk — only
+that it does not look like the desk, and that is measured, not assumed.
+
+A cable across the back edge, an ArUco pad, a cube, the arm's base: each is a
+hole in the region or a notch out of its top, and none disconnects the surface
+or moves its outline. Rules that scan each column independently have to be told
+how much interruption to tolerate, and the right answer differs per column — two
+cables near this desk's back edge push a 40 px-run rule 100 px down the desk
+across the whole left half of the frame.
+
+### Why the fit is robust, and usually constant
+
+The region's top outline is the desk edge in most columns, not all. Where the
+arm and its controller box stand against the back it follows their lower
+silhouette; at the frame borders it follows the desk's vertical side edges.
+Those are minority contaminants — 164 of 320 columns survive on this rig — so
+the fit trims against a constant model before measuring anything.
+
+The edge is modelled as a **constant x** unless the surviving columns genuinely
+span the desk (`MIN_SLOPE_SPAN_MM` = 250). A least-squares slope fitted over a
+66 mm span of y extrapolates to nonsense 300 mm away, and over such a span two
+runs minutes apart produced slopes of +0.05 and −0.26 — another way of saying
+the slope is unmeasured. Over ±342 mm of reach a plausible true tilt moves the
+edge by less than the safety margin, so the constant costs little.
+
+With the surface traced across the frame the span is no longer short and the
+slope becomes a real measurement. Five captures on 2026-08-04 spanning 750 mm of
+robot y agreed on −0.0586 to −0.0618, repeatable to the third decimal, with the
+intercept at −71.7 to −72.6 mm against a jog-touch edge of −72.2 mm.
+
+Residuals around 11 mm are expected and are not slack in the trace, which is
+smooth to 0.47 px between adjacent columns. The boundary sits far outside the
+region the table homography was fitted over, since every marker observation is
+well inside the desk, and near the horizon the extrapolation is worth 1.7 to
+2.2 mm per pixel row. That is what the margin covers.
+
+**Conservative** means the stored edge takes the measured boundary point
+*closest to the arm* — the 90th percentile of mapped x, to shrug off outliers —
+so a tilt either way is absorbed rather than cutting into the wall.
+`EDGE_MARGIN_MM` = 25 mm is then added on top.
+
+### Reading the output
+
+```
+frame 1280x720
+  desk Lab (145,135,163) spread (22.2,2.0,3.0) from 300/500 samples, matched on chroma
+  desk region traced: 541712 px
+  separation: what sits above the boundary is 4.0 spreads from the desk
+  69/320 columns found a boundary
+
+back edge (robot frame): x = +0.0000*y -111.5   [constant (y span 239mm < 250mm)]
+  inliers 35/69   measured x range -247.1 .. -102.7mm   rms 48.0mm
+```
+
+- **`matched on chroma`** is the good case. `matched on lightness` means chroma
+  carried nothing and the fallback ran; treat the result with more suspicion.
+- **`separation`** is the decision, not a setting: how far the material above
+  the boundary sits from the desk, in spreads. Under `MIN_SEPARATION_SIGMA` = 4
+  the script refuses rather than guessing.
+- **`[constant]` vs a fitted slope** tells you whether the y span was long
+  enough for the tilt to be measured.
+- **rms** is the fit residual. Around 11 mm is normal here; the 48 mm above is
+  a failing run.
+
+It refuses to write, naming the first criterion missed, when separation is under
+4 spreads, when fewer than `MIN_EDGE_COLUMNS` = 60 columns survive the fit, when
+those columns cover under `MIN_EDGE_SPAN_PX` = 400 px of frame width, or when
+the residual exceeds `MAX_EDGE_RMS_MM` = 15 mm. The transcript above is a real
+refusal: 35 surviving columns over 184 px, which is a local feature rather than
+a desk edge.
+
+`--dry-run` measures and reports without writing. `--save-overlay PATH` draws
+the traced boundary over the frame, which is the fastest way to see whether it
+followed the desk or something standing on it. `--margin-mm` overrides the
+25 mm pull-back.
+
+### Running this turns a gate on
+
+A calibration with no polygon accepts every point, so `on_table` is inert until
+the first successful run. Afterwards, places and picks past the fitted edge
+start being refused, and cubes dropped as off-desk appear in the scene summary's
+`off_table_blobs` count. If a cube plainly on the desk goes missing from
+`mt4_scene`, check that count first — a non-zero value with a real cube among
+them means the polygon is stale.
+
+---
+
+## Step 6: J4 wrist zero
 
 `calibrate_j4.py`. J4 has no home switch. Its step counter starts at 0 wherever the wrist happened
 to sit at boot. Face-aligned picks need a known relationship between "jaws along
@@ -482,7 +632,7 @@ detects that it is missing.
 
 ---
 
-## Step 6: verify
+## Step 7: verify
 
 ```powershell
 python -m mt4_vision entities            # ids, positions, pickable + why not
@@ -521,6 +671,10 @@ python calibrate_height.py          # required -- cube-top map was cleared
 python calibrate_camera_nadir.py    # required -- camera pose was cleared
 ```
 
+The desk polygon is not in that list. It is stored in robot coordinates, and
+under this section's own assumption the desk did not move, so it survives a
+camera move intact.
+
 It loads the stored robot XYs (no arm motion at all), captures a fresh frame,
 auto-detects each marker's current pixel centre and corners, refits through the
 same `fit_table_map()` step 2 uses, backs up the old calibration to
@@ -556,27 +710,34 @@ carried through refits — dropping it would silently re-arm that trap.
 
 ## What each entry point preserves
 
-| Field | `calibrate_vision` | `recalibrate_camera` | `calibrate_height` | `calibrate_camera_nadir` |
-|-------|:---:|:---:|:---:|:---:|
-| `homography`, `bundle_homography` | **writes** | **writes** | keeps | keeps |
-| `raw_marker_observations` | **writes** | **writes** (new pixels, old robot, flags kept) | keeps | keeps |
-| `table_z`, `safe_z`, `cube_height_mm` | prompts | keeps | keeps | keeps |
-| `grip_open_s`, `grip_close_s` | prompts | keeps | keeps | keeps |
-| `cube_top_homography`, `cube_top_residual` | **cleared** | **cleared** | **writes** | keeps |
-| `probe_observations` | **cleared** | **cleared** | **writes** | keeps |
-| `cam_xy_robot` | kept | **cleared** | keeps | **writes** |
-| `cam_height_mm` | prompts (seed) | **cleared** | keeps | **writes** |
-| `color_ranges` | kept | kept | keeps | keeps |
-| `color_xy_offset_mm` | **cleared** | **cleared** | keeps | keeps |
-| `grip_span_s_*` | **cleared** | **cleared** | keeps | keeps |
-| `travel_speed_us`, `approach_speed_us` | **reset to default** | keeps | keeps | keeps |
-| `face_align_picks` | **reset to true** | keeps | keeps | keeps |
+| Field | `calibrate_vision` | `recalibrate_camera` | `calibrate_height` | `calibrate_camera_nadir` | `calibrate_table_edge` |
+|-------|:---:|:---:|:---:|:---:|:---:|
+| `homography`, `bundle_homography` | **writes** | **writes** | keeps | keeps | keeps |
+| `raw_marker_observations` | **writes** | **writes** (new pixels, old robot, flags kept) | keeps | keeps | keeps |
+| `table_z`, `safe_z`, `cube_height_mm` | prompts | keeps | keeps | keeps | keeps |
+| `grip_open_s`, `grip_close_s` | prompts | keeps | keeps | keeps | keeps |
+| `cube_top_homography`, `cube_top_residual` | **cleared** | **cleared** | **writes** | keeps | keeps |
+| `probe_observations` | **cleared** | **cleared** | **writes** | keeps | keeps |
+| `cam_xy_robot` | kept | **cleared** | keeps | **writes** | keeps |
+| `cam_height_mm` | prompts (seed) | **cleared** | keeps | **writes** | keeps |
+| `table_polygon_robot`, `frame_size_px` | **cleared** | kept | keeps | keeps | **writes** |
+| `color_ranges` | kept | kept | keeps | keeps | keeps |
+| `color_xy_offset_mm` | **cleared** | **cleared** | keeps | keeps | keeps |
+| `grip_span_s_*` | **cleared** | **cleared** | keeps | keeps | keeps |
+| `travel_speed_us`, `approach_speed_us` | **reset to default** | keeps | keeps | keeps | keeps |
+| `face_align_picks` | **reset to true** | keeps | keeps | keeps | keeps |
 
 The clears are mostly deliberate: a cube-top map, a camera pose, and
 colour-centroid offsets are all functions of the viewing geometry, so a
 camera-side change invalidates them. Note that `grip_span_s_*` and the two speed
 fields are also lost on a full recalibration — if you have measured a jaw-span
 model, save the values before re-running step 2.
+
+The desk polygon splits the two camera-side entry points, because it is stored
+in robot coordinates rather than pixels. `recalibrate_camera` keeps it: the
+camera moved, the desk did not. `calibrate_vision` clears it, because a full
+re-touch admits the arm or the desk may have moved as well, and a polygon
+measured against the old base position would put the edge in the wrong place.
 
 ---
 
@@ -619,8 +780,12 @@ failure mode with no detector.
 | `Grasp likely failed` repeatedly (step 3) | The bootstrap map is poor where that cube sits. It auto-rotates cubes after 2 failures; put a cube nearer the base |
 | `Columns lack y-spread` (step 4) | Too few columns survived reach/occlusion. Clear the desk and retry |
 | `Fit rms ... exceeds 35mm -- refusing to write` (step 4) | A mis-tracked sweep. Check for a second same-coloured cube confusing the elimination logic |
+| `the desk and the surface behind it differ by only N spreads` (step 5) | Nothing to find by appearance. Change the lighting or what stands behind the desk; the fallback to lightness has already been tried |
+| `only N of M columns found a boundary at all` (step 5) | The back edge is occluded. Park the arm clear of the back of the frame |
+| `only N columns survived the fit` / `cover only N px of frame width` (step 5) | A local feature, not the desk edge. `--save-overlay` shows what it traced |
 | `err mp segment` mid-calibration | Arm stranded low, often J4 at a soft limit. Home and park before retrying |
-| Picks hit cube corners rather than faces | Step 5 not run this power cycle |
+| Picks hit cube corners rather than faces | Step 6 not run this power cycle |
+| A cube plainly on the desk is missing from the scene | Check the scene summary's `off_table_blobs`. Non-zero with a real cube among them means a stale polygon — re-run step 5 |
 | Empty scene / no cubes | Arm blocking the camera, wrong camera index, or a cold first frame |
 
 Calibration touches hardware, so the usual hardware-debugging rules in
@@ -652,9 +817,11 @@ suspecting the arm.
 | `probe_observations` | Raw step-3 `(pixel, robot, colour)` records, for offline refits and outlier checks |
 | `raw_marker_observations` | Per marker: `pixel`, `corners`, `robot`, plus flags like `exclude_from_fit` |
 | `cam_xy_robot` / `cam_height_mm` | Measured nadir and lens height. Drives `robot_to_pixel` at all heights; also the cube-top fallback when `cube_top_homography` is unset |
+| `table_polygon_robot` | Desk outline in robot XY, safety margin already applied. One measured back edge plus three nominal sides at ±500 mm. `workspace.on_table` is a plain containment test against it; absent, every point counts as desk |
+| `frame_size_px` | Frame size the polygon was measured at, so `camera_covers` knows the frame bounds without a capture |
 | `color_ranges` | Per-colour HSV overrides merged over `detect.COLOR_RANGES` |
 | `color_xy_offset_mm` | Per-colour XY correction. Each HSV band admits a different mix of lit/shaded side faces, so centroid bias is colour-dependent — a map calibrated with one probe colour mis-locates the others by a constant few-to-15 mm |
-| `face_align_picks` | Command J4 from the detection's `yaw_deg`. Assumes step 5 has been done |
+| `face_align_picks` | Command J4 from the detection's `yaw_deg`. Assumes step 6 has been done |
 
 **`workspace_hull_px` is gone.** It held the pixel convex hull of the marker
 centres and nothing read it — the gate it once was is `workspace.in_work_region`,

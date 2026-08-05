@@ -57,6 +57,7 @@ python -m mt4_vision markers        # verify the markers are seen
 python calibrate_vision.py          # jog-to-marker interactive calibration
 python calibrate_height.py          # cube-top parallax probe-fit
 python calibrate_camera_nadir.py    # camera nadir + lens height (overlay)
+python calibrate_table_edge.py      # where the desk ends (gates pick/place)
 python calibrate_j4.py              # J4 zero -- redo after every power cycle
 
 # Check what the arm can see and reach
@@ -133,6 +134,7 @@ python -m mt4_vision markers        # verify the markers are seen
 python calibrate_vision.py          # jog-to-marker interactive calibration
 python calibrate_height.py          # cube-top parallax map (automatic)
 python calibrate_camera_nadir.py    # camera nadir + lens height (automatic)
+python calibrate_table_edge.py      # desk edge -> table polygon (automatic)
 python calibrate_j4.py              # J4 zero (manual jog; see below)
 python -m mt4_vision scene          # sanity-check detections in robot coords
 ```
@@ -156,6 +158,13 @@ height (`cam_height_mm`). These drive the trajectory overlay and are the
 parallax fallback when no cube-top map is set. `--dry-run` fits and reports
 without writing.
 
+**`calibrate_table_edge.py`** measures where the desk ends and stores it as
+`table_polygon_robot`, the gate deciding whether a point is on the desk at all.
+Only the back edge is measurable; the other three run past the arm's reach and
+are stored nominal. No arm motion, but the wall above the desk must be visible,
+so park the arm clear of the back of the frame. Re-run after the arm, the desk
+or the camera moves. `--dry-run` reports without writing.
+
 **`calibrate_j4.py`** sets the J4 wrist origin via firmware `j4zero`. J4 has no
 home switch, so its step counter starts wherever the wrist sat at boot. The
 zero survives `home` but is **lost on power cycle / reflash** — re-run it at the
@@ -170,17 +179,32 @@ python calibrate_height.py          # cube-top map (cleared by recalibrate)
 python calibrate_camera_nadir.py    # camera pose (cleared by recalibrate)
 ```
 
+`recalibrate_camera.py` keeps the desk polygon, since that is stored in robot
+coordinates and a camera move does not shift the desk. `calibrate_vision.py`
+clears it, because a full re-touch admits that the arm or the desk may have
+moved too.
+
 Calibration lands in `vision_calibration.json` (table transform, `table_z` /
-`safe_z`, gripper S values, cube-top homography, camera nadir + height, HSV
-overrides). Steps 3–5 are **not optional after step 2**: a fresh
-`calibrate_vision.py` run clears the cube-top map, camera pose, and colour
-offsets, and nothing downstream fails when they are missing — cube picks just
-silently regain 15–30 mm of parallax error. See
+`safe_z`, gripper S values, cube-top homography, camera nadir + height, desk
+polygon, HSV overrides). Everything after `calibrate_vision.py` is **not
+optional**: a fresh run of it clears the cube-top map, colour offsets and the
+desk polygon, and nothing downstream fails when they are missing. Cube picks
+silently regain 15–30 mm of parallax error, and the desk-edge gate goes inert
+so places past the edge stop being refused. See
 [docs/CALIBRATION.md](docs/CALIBRATION.md#what-each-entry-point-preserves) for
 the full preserve/clear matrix.
 
-Cubes are detected by HSV threshold inside the marker quadrilateral; detections
-outside it (the arm's own orange body, off-desk clutter) are rejected.
+Cubes are detected by HSV threshold, then filtered in three stages. Blob size
+and squareness drop the arm's own orange body and elongated streaks. The desk
+polygon drops anything past the back edge, counted in the scene summary as
+`off_table_blobs`. Specular glare is dropped outright — a blob under saturation
+90, or one whose centroid sits inside a marker outline that *decoded* this
+frame, since a decodable tag has nothing standing on it. What survives is
+listed; `in_work_region` then decides which of those are pick candidates, and a
+detection it refuses keeps its `reason` rather than disappearing.
+
+The marker positions do **not** bound detection. They record where paper was
+taped down, which says nothing about where the desk, the arm or the camera end.
 
 ### CLI
 
@@ -467,16 +491,20 @@ Full hardware detail (board, drivers, flash path) is in
 | [mt4_vision/](mt4_vision/) | Vision + motion: calibration, detection, entity table, grounding, VLM client, grasp/place primitives, path planning, preview |
 | [mt4_mcp/](mt4_mcp/) | MCP server (HTTP or stdio) + OAuth |
 | [services/grounding_dino/](services/grounding_dino/) | Grounding DINO GPU service (deployed to a separate host) |
-| [scripts/](scripts/) | Diagnostics (`diagnose_pick_accuracy.py`, `validate_scene_live.py`), ngrok + grounding-tunnel launchers |
+| [services/qwen3_vl/](services/qwen3_vl/) | Qwen3-VL GPU service (deployed to a separate host) |
+| [scripts/](scripts/) | Diagnostics (`diagnose_pick_accuracy.py`, `validate_scene_live.py`), ngrok + grounding/Qwen tunnel launchers |
 | [tests/](tests/) | Unit tests |
-| [docs/](docs/) | Hardware reference, assumption audit, OAuth setup, sort-behavior spec, printable ArUco sheet |
+| [docs/](docs/) | Calibration guide, hardware reference, assumption audit, Grounding DINO and Qwen3-VL setup, OAuth setup, printable ArUco sheet |
 | [backups/](backups/) | Stock flash/EEPROM images and archived calibrations |
 
 Key `mt4_vision` modules: `calib` (calibration + pixel↔robot transforms),
 `detect`/`scene` (cube detection), `entities` (the addressable snapshot),
-`locate`/`grounding` (non-cube objects), `qwen` (VLM question-answering),
-`motion`/`pickplace` (grasp and place primitives),
-`stackpath`/`landing`/`workspace` (path and site planning),
+`locate`/`grounding` (non-cube objects), `qwen` (VLM client),
+`instruct`/`instruct_reply`/`instruct_view`/`instruct_worker` (the English
+instruction loop behind `ask_qwen.py`), `grasp`/`wrist` (grasp geometry and J4
+angles), `motion`/`pickplace` (grasp and place primitives),
+`stackpath`/`landing`/`workspace` (path and site planning), `table_fit` (the
+table-plane homography fit), `policy`/`shuffle` (the shuffle planner and loop),
 `preview` (annotated overlay), `console` (bottom-pinned interactive UI).
 
 ## Tests
@@ -505,13 +533,15 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 
 | Doc | Contents |
 |-----|----------|
-| [docs/CALIBRATION.md](docs/CALIBRATION.md) | Step-by-step calibration guide: the five layers, each script's procedure and output, re-calibration decision matrix, troubleshooting, field reference |
+| [docs/CALIBRATION.md](docs/CALIBRATION.md) | Step-by-step calibration guide: the six layers, each script's procedure and output, re-calibration decision matrix, troubleshooting, field reference |
 | [docs/MT4_ARCHITECTURE.md](docs/MT4_ARCHITECTURE.md) | Hardware and pin-map reference, ATmega2560 flash path |
 | [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md) | Assumption audit for pick/place/stacking accuracy — what each layer relies on, how well it's known, and where accuracy actually leaks |
 | [docs/OAUTH_CHATGPT.md](docs/OAUTH_CHATGPT.md) | OAuth 2.1 via Google + ngrok for public MCP access |
 | [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md) | Grounding DINO server setup: GPU-host install, WSL2 prerequisites, systemd unit, SSH tunnel, HTTP API, troubleshooting |
 | [services/grounding_dino/README.md](services/grounding_dino/README.md) | What the deployed service files are, and the day-to-day detect commands |
 | [docs/QWEN3-VL.md](docs/QWEN3-VL.md) | Qwen3-VL service: start/stop, HTTP API, SSH tunnel, the `ask_qwen.py` harness, measured coordinate space and accuracy |
+| [docs/qwen3_vl_mt4_repository_mapped_policy.md](docs/qwen3_vl_mt4_repository_mapped_policy.md) | Design: how VLM instruction-following maps onto this repo's geometry, measurement and safety layers |
+| [docs/qwen3_vl_policy_status.md](docs/qwen3_vl_policy_status.md) | Build ledger for that design, 2026-08-02 … 08-03: what was measured on hardware, what failed, what was decided. History — the code is the authority on current behaviour |
 | [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf) | Printable marker sheet (DICT_4X4_50) |
 | [firmware/mt4_jog/src/main.cpp](firmware/mt4_jog/src/main.cpp) | Full serial protocol reference (header comment) |
 | [CLAUDE.md](CLAUDE.md) | Agent instructions: hardware autonomy, primary tools, typical failure patterns |
