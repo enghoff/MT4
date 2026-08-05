@@ -3,3 +3,5 @@ fastmcp>=2.3
 python-dotenv>=1.0
 numpy>=1.26
 opencv-python>=4.8
+
+# Optional: in-process SAM 2.1 for open-vocab silhouettes — see requirements-sam.txt

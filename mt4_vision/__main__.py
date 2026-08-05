@@ -172,7 +172,7 @@ def cmd_locate(args: argparse.Namespace) -> int:
 
 
 def cmd_sam(args: argparse.Namespace) -> int:
-    """Segment at a pixel or a box via the SAM 2.1 service (MT4_SAM_URL).
+    """Segment at a pixel or a box via in-process SAM 2.1.
 
     The mask is what a box or a click is not: an actual silhouette, with a
     centre of area rather than a box centre. Saved tinted onto the frame so
@@ -183,7 +183,7 @@ def cmd_sam(args: argparse.Namespace) -> int:
     from mt4_vision.sam import SamError, best_per_object, health, segment
 
     try:
-        print(f"service: {health()}")
+        print(f"sam: {health()}")
     except SamError as exc:
         print(exc)
         return 1
@@ -544,7 +544,7 @@ def main() -> None:
 
     p = sub.add_parser(
         "sam",
-        help="segment at a pixel or box via the SAM 2.1 service (MT4_SAM_URL)",
+        help="segment at a pixel or box via in-process SAM 2.1",
     )
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--pixel", type=float, nargs=2, metavar=("PX", "PY"))

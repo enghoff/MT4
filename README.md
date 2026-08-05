@@ -30,10 +30,10 @@ a typed English instruction into instructions for the MT4 arm.
 - [PlatformIO](https://platformio.org/) + avrdude (only to flash firmware)
 - For vision: an overhead USB camera and printed ArUco markers
   (DICT_4X4_50; sheet in [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf))
-- For open-vocab grounding: somewhere to run the Grounding DINO service **and**
-  the SAM 2.1 service — a CUDA GPU on this machine or another host (CPU works,
-  slowly). DINO finds the object, SAM measures it, and both fit on one 8 GB
-  card. See [Open-vocabulary objects](#open-vocabulary-objects)
+- For open-vocab grounding: somewhere to run the Grounding DINO service (a CUDA
+  GPU on this machine or another host; CPU works, slowly), plus the optional
+  SAM 2.1 deps on this machine (`pip install -r requirements-sam.txt`) so box
+  measurements become silhouettes. See [Open-vocabulary objects](#open-vocabulary-objects)
 
 Serial ports auto-detect the CH340 USB-UART when `--port` / `MT4_SERIAL_PORT`
 are omitted (COM numbers often change after a re-plug). The camera index comes
@@ -258,13 +258,14 @@ works without it.
 
 ### Silhouettes instead of boxes
 
-A second GPU service wraps `facebook/sam2.1-hiera-small`. Give it a pixel or a
-box and it returns the outline of what is there — on the reference desk, a
-click on a small Statue of Liberty figurine comes back as its silhouette
-including the raised torch, which no rectangle and no HSV colour threshold
-describes.
+`mt4_vision.sam` loads `facebook/sam2.1-hiera-small` in-process. Give it a
+pixel or a box and it returns the outline of what is there — on the reference
+desk, a click on a small Statue of Liberty figurine comes back as its
+silhouette including the raised torch, which no rectangle and no HSV colour
+threshold describes.
 
 ```powershell
+pip install -r requirements-sam.txt                   # once
 python -m mt4_vision sam --pixel 737 570              # mask at a pixel
 python -m mt4_vision sam --box 671 523 787 647        # mask inside a box
 ```
@@ -272,10 +273,11 @@ python -m mt4_vision sam --box 671 523 787 647        # mask inside a box
 Every measurement that starts from a box goes through it: a box from DINO, from
 Qwen, or from re-finding a registered object is a prompt, and the silhouette
 that comes back is what the centre, long axis and grip width are measured from.
-So the open-vocabulary half of this repo needs it running; cube pick/place,
-stacking and calibration never touch it.
+So the open-vocabulary half of this repo needs the SAM deps installed; cube
+pick/place, stacking and calibration never touch it. CUDA is fast (~50 ms per
+new frame); CPU works at about a second.
 
-Setup, HTTP API and the measured configuration: [docs/SAM2.md](docs/SAM2.md).
+Setup and the measured configuration: [docs/SAM2.md](docs/SAM2.md).
 
 ### Telling the arm what to do in English
 
@@ -519,10 +521,9 @@ Full hardware detail (board, drivers, flash path) is in
 | [mt4_mcp/](mt4_mcp/) | MCP server (HTTP or stdio) + OAuth |
 | [services/grounding_dino/](services/grounding_dino/) | Grounding DINO GPU service (deployed to a separate host) |
 | [services/qwen3_vl/](services/qwen3_vl/) | Qwen3-VL GPU service (deployed to a separate host) |
-| [services/sam2/](services/sam2/) | SAM 2.1 segmentation service (deployed to a separate host) |
 | [scripts/](scripts/) | Diagnostics (`diagnose_pick_accuracy.py`, `validate_scene_live.py`), ngrok and GPU-service tunnel launchers |
 | [tests/](tests/) | Unit tests |
-| [docs/](docs/) | Calibration guide, hardware reference, assumption audit, GPU service setup (Grounding DINO, Qwen3-VL, SAM 2.1), OAuth setup, printable ArUco sheet |
+| [docs/](docs/) | Calibration guide, hardware reference, assumption audit, GPU service setup (Grounding DINO, Qwen3-VL), in-process SAM 2.1, OAuth setup, printable ArUco sheet |
 | [backups/](backups/) | Stock flash/EEPROM images and archived calibrations |
 
 Key `mt4_vision` modules: `calib` (calibration + pixel↔robot transforms),
@@ -567,8 +568,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | [docs/OAUTH_CHATGPT.md](docs/OAUTH_CHATGPT.md) | OAuth 2.1 via Google + ngrok for public MCP access |
 | [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md) | Grounding DINO server setup: GPU-host install, WSL2 prerequisites, systemd unit, SSH tunnel, HTTP API, troubleshooting |
 | [services/grounding_dino/README.md](services/grounding_dino/README.md) | What the deployed service files are, and the day-to-day detect commands |
-| [docs/SAM2.md](docs/SAM2.md) | SAM 2.1 segmentation service: install, systemd unit, SSH tunnel, HTTP API, the measured fp16/compile/embedding-cache choices, troubleshooting |
-| [services/sam2/README.md](services/sam2/README.md) | What the deployed SAM 2.1 files are, and the day-to-day segment commands |
+| [docs/SAM2.md](docs/SAM2.md) | In-process SAM 2.1: deps, env vars, lazy load, embedding cache, measured fp16/compile choices, troubleshooting |
 | [docs/QWEN3-VL.md](docs/QWEN3-VL.md) | Qwen3-VL service: start/stop, HTTP API, SSH tunnel, the `ask_qwen.py` harness, measured coordinate space and accuracy |
 | [docs/qwen3_vl_mt4_repository_mapped_policy.md](docs/qwen3_vl_mt4_repository_mapped_policy.md) | Design: how VLM instruction-following maps onto this repo's geometry, measurement and safety layers |
 | [docs/qwen3_vl_policy_status.md](docs/qwen3_vl_policy_status.md) | Build ledger for that design, 2026-08-02 … 08-03: what was measured on hardware, what failed, what was decided. History — the code is the authority on current behaviour |

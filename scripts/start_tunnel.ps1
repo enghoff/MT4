@@ -8,22 +8,22 @@
 # One ssh connection carries every forward, so this is one window, not one per
 # service. A forward costs nothing when the far end is stopped -- which is the
 # normal state of one of grounding-dino/qwen3-vl, since they share a card and
-# swap (services/switch_vision_service.sh) -- so the default forwards all three
-# and you do not restart the tunnel when you switch.
+# swap (services/switch_vision_service.sh) -- so the default forwards both and
+# you do not restart the tunnel when you switch.
 #
-# The defaults below match the reference deployment (see docs/SAM2.md) --
-# override -RemoteHost / -User / -IdentityFile for yours.
+# SAM 2.1 runs in-process on the arm host (mt4_vision.sam); it is not tunneled.
+# Override -RemoteHost / -User / -IdentityFile for your GPU host.
 #
 # Usage:
-#   .\scripts\start_tunnel.ps1                     # dino + qwen + sam
-#   .\scripts\start_tunnel.ps1 qwen,sam            # just those two
+#   .\scripts\start_tunnel.ps1                     # dino + qwen
+#   .\scripts\start_tunnel.ps1 qwen                # just qwen
 #   .\scripts\start_tunnel.ps1 -LocalPorts @{qwen=18766}
 #   # leave running, then from another terminal:
-#   curl http://127.0.0.1:8767/health
+#   curl http://127.0.0.1:8766/health
 
 param(
-    # Names, or "all". A PowerShell prompt parses `qwen,sam` into two arguments
-    # on its own; `powershell -File … -Service qwen,sam` hands it over as one
+    # Names, or "all". A PowerShell prompt parses `qwen,dino` into two arguments
+    # on its own; `powershell -File … -Service qwen,dino` hands it over as one
     # string, so the split below covers both rather than failing on the second.
     [string[]]$Service = @("all"),
     [string]$RemoteHost = "media",
@@ -44,7 +44,6 @@ $ErrorActionPreference = "Stop"
 $Known = [ordered]@{
     dino = @{ Port = 8765; Unit = "grounding-dino.service"; Env = "MT4_GROUNDING_URL" }
     qwen = @{ Port = 8766; Unit = "qwen3-vl.service";       Env = "MT4_QWEN_URL" }
-    sam  = @{ Port = 8767; Unit = "sam2.service";           Env = "MT4_SAM_URL" }
 }
 
 $asked = @()

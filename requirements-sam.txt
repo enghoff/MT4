@@ -1,0 +1,12 @@
+# Optional deps for in-process SAM 2.1 (mt4_vision.sam).
+# Not required for cube pick/place, stacking, calibration, or the jog client.
+torch
+# Sam2Model / Sam2Processor arrived in transformers 4.57.
+transformers>=4.57
+pillow
+numpy
+
+# Not imported by mt4_vision.sam directly: transformers reaches for torchvision
+# on the image processor's fast path and for accelerate inside from_pretrained.
+torchvision
+accelerate
