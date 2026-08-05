@@ -3,6 +3,9 @@
 # They share one 8GB card and aren't meant to run together, so this stops
 # whichever one is active before starting the other. Deployed at ~/switch_vision_service.sh
 # (source of truth: services/switch_vision_service.sh in the mt4 repo).
+#
+# sam2.service is not part of the trade: SAM 2.1 small holds ~600MB including
+# its CUDA context, so it stays up alongside whichever of the two is running.
 set -euo pipefail
 
 DINO_SERVICE="grounding-dino.service"

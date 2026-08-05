@@ -223,6 +223,7 @@ taped down, which says nothing about where the desk, the arm or the camera end.
 | `transfer --from X Y --to X Y` | Queued pick+place between two robot-frame XYs (`--from-yaw`, `--to-yaw`, `--center`) |
 | `locate --pixel PX PY` | Measure a non-cube object at a pixel hint (`--label`, `--pick`) |
 | `grounding --prompt "pen"` | Open-vocab detect via Grounding DINO (`--locate`, `--pick`) |
+| `sam --pixel PX PY` | Segment at a pixel or `--box X1 Y1 X2 Y2` via SAM 2.1 (`--candidates`) |
 | `goto-marker <id>` | Move the TCP to a marker — calibration accuracy check (`--touch` descends to table height) |
 | `shuffle` | Home, then shuffle cubes between markers and open table |
 
@@ -253,6 +254,26 @@ Model `IDEA-Research/grounding-dino-base`. Full server setup — install,
 supervision, remote access, HTTP API, troubleshooting:
 [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md). Everything else in this repo
 works without it.
+
+### Silhouettes instead of boxes
+
+A third optional GPU service wraps `facebook/sam2.1-hiera-small`. Give it a
+pixel or a box and it returns the actual outline of what is there — on the
+reference desk, a click on a small Statue of Liberty figurine comes back as its
+silhouette including the raised torch, which no rectangle and no HSV colour
+threshold describes.
+
+```powershell
+python -m mt4_vision sam --pixel 737 570              # mask at a pixel
+python -m mt4_vision sam --box 671 523 787 647        # mask inside a box
+```
+
+A single point is ambiguous — the cube, its top face, or the stack it sits on
+— so the model returns three candidates with its own confidence in each, and
+the client takes the best. The service keeps the encoded frame for the last
+eight images it saw, so a second question about one frame costs about 20 ms of
+service time against 50 for the first. Setup, HTTP API and the measured
+fp16 / compile / cache choices: [docs/SAM2.md](docs/SAM2.md).
 
 ### Telling the arm what to do in English
 
@@ -542,6 +563,8 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | [docs/OAUTH_CHATGPT.md](docs/OAUTH_CHATGPT.md) | OAuth 2.1 via Google + ngrok for public MCP access |
 | [docs/GROUNDING_DINO.md](docs/GROUNDING_DINO.md) | Grounding DINO server setup: GPU-host install, WSL2 prerequisites, systemd unit, SSH tunnel, HTTP API, troubleshooting |
 | [services/grounding_dino/README.md](services/grounding_dino/README.md) | What the deployed service files are, and the day-to-day detect commands |
+| [docs/SAM2.md](docs/SAM2.md) | SAM 2.1 segmentation service: install, systemd unit, SSH tunnel, HTTP API, the measured fp16/compile/embedding-cache choices, troubleshooting |
+| [services/sam2/README.md](services/sam2/README.md) | What the deployed SAM 2.1 files are, and the day-to-day segment commands |
 | [docs/QWEN3-VL.md](docs/QWEN3-VL.md) | Qwen3-VL service: start/stop, HTTP API, SSH tunnel, the `ask_qwen.py` harness, measured coordinate space and accuracy |
 | [docs/qwen3_vl_mt4_repository_mapped_policy.md](docs/qwen3_vl_mt4_repository_mapped_policy.md) | Design: how VLM instruction-following maps onto this repo's geometry, measurement and safety layers |
 | [docs/qwen3_vl_policy_status.md](docs/qwen3_vl_policy_status.md) | Build ledger for that design, 2026-08-02 … 08-03: what was measured on hardware, what failed, what was decided. History — the code is the authority on current behaviour |
