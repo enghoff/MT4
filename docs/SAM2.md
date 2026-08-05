@@ -216,7 +216,7 @@ ssh -N -L 8767:127.0.0.1:8767 user@gpu-host
 ```
 
 This repo ships a helper for it,
-[scripts/start_sam_tunnel.ps1](../scripts/start_sam_tunnel.ps1), which checks
+[scripts/start_tunnel.ps1](../scripts/start_tunnel.ps1), which checks
 whether the port is already listening (printing `/health` if so), verifies the
 key exists, and reconnects when the link drops. Its defaults match the
 reference deployment below, so override them for yours: `-RemoteHost`, `-User`,

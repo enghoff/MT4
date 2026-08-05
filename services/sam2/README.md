@@ -25,7 +25,7 @@ python -m mt4_vision --camera 1 sam --box 671 523 787 647      # mask in a box
 python -m mt4_vision --camera 1 sam --pixel 737 570 --candidates
 ```
 
-Add `.\scripts\start_sam_tunnel.ps1` first, left running, if the service is on
+Add `.\scripts\start_tunnel.ps1` first, left running, if the service is on
 another host and you reach it by SSH forward.
 
 Env: `MT4_SAM_URL` (default `http://127.0.0.1:8767`).

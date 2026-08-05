@@ -23,7 +23,7 @@ python -m mt4_vision --camera 1 grounding --prompt "pen"           # detect
 python -m mt4_vision --camera 1 grounding --prompt "pen" --locate  # + measure
 ```
 
-Add `.\scripts\start_grounding_tunnel.ps1` first, left running, if the service
+Add `.\scripts\start_tunnel.ps1` first, left running, if the service
 is on another host and you reach it by SSH forward.
 
 Env: `MT4_GROUNDING_URL` (default `http://127.0.0.1:8765`).

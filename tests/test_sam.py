@@ -47,7 +47,7 @@ def test_health_unreachable_names_the_tunnel() -> None:
     import urllib.error
 
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
-        with pytest.raises(SamError, match="start_sam_tunnel"):
+        with pytest.raises(SamError, match="start_tunnel"):
             health("http://example")
 
 

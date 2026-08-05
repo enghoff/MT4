@@ -16,7 +16,7 @@ that cannot be segmented, are out of reach, fail grasp feasibility, or have no
 free marker are skipped. Loops until Ctrl+C / EOF.
 
 Prereqs:
-  * ``.\\scripts\\start_grounding_tunnel.ps1``
+  * ``.\\scripts\\start_tunnel.ps1``
   * Arm free on the serial port; vision calibration present
 
 Example::

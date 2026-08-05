@@ -225,13 +225,12 @@ options (SSH tunnel vs. LAN bind) and the WSL2-specific gotchas
 (`systemd=true`, `networkingMode=mirrored`, mDNS/IPv6).
 
 For the reference deployment (`media`), use
-[scripts/start_qwen_tunnel.ps1](../scripts/start_qwen_tunnel.ps1) — same
-pattern as `start_grounding_tunnel.ps1`, on port 8766 instead of 8765, and
-kept as a separate tunnel since the two services aren't meant to run at the
-same time on the GPU:
+[scripts/start_tunnel.ps1](../scripts/start_tunnel.ps1). One ssh connection
+carries a forward per service, so a single window covers Qwen and the SAM 2.1
+segmenter its measurements go through:
 
 ```powershell
-.\scripts\start_qwen_tunnel.ps1
+.\scripts\start_tunnel.ps1 qwen,sam
 # leave running, then from another terminal:
 curl http://127.0.0.1:8766/health
 ```

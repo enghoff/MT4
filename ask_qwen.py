@@ -144,7 +144,7 @@ only thing the model does; every millimetre and every safety gate is the
 existing stack's.
 
 Prereqs:
-  * the Qwen3-VL service reachable (``.\\scripts\\start_qwen_tunnel.ps1``)
+  * the Qwen3-VL and SAM 2.1 services reachable (``.\\scripts\\start_tunnel.ps1``)
   * arm free on the serial port, vision calibration present
 """
 

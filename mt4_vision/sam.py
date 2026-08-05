@@ -2,7 +2,7 @@
 
 An HTTP service reached at ``MT4_SAM_URL`` (default ``http://127.0.0.1:8767``).
 It may run on this machine or on another host -- if the latter and you reach it
-by SSH forward, see ``scripts/start_sam_tunnel.ps1``. Setup: ``docs/SAM2.md``.
+by SSH forward, see ``scripts/start_tunnel.ps1``. Setup: ``docs/SAM2.md``.
 
 Where :mod:`mt4_vision.grounding` answers "where is the pen" with a box, this
 answers "which pixels are it" with a mask, from a point or a box you already
@@ -35,7 +35,7 @@ DEFAULT_URL = os.environ.get("MT4_SAM_URL", "http://127.0.0.1:8767")
 _UNREACHABLE_HINT = (
     "start the service (`systemctl start sam2` on the GPU host), or -- if it "
     "runs on another host reached by SSH forward -- "
-    ".\\scripts\\start_sam_tunnel.ps1"
+    ".\\scripts\\start_tunnel.ps1"
 )
 
 

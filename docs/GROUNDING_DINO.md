@@ -118,7 +118,7 @@ ssh -N -L 8765:127.0.0.1:8765 user@gpu-host
 ```
 
 This repo ships a helper for it,
-[scripts/start_grounding_tunnel.ps1](../scripts/start_grounding_tunnel.ps1),
+[scripts/start_tunnel.ps1](../scripts/start_tunnel.ps1),
 which checks whether the port is already listening (printing `/health` if so),
 verifies the key exists, and adds `ExitOnForwardFailure` plus a keepalive.
 Its defaults match the reference deployment below, so override them for yours:

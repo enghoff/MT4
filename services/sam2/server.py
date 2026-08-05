@@ -1,7 +1,7 @@
 """SAM 2.1 (small) HTTP service for prompted segmentation.
 
 Binds to 127.0.0.1 by default -- reach it from the MT4 host via SSH tunnel
-(see scripts/start_sam_tunnel.ps1), the same way as the Grounding DINO and
+(see scripts/start_tunnel.ps1), the same way as the Grounding DINO and
 Qwen3-VL services.
 
 A request is a frame plus point or box prompts; the answer is one binary mask

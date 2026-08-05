@@ -465,7 +465,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
 
         Requires the Grounding DINO service reachable at `MT4_GROUNDING_URL`
         (default `http://127.0.0.1:8765`); if it runs on another host behind an
-        SSH forward, `scripts/start_grounding_tunnel.ps1` opens it. Prefer
+        SSH forward, `scripts/start_tunnel.ps1` opens it. Prefer
         mt4_scene ids for coloured cubes; use this for things HSV cannot name
         (pen, key, ...).
 
