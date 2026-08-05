@@ -27,6 +27,12 @@ pixels a decision was made from, and re-capturing them would quietly answer a
 different question than the one worth asking. q or Esc in that window stops the
 run; the arm is still parked on the way out.
 
+**While the hardware moves, the two pictures trade places.** The live feed
+takes the large pane and the frame with the overlay drops to the inset, for
+the phases where the desk is actually changing -- a carry, a park, a homing,
+the jaws letting go. Both are always on screen; what changes is which one is
+worth the space, and during a move that is the arm crossing the desk.
+
 ``--record run.mp4`` writes that same composited picture to a video for the
 whole session, at 10 fps and real speed. It does not need the window: with
 ``--no-preview``, or on a machine whose OpenCV has no GUI, the file is written

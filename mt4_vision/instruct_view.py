@@ -10,6 +10,10 @@ keeps moving through a multi-second arm move:
   believed to hold, what has been done;
 * a live inset, so the desk stays visible while the stale main pane is up.
 
+The first and third trade places while the hardware moves (see
+:data:`MOVING_PHASES`): a carry is the one stretch where the desk is changing
+and the frame with the overlay is describing a moment that has gone.
+
 The same composited canvas is what ``video_path`` records and what ``/save``
 writes, so a recording and a window show the identical picture.
 
@@ -101,6 +105,14 @@ ERR_BGR = (90, 90, 250)       # red
 WARN_BGR = (0, 200, 255)
 
 
+# Phases during which the desk itself is changing: the worker's own labels for
+# arm motion, plus the chore labels ``ask_qwen`` submits for the commands that
+# drive the hardware. ``/open`` is here because the jaws letting go changes the
+# desk as much as a carry does, even though the arm holds still for it. A phase
+# missing from this set costs nothing but the swap.
+MOVING_PHASES = frozenset({"moving", "parking", "homing", "opening the jaws"})
+
+
 @dataclass(frozen=True)
 class RunState:
     """What the panel draws. Replaced wholesale, never mutated in place."""
@@ -126,6 +138,11 @@ class RunState:
     @property
     def elapsed(self) -> float:
         return 0.0 if not self.phase_started else time.monotonic() - self.phase_started
+
+    @property
+    def arm_moving(self) -> bool:
+        """Whether the hardware is in motion, and the window should show it."""
+        return self.phase in MOVING_PHASES
 
 
 def decision_view(
@@ -321,10 +338,22 @@ def compose(
     svc: str,
     camera: int,
 ) -> np.ndarray:
-    """Decision frame (or the live feed when there isn't one yet) + panel."""
-    if view is None:
+    """The main pane, whichever of the two frames it is, plus the panel.
+
+    The two pictures trade places on ``state.arm_moving``. Standing still, the
+    decision frame is large and the live feed is the corner inset: the question
+    then is what the model pointed at, and that is a question about pixels a
+    box was drawn on. Moving, they swap: the desk is changing, the frame with
+    the overlay describes a moment that has passed, and the thing worth the
+    large pane is the arm actually crossing the desk. Neither picture ever
+    leaves the window, so the comparison is always available -- what swaps is
+    which one is worth the space.
+    """
+    if view is None or state.arm_moving:
         main = live.copy()
         draw_outlined_text(main, "LIVE", (14, 28), scale=0.55, color=(220, 220, 220))
+        if view is not None:
+            draw_inset(main, view, "DECIDED")
     else:
         main = view.copy()
         draw_inset(main, live, "LIVE")

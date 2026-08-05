@@ -789,11 +789,11 @@ def draw_inset(
 ) -> None:
     """Drop a small labelled thumbnail into ``canvas``' bottom-right corner.
 
-    What it is for: the main pane of an interactive harness shows a *held*
-    frame -- the one a model answered about, seconds ago -- and the question
-    "is the camera still seeing what I think it is" cannot be answered from
-    that picture at all. The inset is the live feed, so the stale main pane
-    and the current scene are on screen together and can never be confused.
+    What it is for: an interactive harness has two pictures of the same desk --
+    a *held* frame, the one a model answered about seconds ago, and the live
+    feed -- and either one alone leaves a question the other answers. The inset
+    carries whichever is not in the main pane, so both are on screen together
+    and ``tag`` says which of them the corner is showing.
 
     A no-op when the canvas is too small to take the thumbnail, rather than an
     exception: this draws on a preview, and a preview that raises is worse

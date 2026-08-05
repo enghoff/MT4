@@ -121,6 +121,40 @@ def test_compose_pairs_the_main_pane_with_the_panel():
         assert canvas.shape == (H, W + PANEL_W, 3)
 
 
+def test_the_panes_swap_while_the_arm_moves():
+    """Standing still the decision frame is large; moving, the live feed is.
+
+    Told apart by which frame's fill colour covers the main pane, with the
+    other one small enough to be only the corner inset.
+    """
+    live, view = blank(value=40), blank(value=200)
+    # Mid-height and well left: clear of the "LIVE" label at the top and of
+    # the inset in the bottom-right corner.
+    middle = np.s_[H // 2 : H // 2 + 40, 40:240]
+    for phase, expected in (
+        ("deciding", 200), ("measuring", 200), ("idle", 200),
+        ("moving", 40), ("parking", 40), ("homing", 40),
+        ("opening the jaws", 40),
+    ):
+        canvas = compose(
+            live, view, RunState(instruction="x", phase=phase), svc="s", camera=1,
+        )
+        assert (canvas[middle] == expected).all(), f"wrong pane is large in {phase!r}"
+
+
+def test_the_swap_still_shows_both_frames():
+    """Neither picture ever leaves the window -- only the sizes change."""
+    live, view = blank(value=40), blank(value=200)
+    for phase in ("deciding", "moving"):
+        canvas = compose(
+            live, view, RunState(instruction="x", phase=phase), svc="s", camera=1,
+        )
+        corner = canvas[H - 60 :, W - 120 : W]
+        assert (corner == (40 if phase == "deciding" else 200)).any(), (
+            f"the other frame is missing from the inset in {phase!r}"
+        )
+
+
 def test_compose_survives_a_view_and_a_live_frame_of_different_sizes():
     """The window must not die because the camera changed mode mid-session."""
     canvas = compose(

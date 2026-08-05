@@ -382,6 +382,15 @@ done. The corner inset is the live feed. The left pane deliberately does not
 update during a move: those are the pixels a decision was made from, and a
 re-capture would silently answer a different question.
 
+**The two pictures trade places while the hardware moves** — a carry, a park, a
+homing, the jaws opening. Standing still, the decision frame is large, because
+the question then is what the model pointed at and that is a question about the
+pixels a box was drawn on. Moving, the live feed takes the large pane and the
+overlay drops to the inset: the desk is changing, and the frame with the
+overlay is describing a moment that has passed. Both pictures stay on screen
+throughout; only which one gets the space changes, and the inset's label says
+which is which.
+
 **`--record run.mp4` writes that picture to a video** for the whole session,
 and `--record-fps` sets the rate (default 10). The compositing thread is what
 records, so the window is not required: `--no-preview`, or a machine whose
