@@ -701,6 +701,10 @@ class TaskWorker:
             # stack asks.
             grasp = None
             dest_grasp = None
+            # The measurement behind `grasp`, kept so the live pane can draw
+            # the silhouette the jaws are being sent to. None for a PLACE,
+            # which measures no source.
+            picked = None
             trouble = ""
             # Which half of the move was refused, so the history line can name
             # the target rather than only the complaint. Set where the refusal
@@ -778,7 +782,10 @@ class TaskWorker:
             # Where the jaws will close and open again, as pixels of the desk.
             # Projected with no z: both poses are at table height, where
             # robot_to_pixel is the exact table-plane inverse. The live pane
-            # draws these for as long as the arm is in flight.
+            # draws these for as long as the arm is in flight, together with
+            # the silhouette the pick was measured from -- the object is still
+            # on that spot until the jaws close, so the fill is a live check
+            # that the arm is going to the thing and not beside it.
             self._set(
                 move_from_px=(
                     None if grasp is None
@@ -787,6 +794,10 @@ class TaskWorker:
                 move_to_px=(
                     None if dest_grasp is None
                     else obs.calib.robot_to_pixel(dest_grasp.x, dest_grasp.y)
+                ),
+                move_mask=None if picked is None else picked.mask,
+                move_mask_origin_px=(
+                    (0, 0) if picked is None else picked.mask_origin_px
                 ),
             )
             self._phase("moving")
@@ -855,9 +866,13 @@ class TaskWorker:
                 self._set(error=f"{note}: {exc}")
                 break
             finally:
-                # The arm has stopped, wherever it got to. Leaving the rings up
-                # would draw the finished move over the park that follows it.
-                self._set(move_from_px=None, move_to_px=None)
+                # The arm has stopped, wherever it got to. Leaving the rings
+                # and the silhouette up would draw the finished move over the
+                # park that follows it.
+                self._set(
+                    move_from_px=None, move_to_px=None,
+                    move_mask=None, move_mask_origin_px=(0, 0),
+                )
         else:
             self._ui.emit(f"    -> gave up after {max_steps} steps")
             self._ui.set_status(f"gave up after {max_steps} steps")

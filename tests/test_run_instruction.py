@@ -34,7 +34,7 @@ from mt4_vision.instruct_view import (
     render_panel,
 )
 from mt4_vision.instruct_worker import TaskWorker
-from mt4_vision.preview import QWEN_BOUND_BGR, draw_inset, wrap_text
+from mt4_vision.preview import QWEN_BOUND_BGR, QWEN_MASK_BGR, draw_inset, wrap_text
 
 H, W = 720, 1280
 
@@ -183,6 +183,57 @@ def test_the_move_is_drawn_on_the_live_pane_and_only_while_it_is_large():
         live, view, RunState(instruction="x", phase="deciding"), svc="s", camera=1,
     )
     assert np.array_equal(still, plain)
+
+
+def test_the_grasp_silhouette_is_drawn_on_the_live_pane_while_it_is_large():
+    """The mask goes on the live feed too, not only on the decision frame.
+
+    Where the arm is heading is a question about the object, and the ring alone
+    cannot answer it: a ring 20px across sits on the desk beside a cube just as
+    convincingly as on the cube. The fill is what shows which.
+    """
+    live, view = blank(value=40), blank(value=200)
+    mask = np.zeros((60, 80), np.uint8)
+    mask[10:50, 10:70] = 1
+    state = dict(
+        move_from_px=(300.0, 300.0),
+        move_mask=mask,
+        move_mask_origin_px=(260, 270),
+    )
+    moving = compose(
+        live, view, RunState(instruction="x", phase="moving", **state),
+        svc="s", camera=1,
+    )
+    # Inside the mask: the live frame's fill tinted toward the mask colour.
+    inside = tuple(int(v) for v in moving[300, 300 - 4])
+    assert inside != (40, 40, 40)
+    for channel, mask_channel in zip(inside, QWEN_MASK_BGR):
+        assert (channel > 40) == (mask_channel > 40)
+    # Outside it, untouched.
+    assert tuple(int(v) for v in moving[300, 200]) == (40, 40, 40)
+
+    # Standing still the decision frame has the pane and already carries the
+    # same silhouette, so nothing is drawn on the live frame at all.
+    still = compose(
+        live, view, RunState(instruction="x", phase="deciding", **state),
+        svc="s", camera=1,
+    )
+    plain = compose(
+        live, view, RunState(instruction="x", phase="deciding"), svc="s", camera=1,
+    )
+    assert np.array_equal(still, plain)
+
+
+def test_a_place_has_no_silhouette_to_draw():
+    """A PLACE measures no source, so the live pane shows the rings alone."""
+    live, view = blank(value=40), blank(value=200)
+    canvas = compose(
+        live, view,
+        RunState(instruction="x", phase="moving", move_to_px=(700.0, 500.0)),
+        svc="s", camera=1,
+    )
+    assert tuple(int(v) for v in canvas[480, 700]) == QWEN_BOUND_BGR
+    assert tuple(int(v) for v in canvas[300, 300]) == (40, 40, 40)
 
 
 def test_a_pick_draws_one_end_and_no_arrow():
