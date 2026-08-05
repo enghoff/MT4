@@ -369,6 +369,7 @@ python ask_qwen.py                                  # interactive
 python ask_qwen.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
 python ask_qwen.py "find all the pickable objects"  # a report, nothing moves
 python ask_qwen.py --dry-run "pick up the stapler"  # decide, never move
+python ask_qwen.py --record run.mp4 "..."           # the window, to a video
 ```
 
 **The window is three things at once.** The left pane is the frame the last
@@ -380,6 +381,43 @@ instruction, step, phase, what the jaws are believed to hold, what has been
 done. The corner inset is the live feed. The left pane deliberately does not
 update during a move: those are the pixels a decision was made from, and a
 re-capture would silently answer a different question.
+
+**The two pictures trade places while the hardware moves** — a carry, a park, a
+homing, the jaws opening. Standing still, the decision frame is large, because
+the question then is what the model pointed at and that is a question about the
+pixels a box was drawn on. Moving, the live feed takes the large pane and the
+overlay drops to the inset: the desk is changing, and the frame with the
+overlay is describing a moment that has passed. Both pictures stay on screen
+throughout; only which one gets the space changes, and the inset's label says
+which is which.
+
+**The live pane draws the move it is watching** — a green ring where the jaws
+will close, another where they will open, an arrow from one to the other, in
+the same colours `annotate_qwen` uses on the decision frame. They are the poses
+handed to `transfer` / `pick_at` / `place_at`, projected through the
+calibration, so the large pane shows the arm against its own plan rather than
+against a memory of an overlay that is now two inches wide in the corner.
+Either ring can be absent and is labelled `from` / `to`, since a pick has no
+destination and a place no source.
+
+**`--record run.mp4` writes that picture to a video** for the whole session,
+and `--record-fps` sets the rate (default 10). The compositing thread is what
+records, so the window is not required: `--no-preview`, or a machine whose
+OpenCV has no GUI, still gets the file — which is the case where a recording is
+the only way to see what happened. The loop turns over at camera rate (30.7/s
+measured, 26.3 ms of it waiting for the next frame and 6.0 ms drawing), so the
+recorder writes on a wall clock rather than once per tick and repeats the
+canvas across a late one. That is what keeps a move at real speed: 8.1 s of
+file for an 8.0 s run, where one frame per due tick gave 7.4 s. A 1740×720
+canvas of the desk costs about 165 KiB/s, so roughly 10 MB per minute of
+recorded motion.
+
+**Standing still is recorded a tenth as often**, so waiting on the model plays
+back ten times faster. It is the same predicate the panes swap on: motion is
+worth real time and a still picture of a desk is not, and most of a session is
+the still picture. A pace change takes effect on the tick that caused it rather
+than after the deadline already pending — otherwise the switch out of a wait
+would swallow the first second of the move, which is the second worth having.
 
 **Typing does not block on the arm.** A transfer is seconds of motion and a
 decision is seconds of GPU, and through all of it the prompt still takes input.

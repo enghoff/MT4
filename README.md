@@ -18,8 +18,10 @@ backed up and restorable, see [Restoring stock firmware](#restoring-stock-firmwa
 ## Demo
 
 [Autonomous cube stacking](https://youtu.be/1H_cvyK35i8) — `stack_cubes.py`
-building a stack on a calibrated marker, with the live vision overlay
-(pick candidates, marker occupancy, current target) visible throughout.
+building a stack on a calibrated marker, with the live vision overlay visible throughout.
+
+[Vision-language control](https://youtu.be/Upl5uVBjPy0) — `ask_qwen.py` turning
+a typed English instruction into instructions for the MT4 arm.
 
 ## Requirements
 
@@ -264,6 +266,7 @@ python ask_qwen.py                                  # interactive prompt + windo
 python ask_qwen.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
 python ask_qwen.py "find all the pickable objects"  # a report, nothing moves
 python ask_qwen.py --dry-run "pick up the stapler"  # decide, never move
+python ask_qwen.py --record run.mp4 "..."           # the window, to a video
 ```
 
 The model is the eyes and nothing else. It gets the frame and the decoded ArUco
@@ -285,9 +288,9 @@ not visible in a photograph.
 
 The window shows the exact frame each decision was made from with the model's
 own answer drawn on it, so a wrong answer about a frame the arm was blocking
-looks different from a wrong answer about a clean one. Setup, commands, and the
-measured coordinate-space and accuracy findings:
-[docs/QWEN3-VL.md](docs/QWEN3-VL.md).
+looks different from a wrong answer about a clean one. A recorded session is in
+[Demo](#demo). Setup, commands, and the measured coordinate-space and accuracy
+findings: [docs/QWEN3-VL.md](docs/QWEN3-VL.md).
 
 ## MCP server
 

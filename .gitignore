@@ -27,6 +27,10 @@ vision_calibration.json
 # ask_qwen.py /save records (frames + JSON transcripts)
 instruction_runs/
 
+# --record / --video preview recordings (tens of MB per session)
+*.mp4
+*.avi
+
 # demonstration collection + converted dataset output (images -- not for git)
 data/
 .mcp.json

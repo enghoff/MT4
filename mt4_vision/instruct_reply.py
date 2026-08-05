@@ -69,6 +69,28 @@ def to_frame_pixels(
     return tuple(v * (sx if i % 2 == 0 else sy) for i, v in enumerate(values))
 
 
+def to_model_coords(
+    point_px: Sequence[float], size: tuple[int, int]
+) -> tuple[float, float]:
+    """Frame pixels back on the 0-1000 grid, the inverse of the leading reading.
+
+    Anything written *to* the model has to be in the space the model reads and
+    writes: the tag positions it copies into ``dest_2d``, and the places named
+    in the history of what has already happened. Robot millimetres would be
+    noise there -- the model has no access to that frame, and nothing it can say
+    is measured in it.
+
+    The inverse of :func:`to_frame_pixels`'s normalized branch only. There is no
+    inverse of the raw-pixel retry, because nothing is ever written to the model
+    in that space.
+    """
+    w, h = size
+    return (
+        float(point_px[0]) * COORD_SCALE / w,
+        float(point_px[1]) * COORD_SCALE / h,
+    )
+
+
 def point_readings(
     point: Sequence[float], size: tuple[int, int]
 ) -> tuple[tuple[float, float], ...]:
