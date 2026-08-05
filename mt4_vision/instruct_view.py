@@ -10,6 +10,9 @@ keeps moving through a multi-second arm move:
   believed to hold, what has been done;
 * a live inset, so the desk stays visible while the stale main pane is up.
 
+The same composited canvas is what ``video_path`` records and what ``/save``
+writes, so a recording and a window show the identical picture.
+
 ``worker`` is duck-typed (it needs ``snapshot()``) and ``ui`` needs
 ``emit``/``set_status``, so nothing here imports the modules that import it.
 """
@@ -33,6 +36,7 @@ if TYPE_CHECKING:  # duck-typed at runtime -- see the module docstring
 from mt4_vision.preview import (
     LivePreview,
     PreviewStopped,
+    VideoRecorder,
     annotate_qwen,
     draw_inset,
     draw_outlined_text,
@@ -40,6 +44,15 @@ from mt4_vision.preview import (
 )
 
 MAX_STEPS = 6
+
+
+# Frames per second written by ``--record``, and the rate the file declares.
+# The compositing loop turns over at camera rate -- 30.7/s measured on a
+# 1280x720 stream, 26.3 ms of it waiting for the next frame and 6.0 ms drawing
+# -- so recording every canvas would triple the file for motion nobody is
+# watching at that resolution. RunPreview writes on a clock instead of every
+# tick, which is also what keeps playback at real speed.
+RECORD_FPS = 10.0
 
 
 CAPTION_BGR = (255, 255, 255)
@@ -327,6 +340,11 @@ class RunPreview:
     publishing frames straight from the worker: a preview that only updates
     when the worker has something to say is frozen for exactly the seconds
     when watching the desk matters most.
+
+    ``window`` and ``video_path`` are independent outputs of the same canvas.
+    Recording without a window is the headless case -- a machine whose OpenCV
+    has no GUI can still write the file, and that is where a recording is the
+    only way to see what happened.
     """
 
     def __init__(
@@ -338,6 +356,9 @@ class RunPreview:
         camera: int,
         ui: BottomUI | PlainUI,
         title: str = "mt4 -- what qwen said (q or Esc to stop)",
+        window: bool = True,
+        video_path: str | None = None,
+        fps: float = RECORD_FPS,
     ) -> None:
         self._stream = stream
         self._worker = worker
@@ -345,7 +366,14 @@ class RunPreview:
         self._camera = camera
         self._ui = ui
         self._draw_errors: set[str] = set()
-        self._preview = LivePreview(title)
+        self._preview = LivePreview(title) if window else None
+        self._recorder = (
+            VideoRecorder(video_path=video_path, fps=fps) if video_path else None
+        )
+        # The catch-up in _record divides the elapsed time by this, so a
+        # non-positive rate has no meaning here; callers validate it.
+        self._record_period = 1.0 / fps
+        self._next_write = time.monotonic()
         self._latest: np.ndarray | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -385,6 +413,9 @@ class RunPreview:
                 continue
             with self._lock:
                 self._latest = canvas
+            self._record(canvas)
+            if self._preview is None:
+                continue
             try:
                 self._preview.show(canvas)
             except PreviewStopped:
@@ -397,7 +428,42 @@ class RunPreview:
                 self._ui.set_status("window closed -- stopping; press Enter to quit")
                 break
 
+    def _record(self, canvas: np.ndarray) -> None:
+        """Write this canvas as many times as the recording clock owes it.
+
+        Paced against wall time, not against the loop, so the file plays back
+        at the speed the desk actually moved -- a move timed off the video is
+        the move that happened. The loop turns over faster than the recording
+        rate (30.7/s measured, against 10 written), so an ordinary tick writes
+        one frame or none; a late tick -- window-redraw jitter, or the 200 ms
+        sleep after a camera error -- repeats the canvas to fill the gap it
+        left. Writing at most one frame per tick instead drops those periods
+        and shortens the video: 7.4 s of file for an 8.0 s run, measured with
+        the window open.
+
+        ``now`` is read once, so a write slower than ``_record_period`` cannot
+        chase its own tail.
+        """
+        if self._recorder is None:
+            return
+        now = time.monotonic()
+        while now >= self._next_write:
+            try:
+                self._recorder.write(canvas)
+            except Exception as exc:  # noqa: BLE001 -- see the compose handler above
+                # A path OpenCV will not open -- a directory that does not
+                # exist, an extension with no codec -- must not take the window
+                # down with it. Say so once, give up on the file, keep showing
+                # the run.
+                self._recorder = None
+                self._ui.emit(f"  recording stopped -- {type(exc).__name__}: {exc}")
+                return
+            self._next_write += self._record_period
+
     def close(self) -> None:
         self._stop.set()
         self._thread.join(timeout=2.0)
-        self._preview.close()
+        if self._preview is not None:
+            self._preview.close()
+        if self._recorder is not None:
+            self._recorder.close()

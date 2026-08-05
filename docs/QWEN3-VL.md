@@ -369,6 +369,7 @@ python ask_qwen.py                                  # interactive
 python ask_qwen.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
 python ask_qwen.py "find all the pickable objects"  # a report, nothing moves
 python ask_qwen.py --dry-run "pick up the stapler"  # decide, never move
+python ask_qwen.py --record run.mp4 "..."           # the window, to a video
 ```
 
 **The window is three things at once.** The left pane is the frame the last
@@ -380,6 +381,18 @@ instruction, step, phase, what the jaws are believed to hold, what has been
 done. The corner inset is the live feed. The left pane deliberately does not
 update during a move: those are the pixels a decision was made from, and a
 re-capture would silently answer a different question.
+
+**`--record run.mp4` writes that picture to a video** for the whole session,
+and `--record-fps` sets the rate (default 10). The compositing thread is what
+records, so the window is not required: `--no-preview`, or a machine whose
+OpenCV has no GUI, still gets the file — which is the case where a recording is
+the only way to see what happened. The loop turns over at camera rate (30.7/s
+measured, 26.3 ms of it waiting for the next frame and 6.0 ms drawing), so the
+recorder writes on a wall clock rather than once per tick and repeats the
+canvas across a late one. That is what keeps playback at real speed: 8.1 s of
+file for an 8.0 s run, where one frame per due tick gave 7.4 s. A 1740×720
+canvas of the desk costs about 165 KiB/s, so roughly 10 MB per minute of
+session.
 
 **Typing does not block on the arm.** A transfer is seconds of motion and a
 decision is seconds of GPU, and through all of it the prompt still takes input.

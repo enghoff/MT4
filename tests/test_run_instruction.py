@@ -24,7 +24,15 @@ import time
 
 import numpy as np
 
-from mt4_vision.instruct_view import BG, PANEL_W, RunState, compose, render_panel
+from mt4_vision import instruct_view
+from mt4_vision.instruct_view import (
+    BG,
+    PANEL_W,
+    RunPreview,
+    RunState,
+    compose,
+    render_panel,
+)
 from mt4_vision.instruct_worker import TaskWorker
 from mt4_vision.preview import draw_inset, wrap_text
 
@@ -155,6 +163,82 @@ def test_draw_inset_is_a_no_op_when_it_cannot_fit():
     tiny = blank(h=40, w=40, value=10)
     draw_inset(tiny, blank(), "LIVE")
     assert (tiny == 10).all()
+
+
+# -- recording ------------------------------------------------------------- #
+
+
+class FrameCounter:
+    """A ``VideoRecorder`` that counts frames instead of encoding them."""
+
+    def __init__(self) -> None:
+        self.frames = 0
+
+    def write(self, frame: np.ndarray) -> None:
+        self.frames += 1
+
+    def close(self) -> None:
+        pass
+
+
+def paced(fps: float = 10.0) -> RunPreview:
+    """A ``RunPreview`` carrying only the fields ``_record`` reads.
+
+    Built without ``__init__`` because the rest of it is a camera, a window
+    and a thread, and the pacing is arithmetic on a clock.
+    """
+    view = object.__new__(RunPreview)
+    view._recorder = FrameCounter()
+    view._record_period = 1.0 / fps
+    view._next_write = 0.0
+    view._ui = Recorder()
+    return view
+
+
+def replay(view: RunPreview, ticks: list[float], monkeypatch) -> None:
+    """Offer one canvas per tick, with the clock reading that tick's time."""
+    clock = {"now": 0.0}
+    monkeypatch.setattr(instruct_view.time, "monotonic", lambda: clock["now"])
+    canvas = blank(h=8, w=8)
+    for tick in ticks:
+        clock["now"] = tick
+        view._record(canvas)
+
+
+def test_recording_writes_at_the_declared_rate(monkeypatch):
+    """10 s of a 30/s loop is 100 frames of 10 fps video, not 300."""
+    view = paced(10.0)
+    replay(view, [i / 30 for i in range(1, 300)], monkeypatch)
+    assert view._recorder.frames == 100
+
+
+def test_a_stalled_tick_is_filled_so_the_file_keeps_wall_time(monkeypatch):
+    """The shortfall this pins: 7.4 s of video for an 8.0 s run.
+
+    Writing at most one frame per tick drops every period a slow tick jumped
+    over, and the recording ends up shorter than the run it recorded.
+    """
+    view = paced(10.0)
+    # A second of ordinary ticks, a 500 ms stall, then a second more.
+    ticks = [i / 30 for i in range(1, 31)]
+    ticks += [1.5]
+    ticks += [1.5 + i / 30 for i in range(1, 30)]
+    replay(view, ticks, monkeypatch)
+    assert view._recorder.frames == 25          # 2.5 s at 10 fps
+
+
+def test_a_recorder_that_fails_gives_up_the_file_and_keeps_the_window(monkeypatch):
+    """A path with no codec must not take the run's only display down."""
+    view = paced(10.0)
+
+    class Broken:
+        def write(self, frame: np.ndarray) -> None:
+            raise RuntimeError("no codec for .xyz")
+
+    view._recorder = Broken()
+    replay(view, [0.1, 0.2, 0.3], monkeypatch)
+    assert view._recorder is None
+    assert any("no codec" in line for line in view._ui.lines)
 
 
 # -- queue and stop -------------------------------------------------------- #

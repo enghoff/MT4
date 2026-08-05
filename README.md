@@ -264,6 +264,7 @@ python ask_qwen.py                                  # interactive prompt + windo
 python ask_qwen.py "put the red cube on marker 3"   # one-shot, exit 0 = DONE
 python ask_qwen.py "find all the pickable objects"  # a report, nothing moves
 python ask_qwen.py --dry-run "pick up the stapler"  # decide, never move
+python ask_qwen.py --record run.mp4 "..."           # the window, to a video
 ```
 
 The model is the eyes and nothing else. It gets the frame and the decoded ArUco

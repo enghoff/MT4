@@ -6,6 +6,7 @@
     python ask_qwen.py "find all the pickable objects"
     python ask_qwen.py --dry-run "pick up the green cube"
     python ask_qwen.py --no-preview "..."    # no window (headless, CI)
+    python ask_qwen.py --record run.mp4      # write the window to a video too
 
 Interactive is the default: a prompt line pinned to the bottom of the terminal,
 a background worker doing the slow thing, and a window that keeps redrawing
@@ -25,6 +26,11 @@ move plays out. The left pane is deliberately **not** live: those are the exact
 pixels a decision was made from, and re-capturing them would quietly answer a
 different question than the one worth asking. q or Esc in that window stops the
 run; the arm is still parked on the way out.
+
+``--record run.mp4`` writes that same composited picture to a video for the
+whole session, at 10 fps and real speed. It does not need the window: with
+``--no-preview``, or on a machine whose OpenCV has no GUI, the file is written
+anyway, which is the case where it is the only way to see what happened.
 
 Each step is one capture, one decision, one motion:
 
@@ -142,7 +148,7 @@ from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision import instruct as I
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX, CameraError, FrameStream
 from mt4_vision.console import BottomUI
-from mt4_vision.instruct_view import MAX_STEPS, RunPreview
+from mt4_vision.instruct_view import MAX_STEPS, RECORD_FPS, RunPreview
 from mt4_vision.instruct_worker import PlainUI, TaskWorker, save_record
 from mt4_vision.pickplace import ensure_homed, home_arm, retreat_for_camera
 from mt4_vision.preview import gui_available
@@ -346,6 +352,14 @@ def handle_command(
 # --------------------------------------------------------------------------- #
 
 
+def record_fps(text: str) -> float:
+    """A positive frame rate. The recorder paces itself off 1/fps."""
+    value = float(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("--record-fps must be greater than 0")
+    return value
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("instruction", nargs="*", help="what to do; omit for interactive")
@@ -359,6 +373,16 @@ def main() -> int:
         "--preview", action=argparse.BooleanOptionalAction, default=True,
         help="live window: the frame the model saw with its answer drawn on it, "
              "a state panel and a live inset; q or Esc stops the run (default: on)",
+    )
+    ap.add_argument(
+        "--record", default=None,
+        help="also write the window to this video path (e.g. run.mp4); works "
+             "with --no-preview and without an OpenCV GUI",
+    )
+    ap.add_argument(
+        "--record-fps", type=record_fps, default=RECORD_FPS,
+        help=f"frames per second written by --record (default {RECORD_FPS:g}); "
+             "the file plays back at real speed at any value",
     )
     args = ap.parse_args()
 
@@ -392,8 +416,8 @@ def main() -> int:
     if want_preview and not gui_available():
         print(
             "no OpenCV GUI here, so no preview window (is "
-            "opencv-python-headless installed?). --save-view still writes "
-            "the frame the model saw.",
+            "opencv-python-headless installed?). --record still writes the "
+            "video, and --save-view the frame the model saw.",
             file=sys.stderr,
         )
         want_preview = False
@@ -422,8 +446,20 @@ def main() -> int:
             max_steps=args.max_steps, save_view=args.save_view,
             dry_run=args.dry_run,
         )
-        if want_preview:
-            view = RunPreview(stream, worker, svc=svc, camera=args.camera, ui=ui)
+        # The compositing thread is what records, so a run that only wants the
+        # file still gets one -- the window is one of its two outputs, not the
+        # thing that produces the picture.
+        if want_preview or args.record:
+            view = RunPreview(
+                stream, worker, svc=svc, camera=args.camera, ui=ui,
+                window=want_preview, video_path=args.record,
+                fps=args.record_fps,
+            )
+        if args.record:
+            ui.emit(
+                f"recording the window to {args.record} "
+                f"at {args.record_fps:g} fps"
+            )
 
         if not interactive:
             worker.submit(" ".join(args.instruction))
