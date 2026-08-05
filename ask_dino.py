@@ -21,8 +21,8 @@ Prereqs:
 
 Example::
 
-    python move_object_to_marker.py --camera 1
-    python move_object_to_marker.py --dry-run --no-park
+    python ask_dino.py --camera 1
+    python ask_dino.py --dry-run --no-park
 """
 
 from __future__ import annotations

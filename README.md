@@ -65,7 +65,7 @@ python -m mt4_vision entities       # entity table: ids, pickable, why not
 
 # Run a task
 python stack_cubes.py --marker 4 --preview
-python move_object_to_marker.py     # interactive: name an object, it moves it
+python ask_dino.py                  # interactive: name an object, it moves it
 
 # MCP server for LLM control
 python -m mt4_mcp                   # HTTP at http://127.0.0.1:8787/mcp
@@ -83,7 +83,7 @@ Top-level scripts, each driving the arm end to end:
 | [stack_cubes.py](stack_cubes.py) | Build a cube stack on a calibrated marker (`--marker` required). Clears the site first, picks with the centering re-grip, places by dead reckoning; transits route the gripper *and* forearm around the growing column. `--resume N`, `--max-levels` (default 9), `--preview`, `--record` |
 | [unstack_cubes.py](unstack_cubes.py) | Reverse a stack: take cubes off the top by dead reckoning and scatter them at random open spots/orientations. `--marker` and `--stack-height N` both required — the operator is trusted about N |
 | [shuffle_blocks.py](shuffle_blocks.py) | Live loop: shuffle cubes between free markers and open-table slots (Ctrl+C to stop, H to re-home) |
-| [move_object_to_marker.py](move_object_to_marker.py) | Interactive open-vocab mover: type an object description, Grounding DINO finds it, and it lands on a free marker. Live preview refreshed by a background detection thread. `--marker` (repeatable), `--dry-run`, `--no-preview` |
+| [ask_dino.py](ask_dino.py) | Interactive open-vocab mover: type an object description, Grounding DINO finds it, and it lands on a free marker. Live preview refreshed by a background detection thread. `--marker` (repeatable), `--dry-run`, `--no-preview` |
 | [track_cube.py](track_cube.py) | Visually servo the gripper to hover above a single cube and follow it as you move it by hand |
 | [jog.py](jog.py) | Keyboard + Xbox gamepad jog client — see [Jog](#jog) |
 

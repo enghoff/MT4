@@ -2058,7 +2058,7 @@ contested between reviewers. Ranked by value.
 `object_entity` tests region → antipodal grasp plan → cube clearance → region
 again at the moved grasp point. Each has a gate the other lacks. Five callers
 run **both** and hand-reconcile the answers (`mt4_mcp/server.py:445`, `:518`,
-`mt4_vision/__main__.py:147`, `:241`, `move_object_to_marker.py:133`), each with
+`mt4_vision/__main__.py:147`, `:241`, `ask_dino.py:133`), each with
 its own `if not ok and entity.reason is None:` merge. The acting paths —
 `mt4_pick`, `_reacquire`, `ask_qwen` — read only `entity.pickable`, so
 **the J4 gate never runs where it matters** and an infeasible long-axis grasp is

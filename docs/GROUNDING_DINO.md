@@ -228,7 +228,7 @@ to the whole prompt string while boxes stay correct.
 | [mt4_vision/grounding.py](../mt4_vision/grounding.py) | Client. `health()`, `detect(frame, prompt)` → `Detection` list sorted by score, with `cx`/`cy`. Raises `GroundingError` when unreachable |
 | `python -m mt4_vision grounding --prompt "pen"` | Detect and save `grounding_frame.jpg`. `--locate` measures the top hit, `--pick` picks it, `--label`, `--box-threshold`, `--text-threshold`, `--window` |
 | MCP `mt4_locate_by_prompt` | Registers the top hit as `obj_N` with entity, detection list and a view token |
-| [move_object_to_marker.py](../move_object_to_marker.py) | Interactive mover: type a description, DINO finds it, it lands on a free marker. Background detection thread refreshes the preview |
+| [ask_dino.py](../ask_dino.py) | Interactive mover: type a description, DINO finds it, it lands on a free marker. Background detection thread refreshes the preview |
 
 Detection stops at a box; measurement is separate. Both the CLI and the MCP tool
 hand the box to `locate.measure_with_box_fallback`, which tries three things in
