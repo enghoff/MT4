@@ -46,7 +46,8 @@ silently rather than failing loudly.
 | 6 | **Gripper span** | `grip_span_s_at_zero_mm`, `grip_span_s_per_mm` | Closing distance for objects that are not 20 mm cubes | Jaws close on air, pick reports success |
 
 Layers 1–4 live in the JSON file. Layer 5 lives in the microcontroller and is
-lost on power cycle. Layer 6 is optional and currently unmeasured on this rig.
+lost on power cycle. Layer 6 is optional and stays unmeasured unless you fit it
+by hand.
 
 Layer 4 is the odd one: missing, it fails *open* rather than degrading. The
 other layers get less accurate without their measurement, but an absent desk
@@ -81,20 +82,26 @@ The composed result is still a single 3×3 homography. A solution whose
 denominator changes sign across the workspace is rejected outright — that is the
 physical-camera check the naive fit failed.
 
-### A note on this rig's camera
+### A note on where the camera sits
 
-Despite being called "overhead", the camera is **steeply oblique**: measured
-nadir at robot ≈ **(518, −35)**, lens ≈ **244 mm** above the table. The nadir is
-far off-desk, well outside the workspace, so raising the TCP shifts its image a
-lot along the camera azimuth. Height parallax is radial from that far nadir and
-grows with height — not the roughly-constant shift a single-height fit suggests.
-This is why layer 3 exists as its own measurement.
+Nothing here assumes the camera is directly above the work surface, and a mount
+that clamps to a desk edge or a nearby stand rarely is. What matters is the
+**nadir** — the point on the table plane the camera looks straight down at — and
+the lens height above that plane. Step 4 measures both.
 
-The residual error at large ±Y is lens **barrel distortion**, which a single
-radial model cannot express and nothing in this pipeline undistorts. A real fix
-would need `cv2.calibrateCamera` intrinsics plus an undistort pass. Full detail,
-including which rows of the older top-down analysis this superseded, is in
-[ASSUMPTIONS.md](ASSUMPTIONS.md) section B.
+The more oblique the mount, the further off-desk the nadir lands, and the more
+raising the TCP shifts its image along the camera azimuth. Height parallax is
+radial from the nadir and grows with height — not the roughly-constant shift a
+single-height fit suggests. That is why layer 3 exists as its own measurement
+rather than being folded into the table plane, and why a nadir well outside the
+workspace is a normal result rather than a broken one.
+
+An oblique view also spends more of its residual error on lens **barrel
+distortion** toward the frame edges, which a single radial model cannot express
+and nothing in this pipeline undistorts. A real fix would need
+`cv2.calibrateCamera` intrinsics plus an undistort pass. Measured detail from
+one setup, including which rows of an earlier top-down analysis it superseded,
+is in [ASSUMPTIONS.md](ASSUMPTIONS.md) section B.
 
 ---
 
@@ -119,7 +126,7 @@ human.
 - Custom firmware flashed (`python flash_jog.py --port COM6`).
 - Serial port free. **Only one process can own it** — stop `jog.py`, the MCP
   server, and any other client first.
-- Overhead camera connected and seeing the desk.
+- Scene camera connected and seeing the desk.
 - At least 3 ArUco markers (DICT_4X4_50) taped flat on the work surface, spread
   out, all within the arm's reach if possible. Sheet:
   [ArUco Markers A4 5x5cm.pdf](ArUco%20Markers%20A4%205x5cm.pdf).
@@ -236,11 +243,11 @@ Then it asks for a few values, each with a default; Enter accepts.
 
 | Prompt | Default | Notes |
 |--------|---------|-------|
-| `table_z` | Median TCP Z of the recorded touches | The TCP Z while touching a marker *is* the table height there. Also the grip height for a cube on the table — the jaws straddle its lower faces. Currently 120. **Sanity-check the prompted default against `GROUND_Z_MM` = 115:** a touch jogged down until the arm stopped has hit the guard clamp, not the desk, and every marker then records exactly 115.0. Desk contact measured 2026-08-04 is ~120 |
+| `table_z` | Median TCP Z of the recorded touches | The TCP Z while touching a marker *is* the table height there. Also the grip height for a cube on the table — the jaws straddle its lower faces. **Sanity-check the prompted default against `GROUND_Z_MM` = 115:** the desk sits a few mm above the soft floor, so expect a value slightly over 115. A touch jogged down until the arm stopped has hit the guard clamp, not the desk, and every marker then records exactly 115.0 |
 | `cube edge length` | Previous, else 20 | Feeds the parallax model and stack place height |
 | `safe_z` | Previous, else `table_z + 1.5 × cube` | Travel height. Keep modest — the arm belongs low over the desk |
 | `camera height above table` | Previous, else 240 | **Only a seed.** Step 4 derives this properly and overwrites it |
-| `grip_close_s` | The `G` reading, else previous, else 240 | Firmware S value that holds a cube (currently 255) |
+| `grip_close_s` | The `G` reading, else previous, else 240 | Firmware S value that holds a cube |
 | `grip_open_s` | Previous, else 140 | |
 
 Saved with a `bundle+similarity` (or `affine`) homography, the marker-centre
@@ -274,9 +281,9 @@ symptom is a place accepted past the back edge.
 ## Step 3: cube-top parallax
 
 `calibrate_height.py`. Cubes are detected by their **top face**, `cube_height_mm` above the table
-plane the markers lie on. On this oblique camera that costs a measured
-**15–19 mm** of pick error across most of the desk, and ~26 mm near the
-low-x markers. This step measures the shift directly.
+plane the markers lie on. The more oblique the mount, the more that costs: on a
+steeply oblique one, **15–19 mm** of pick error across most of the desk and
+~26 mm at the far corners. This step measures the shift directly.
 
 ```powershell
 python calibrate_height.py
@@ -401,12 +408,13 @@ vs TCP) is the *same* at every height in a column, so fitting the offset's
 *growth with height* cancels it. The cube-top map from step 3 cannot serve this
 purpose — it bakes that bias in.
 
-The earlier approach prompted for a `cam_height_mm` and guessed the nadir. That
-was wrong by a wide margin: the guess was 700 mm, the real lens height is ~244
-mm, and the camera is oblique rather than overhead. The overlay drew the
-trajectory far too low as a result. This fit recovers the height within a couple
-of mm of a tape measure — but derives it, like every other number here, from
-vision plus the arm.
+**Guessing is worse than it looks.** Prompting for a lens height and assuming
+the nadir sits in the middle of the desk gets both numbers wrong whenever the
+mount is oblique, and it fails quietly: the overlay simply draws the trajectory
+too low. Eyeballing how far a clamped camera sits above a table is also harder
+than it sounds, and nothing downstream objects to a badly wrong figure. This fit
+recovers the height within a couple of mm of a tape measure — but derives it,
+like every other number here, from vision plus the arm.
 
 ### What it sweeps
 
@@ -416,9 +424,9 @@ to 148 mm above the table. The y-spread is what pins the nadir's y: a +y and a
 columns keep the fit honest toward the frame edges; the central ones anchor the
 middle.
 
-It is robust to this rig's two nuisances:
+It is robust to two nuisances:
 
-- **Self-occlusion** — the black gripper claw hides a low held cube from the
+- **Self-occlusion** — the black gripper claw hides a low held cube from an
   oblique camera, so each column is tracked through whatever heights *are*
   visible and skips the rest, rather than demanding the lowest rung.
 - **Probe identity** — the held cube is told from desk cubes by elimination: the
@@ -437,16 +445,21 @@ failure.
 
 ### Reading the output
 
+One setup's report, for shape:
+
 ```
 Collected 62 rungs across 9 columns: [...]
 nadir = (518.1, -35.0)   cam_height = 244.0 mm
 robot-space rms = 18.42 mm   overlay pixel error mean=6.3 max=14.1px
 ```
 
-- **nadir far off-desk** (large x, here ~518) is expected and correct on this
-  rig — that is what "steeply oblique" means.
+- **A nadir far off-desk is expected on an oblique mount** — that is what the
+  obliquity *is*, and the fit is not misbehaving by reporting it. A nadir near
+  the middle of the work surface means the camera genuinely is close to
+  overhead. Either is a valid answer; the number to distrust is one that lands
+  somewhere the camera plainly is not.
 - **robot-space rms of ~20–30 mm is normal and fine.** A wide-Y fit is
-  inherently distortion-limited: the oblique lens barrel-distorts the frame
+  inherently distortion-limited: an oblique lens barrel-distorts the frame
   edges, which no single pinhole radial model can express. Above 35 mm it refuses
   to write, which catches a genuinely broken sweep (latched the wrong blob,
   absurd nadir) rather than an honest edge-distortion residual.
@@ -473,20 +486,21 @@ Takes about five seconds. No arm motion at all — it reads one frame.
 
 ### Only the back edge is real
 
-The left, right and near sides run off the camera frame and lie past the arm's
-342 mm reach in every direction, so there is nothing out there to measure and
-nothing that could bind. The stored polygon has one measured side and three
-nominal ones at ±500 mm. `on_table` is a genuine point-in-polygon test, but on
-this rig it is a half-plane in disguise. Replace the desk with a smaller one and
-the other three sides become worth measuring.
+On a desk wider and deeper than the arm can reach, the left, right and near
+sides run off the camera frame and lie past the arm's 342 mm reach, so there is
+nothing out there to measure and nothing that could bind. The stored polygon
+then has one measured side and three nominal ones at ±500 mm: `on_table` is a
+genuine point-in-polygon test, but a half-plane in disguise. On a smaller
+surface, or one the arm overhangs, the other three sides become worth
+measuring — and this step will not measure them for you.
 
 ### The desk's colour is learned, never named
 
 No surface colour appears anywhere in the script, and none may be added. A
 colour written into the source is a claim about one desk under one light, and it
 survives neither changing. Measured 2026-08-04: a hue window of 8–30 with
-saturation ≥ 40, fitted to this exact desk, admitted **0.0%** of five clear
-patches of the same desk under brighter light, which read hue 4 saturation 27.
+saturation ≥ 40, fitted to one exact desk, admitted **0.0%** of five clear
+patches of that same desk under brighter light, which read hue 4 saturation 27.
 The scan then found only sensor speckle, and seven captures of the static desk
 returned 1, 4, 2, 7, 0, 15 and 7 "clean" columns. A polygon fitted to speckle is
 worse than no polygon, because it is silent and it moves the desk toward the arm.
@@ -497,10 +511,10 @@ lands on desk by construction. Their robust median and spread in Lab is the
 reference, and every later comparison is in units of that spread.
 
 Comparison is on **chroma** (Lab a and b) where chroma will carry it, which the
-scan tries first. Illumination moves L and barely touches a and b: this desk's
-back strip sits in shade 60 L below its lit middle with its chroma right to
-within 1 spread, and judging on L there reports the edge 160 mm off — at +88 mm
-instead of −72 mm, with 138 agreeing columns at 7 mm residual, so nothing
+scan tries first. Illumination moves L and barely touches a and b: on one measured
+desk the back strip sat in shade 60 L below its lit middle with its chroma right
+to within 1 spread, and judging on L there reported the edge 160 mm off — at
++88 mm instead of −72 mm, with 138 agreeing columns at 7 mm residual, so nothing
 downstream would question it. Lightness is admitted only when chroma is measured
 to carry nothing, as on a white bench under a black curtain. The output says
 which pass was used.
@@ -515,16 +529,16 @@ A cable across the back edge, an ArUco pad, a cube, the arm's base: each is a
 hole in the region or a notch out of its top, and none disconnects the surface
 or moves its outline. Rules that scan each column independently have to be told
 how much interruption to tolerate, and the right answer differs per column — two
-cables near this desk's back edge push a 40 px-run rule 100 px down the desk
-across the whole left half of the frame.
+cables lying near a back edge push a 40 px-run rule 100 px down the desk across
+the whole left half of the frame.
 
 ### Why the fit is robust, and usually constant
 
 The region's top outline is the desk edge in most columns, not all. Where the
 arm and its controller box stand against the back it follows their lower
 silhouette; at the frame borders it follows the desk's vertical side edges.
-Those are minority contaminants — 164 of 320 columns survive on this rig — so
-the fit trims against a constant model before measuring anything.
+Those are minority contaminants — 164 of 320 columns survived in the measured
+case — so the fit trims against a constant model before measuring anything.
 
 The edge is modelled as a **constant x** unless the surviving columns genuinely
 span the desk (`MIN_SLOPE_SPAN_MM` = 250). A least-squares slope fitted over a
@@ -701,10 +715,10 @@ innocent.
 
 A marker can be flagged in `raw_marker_observations` with
 `"exclude_from_fit": true`. It then keeps its stored robot XY as a usable *slot
-coordinate* but stays out of the map fit. This exists because marker 1's touch
-was recorded at the arm's reach limit, where arm-frame and camera geometry
-disagree by ~30 mm; including it dragged the whole similarity. The flag is
-carried through refits — dropping it would silently re-arm that trap.
+coordinate* but stays out of the map fit. It is for a marker touched at the
+arm's reach limit, where arm-frame and camera geometry disagree by ~30 mm and
+including the touch drags the whole similarity. The flag is carried through
+refits — dropping it would silently re-arm that trap.
 
 ---
 
@@ -743,8 +757,8 @@ measured against the old base position would put the edge in the wrong place.
 
 ## Optional: gripper span model
 
-`grip_span_s_at_zero_mm` and `grip_span_s_per_mm` are **currently unmeasured** on
-this rig (both `null`). They model jaw opening as
+`grip_span_s_at_zero_mm` and `grip_span_s_per_mm` are **`null` until you measure
+them**, and no calibration step fills them in. They model jaw opening as
 `span_mm = (at_zero − S) / per_mm`.
 
 This matters more than it looks. `grip_close_s` is the value for a **20 mm
@@ -758,7 +772,7 @@ just holds, fit `S = at_zero − per_mm × width`, and store both coefficients. 
 the one point we have (S 240 holds a 20 mm cube) plus S 285 = fully closed, the
 slope is around 2.25 S/mm — a guess to check, not a substitute for measuring.
 
-Vision reports a *silhouette* width, which on this oblique mount reads wide for
+Vision reports a *silhouette* width, which on an oblique mount reads wide for
 anything with height, so picks close `GRIP_SQUEEZE_MM` = 4 mm past the measured
 width. Too-closed merely squeezes, which the jaws tolerate; too-open is the
 failure mode with no detector.

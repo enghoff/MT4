@@ -269,7 +269,7 @@ and must resolve to one id.
 ## Geometry Is Already Object-General **[r2]**
 
 Worth stating plainly because it inverts the obvious worry. A single oblique
-overhead camera cannot see height, and height aliases into XY error — but this
+scene camera cannot see height, and height aliases into XY error — but this
 is solved, and solved generically:
 
 - [`_parallax_gain`](../mt4_vision/locate.py#L416) gives millimetres of

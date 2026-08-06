@@ -9,13 +9,13 @@ sits radially outward from the camera *nadir* (the robot XY directly under the
 lens) by ``cam_height / (cam_height - h)``. So two numbers fully describe it:
 the nadir ``cam_xy_robot`` and the lens height ``cam_height_mm``.
 
-On this rig the overhead camera is steeply *oblique* -- the nadir is far off
-to one side, well outside the workspace -- so raising the TCP shifts its image
-a lot, and getting these two numbers right is what makes the overlay track the
-arm instead of drawing the trajectory far too low.
+The scene camera does not have to be overhead, and on an oblique mount the
+nadir lands far off to one side, well outside the workspace. Raising the TCP
+then shifts its image a lot, and getting these two numbers right is what makes
+the overlay track the arm instead of drawing the trajectory far too low.
 
-Rather than have a human measure the lens position (the earlier approach: a
-prompted ``cam_height_mm`` plus a guessed nadir), this derives BOTH from
+Rather than have a human measure the lens position (a prompted
+``cam_height_mm`` plus a guessed nadir), this derives BOTH from
 vision + the arm, like every other calibration here: grip a cube, hover it at
 a column of known heights over several XY spread across the desk, detect where
 it lands, and fit the radial model to the apparent-vs-true offsets. The

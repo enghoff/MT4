@@ -339,7 +339,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         anything moves. Requires the calibration from `python calibrate_vision.py`.
 
         Args:
-            camera: USB camera index (default 1 -- the overhead work camera).
+            camera: USB camera index (default 1 -- the scene camera).
         """
         try:
             _scene, snapshot = _build_snapshot(camera)
@@ -363,7 +363,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         is already a `cube_N` or `marker_N`, use that id instead.
 
         Args:
-            camera: USB camera index (default 1 -- the overhead work camera).
+            camera: USB camera index (default 1 -- the scene camera).
         """
         try:
             import cv2
@@ -854,7 +854,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             marker_id: ArUco marker id to move to (see mt4_scene's calibration
                 or the physical markers on the work surface).
             touch: If true, descend to table height instead of hovering.
-            camera: USB camera index (default 1 -- the overhead work camera).
+            camera: USB camera index (default 1 -- the scene camera).
         """
         try:
             from mt4_vision.calib import load_calibration

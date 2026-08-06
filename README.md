@@ -3,7 +3,7 @@
 A full replacement software stack for the WLKATA MT4 desktop robot arm
 (ATmega2560, 115200 baud serial): custom firmware with on-device Cartesian
 motion and queued multi-waypoint paths, interactive jog (keyboard + Xbox
-gamepad), overhead-camera vision pick-and-place, open-vocabulary object
+gamepad), scene-camera vision pick-and-place, open-vocabulary object
 grounding, and an MCP server that lets an LLM drive the arm — "put the red
 cube next to the blue one", "move the pen onto marker 3".
 
@@ -17,10 +17,10 @@ backed up and restorable, see [Restoring stock firmware](#restoring-stock-firmwa
 
 ## Demo
 
-[Autonomous cube stacking](https://youtu.be/1H_cvyK35i8) — `stack_cubes.py`
+[Autonomous cube stacking](https://youtu.be/afYh03Ql2DU) — `stack_cubes.py`
 building a stack on a calibrated marker, with the live vision overlay visible throughout.
 
-[Vision-language control](https://youtu.be/Upl5uVBjPy0) — `ask_qwen.py` turning
+[Vision-language control](https://youtu.be/S7dCj_cUEkE) — `ask_qwen.py` turning
 a typed English instruction into instructions for the MT4 arm.
 
 ## Requirements
@@ -28,7 +28,7 @@ a typed English instruction into instructions for the MT4 arm.
 - Python 3.10+ — `pip install -r requirements.txt`
 - Windows (jog client uses `GetAsyncKeyState` / XInput)
 - [PlatformIO](https://platformio.org/) + avrdude (only to flash firmware)
-- For vision: an overhead USB camera and printed ArUco markers
+- For vision: a fixed USB camera viewing the work surface, and printed ArUco markers
   (DICT_4X4_50; sheet in [docs/ArUco Markers A4 5x5cm.pdf](docs/ArUco%20Markers%20A4%205x5cm.pdf))
 - For open-vocab grounding: somewhere to run the Grounding DINO service (a CUDA
   GPU on this machine or another host; CPU works, slowly), plus the optional
@@ -38,7 +38,7 @@ a typed English instruction into instructions for the MT4 arm.
 Serial ports auto-detect the CH340 USB-UART when `--port` / `MT4_SERIAL_PORT`
 are omitted (COM numbers often change after a re-plug). The camera index comes
 from `--camera`, else `MT4_CAMERA_INDEX`, else **0**; set that variable to
-whichever USB index your overhead camera landed on (`setx MT4_CAMERA_INDEX 1`
+whichever USB index your scene camera landed on (`setx MT4_CAMERA_INDEX 1`
 on a laptop whose built-in camera takes 0 — then restart any shell that was
 already open, since it inherited an environment without it). Either can be
 **-1** to auto-detect by scanning for the camera that sees the markers. The MCP
@@ -92,12 +92,17 @@ Top-level scripts, each driving the arm end to end:
 
 ## Vision
 
-An overhead USB camera watches the work surface, which carries ArUco markers.
+A fixed **scene camera** watches the work surface, which carries ArUco markers.
 A one-time calibration maps camera pixels to robot-frame XY on the table plane
-— no camera intrinsics needed. Despite the name, the camera is **steeply
-oblique** on this rig (measured nadir ≈ (518, −35) robot, lens ≈ 244 mm up), so
-height parallax is modelled radially from that nadir and grows with height —
-see [docs/CALIBRATION.md](docs/CALIBRATION.md).
+— no camera intrinsics needed.
+
+The mount does not have to be truly overhead, and usually isn't.
+`calibrate_camera_nadir.py` measures where the camera actually sits — the point
+on the table it looks straight down at (its **nadir**) and its height above the
+plane — so height parallax is modelled radially outward from that point and
+grows with the object's height. The more oblique the mount, the further off-desk
+the nadir lands and the more this matters. See
+[docs/CALIBRATION.md](docs/CALIBRATION.md).
 
 ### Entity model
 
@@ -259,10 +264,9 @@ works without it.
 ### Silhouettes instead of boxes
 
 `mt4_vision.sam` loads `facebook/sam2.1-hiera-small` in-process. Give it a
-pixel or a box and it returns the outline of what is there — on the reference
-desk, a click on a small Statue of Liberty figurine comes back as its
-silhouette including the raised torch, which no rectangle and no HSV colour
-threshold describes.
+pixel or a box and it returns the outline of what is there — a click on a small
+Statue of Liberty figurine comes back as its silhouette including the raised
+torch, which no rectangle and no HSV colour threshold describes.
 
 ```powershell
 pip install -r requirements-sam.txt                   # once

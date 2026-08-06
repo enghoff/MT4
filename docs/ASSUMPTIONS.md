@@ -19,7 +19,7 @@ instrumented runs where applicable.
 
 ## B. Camera / vision geometry
 
-> **2026-07-25 update:** the "overhead" camera is actually **steeply oblique** —
+> **2026-07-25 update:** the scene camera on this rig is **steeply oblique** —
 > nadir far off-desk at ~(518, −35) robot, lens ~244 mm up, measured directly
 > against the arm (`calibrate_camera_nadir.py`). Height parallax is therefore
 > radial from that far nadir and grows with height; `Calibration.robot_to_pixel`

@@ -46,11 +46,11 @@ from mt4_vision.workspace import (
     work_region_block_reason,
 )
 
-# Real cube blobs under the closer overhead mount land ~2000-4000px^2
+# Real cube blobs at the measured scene-camera distance land ~2000-4000px^2
 # (on-pad red measured 2790 then 3627 on 2026-07-20 as pose/lighting
 # varied). Tighter than detect.py's floor so low-area glare/arm flecks
 # are not pick targets while still counting toward marker occupancy via
-# the raw detection list. Old far-mount pick band was 280-650.
+# the raw detection list.
 PICK_MIN_AREA = 400.0
 PICK_MAX_AREA = 5000.0
 # A cube gripped at the capture pose hovers ~210mm over the table and

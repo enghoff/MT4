@@ -1,6 +1,6 @@
 # Claude / agent instructions — MT4 repo
 
-This project controls a **real WLKATA MT4 arm** and **overhead USB camera** over serial. Treat hardware as part of the debugging loop, not a black box.
+This project controls a **real WLKATA MT4 arm** and **scene camera** (USB) over serial. Treat hardware as part of the debugging loop, not a black box.
 
 ## Hardware autonomy (required)
 

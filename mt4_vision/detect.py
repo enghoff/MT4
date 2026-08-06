@@ -1,4 +1,4 @@
-"""ArUco marker and colored-cube detection in the (oblique) overhead camera."""
+"""ArUco marker and colored-cube detection in the (oblique) scene camera."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ COLOR_RANGES: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]]
     "blue": [((90, 100, 60), (128, 255, 255))],
 }
 # Reject blobs smaller than this (px^2) -- noise, shadows, cable ties.
-# At this overhead mount real cube blobs are ~1600-3600px^2 (measured
+# At the measured mount distance real cube blobs are ~1600-3600px^2 (measured
 # 2026-07-20). Keep a 2x margin below the smallest real cube: sub-cube blobs
 # are never cubes here, and a floor near 120 lets a 263px^2 specular glare on
 # a laminated marker (reflecting the wall) pass as a blue cube -- which
