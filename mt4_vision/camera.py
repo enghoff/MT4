@@ -1,4 +1,9 @@
-"""USB camera capture for the scene camera watching the work surface."""
+"""USB camera capture for the scene camera watching the work surface.
+
+Set ``MT4_CAMERA_URL=shm://mt4_scene_cam`` to read frames from MT4-sim's
+``serve_firmware.py --camera`` feed instead of a USB device. Everything else
+(``open_camera``, ``capture_frame``, ``FrameStream``) keeps the same surface.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +22,9 @@ import numpy as np
 # Read at import from the real environment, not .env (only mt4_mcp loads that):
 # a shell started before the variable was set inherits a copy without it.
 DEFAULT_CAMERA_INDEX = int(os.environ.get("MT4_CAMERA_INDEX", "0"))
+# Shared-memory URL from MT4-sim (`shm://mt4_scene_cam`). When set, open_camera
+# ignores the USB index and attaches to that feed.
+DEFAULT_CAMERA_URL = os.environ.get("MT4_CAMERA_URL", "").strip() or None
 AUTO_SCAN_MAX_INDEX = 5
 # The driver's default UVC mode is 640x480, where each ArUco marker (already
 # viewed at a steep angle from an oblique mount, and small relative to a
@@ -47,6 +55,13 @@ class CameraError(Exception):
 # Auto-detect result, cached because opening each candidate camera costs
 # seconds. Reset by unplugging/replugging only across process restarts.
 _detected_index: int | None = None
+
+
+def _resolve_url(url: str | None) -> str | None:
+    if url is not None:
+        text = url.strip()
+        return text or None
+    return DEFAULT_CAMERA_URL
 
 
 def _open_raw(index: int) -> cv2.VideoCapture:
@@ -89,7 +104,19 @@ def _autodetect_index() -> int:
     )
 
 
-def open_camera(index: int = DEFAULT_CAMERA_INDEX) -> cv2.VideoCapture:
+def open_camera(
+    index: int = DEFAULT_CAMERA_INDEX, *, url: str | None = None
+) -> cv2.VideoCapture:
+    """Open the scene camera: USB by index, or a sim feed when ``url`` / ``MT4_CAMERA_URL`` is set."""
+    feed = _resolve_url(url)
+    if feed is not None:
+        from mt4_vision.sim_feed import SimFeedCapture
+
+        try:
+            return SimFeedCapture(feed)
+        except Exception as exc:  # noqa: BLE001 - surface as CameraError
+            raise CameraError(str(exc)) from exc
+
     if index < 0:
         index = _autodetect_index()
     cap = _open_raw(index)
@@ -108,11 +135,15 @@ def grab_frame(cap: cv2.VideoCapture, flush: int = FLUSH_FRAMES) -> np.ndarray:
     return frame
 
 
-def capture_frame(index: int = DEFAULT_CAMERA_INDEX) -> np.ndarray:
+def capture_frame(
+    index: int = DEFAULT_CAMERA_INDEX, *, url: str | None = None
+) -> np.ndarray:
     """One-shot open/grab/release for callers without a long-lived capture."""
-    cap = open_camera(index)
+    cap = open_camera(index, url=url)
     try:
-        return grab_frame(cap)
+        # Sim feeds have no driver buffer to flush; USB still needs it.
+        flush = 0 if _resolve_url(url) is not None else FLUSH_FRAMES
+        return grab_frame(cap, flush=flush)
     finally:
         cap.release()
 
@@ -131,8 +162,10 @@ class FrameStream:
     delivered at call time plus one full frame period).
     """
 
-    def __init__(self, index: int = DEFAULT_CAMERA_INDEX) -> None:
-        self._cap = open_camera(index)
+    def __init__(
+        self, index: int = DEFAULT_CAMERA_INDEX, *, url: str | None = None
+    ) -> None:
+        self._cap = open_camera(index, url=url)
         self._cond = threading.Condition()
         self._frame: np.ndarray | None = None
         self._seq = 0
