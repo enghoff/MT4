@@ -16,7 +16,12 @@ from mt4_jog.joints import (
 )
 from mt4_jog.kinematics import JointAnglesDeg, ik_position, steps_from_angles
 from mt4_vision.calib import Calibration
-from mt4_vision.detect import CubeDetection, detect_cubes
+from mt4_vision.detect import (
+    MAX_BLOB_AREA,
+    MIN_BLOB_AREA,
+    CubeDetection,
+    detect_cubes,
+)
 
 # Cube centroid within this of a marker center counts the marker occupied
 # when the ArUco tag does not decode. A decoded tag alone is *not*
@@ -85,7 +90,12 @@ DEFAULT_FRAME_SIZE_PX = (1280, 720)
 # free_placement_slots gates every one of them through in_work_region, so a
 # slot that the camera cannot confirm never reaches a caller. Before that gate
 # existed, five of these eight sat in the detector's discard zone and a cube
-# placed on one vanished from every later scan.
+# placed on one vanished from every later scan. The gate was in-frame only until
+# 2026-08-10, which let the same failure back in by a different door: five of
+# the fifteen slots below are near enough the camera that a cube on one imaged
+# over the detector's size cap, so it was in frame, reachable, and still
+# discarded. work_region_block_reason now checks the size a cube would image at
+# as well as where it would land.
 PLACEMENT_SLOTS: list[tuple[float, float]] = [
     (150.0, 100.0),
     (150.0, -100.0),
@@ -254,6 +264,105 @@ def camera_covers(
     )
 
 
+def expected_cube_area_px2(x: float, y: float, calib: Calibration) -> float:
+    """Blob area a cube resting at (x, y) should image at, in px^2.
+
+    The detector's size gate used to be two fixed numbers, which only works if
+    a cube looks the same size everywhere. On this mount it does not: the
+    camera is low and steeply oblique, so a 20mm cube images ~1900px^2 at the
+    far corners of the reach and ~5800px^2 at the near slots, a factor of 3.
+    Fixed thresholds tuned in the middle of that range therefore throw away
+    real cubes at one end while passing smears at the other.
+
+    So predict instead of assume. The cube's eight corners are projected with
+    the same height-corrected camera model ``camera_covers`` uses, and the
+    silhouette is their convex hull -- which is what a solid-coloured cube
+    presents to the detector. Yaw is not known at predict time and is taken
+    axis-aligned; turning a cube swings the true silhouette by about +-10%,
+    which is small next to the 3x positional swing and is absorbed by the
+    tolerance band the callers apply (PICK_AREA_LO/HI below).
+    """
+    side = float(calib.cube_height_mm)
+    half = 0.5 * side
+    z0 = float(calib.table_z)
+    corners = [
+        calib.robot_to_pixel(x + dx, y + dy, z0 + dz)
+        for dx, dy in ((-half, -half), (half, -half), (half, half), (-half, half))
+        for dz in (0.0, side)
+    ]
+    hull = cv2.convexHull(np.array(corners, dtype=np.float32).reshape(-1, 1, 2))
+    return float(cv2.contourArea(hull))
+
+
+# How far a real cube's blob may sit from expected_cube_area_px2 and still be a
+# pick target. Measured over 229 logged detections spanning the whole table
+# (two shuffle runs, 2026-08-10): measured/predicted ran 0.78-1.04, median 0.92,
+# with no drift across the 3x positional range -- so the band has to reach down
+# to ~0.78 and does not have to be wide. 0.60 leaves a real cube at the far
+# corners (predicted ~2100px^2, floor ~1260) clear of detect.py's own floor;
+# 1.45 still refuses a blob half again cube-sized -- the arm's body, a smear, or
+# two cubes merged into one contour. Mid-table that ceiling works out ~3600px^2,
+# where the old fixed 5000 passed a smear as a cube.
+PICK_AREA_LO = 0.60
+PICK_AREA_HI = 1.45
+
+# Yaw is unknown when predicting, and turning a cube swings its silhouette by
+# about +-10% (measured 5030-5788px^2 over six yaws at (250,100)). A prediction
+# used to decide whether a *future* cube will be detectable has to allow for the
+# worst yaw, so it carries this factor; a prediction judged against a blob that
+# has already been measured does not.
+CUBE_YAW_AREA_SPREAD = 1.15
+
+# A cube is not read where it stands. Its blob centroid sits at an unknown point
+# on the top face and the cube-top map corrects for a nominal one, so the
+# reported position drifts a few mm with yaw. Measured over 90 placements -- one
+# cube teleported onto each of the 15 slots at six yaws, live detector,
+# 2026-08-10 -- median 6.8mm, 95th 13.1mm, worst 17.8mm.
+#
+# On top of that the placement itself misses: measured 0.7-7.9mm over the ten
+# to_slot placements in those runs, from the cube poses on the stage.
+#
+# So a spot chosen for a *future* cube has to stay inside camera coverage over a
+# disc this wide, not just at its centre. (270,0) passes coverage at its centre,
+# and a cube placed there was read at (272,-7), which does not -- in frame by the
+# slot's reckoning, out of frame by the cube's.
+#
+# 20mm is the 95th-percentile read offset (13.1) plus the worst placement miss
+# (7.9). Stacking the two worst cases instead would give 26mm, and that is not a
+# free choice: at 20mm this rule costs 2 of the 15 slots, at 25mm it costs 5 --
+# back to the 10 that were usable before any of this was fixed. The two errors
+# have unrelated causes and need not align, so the 95th is the honest input.
+CUBE_READ_TOLERANCE_MM = 20.0
+
+
+def cube_area_block_reason(
+    area: float, x: float, y: float, calib: Calibration
+) -> str | None:
+    """Why a blob of ``area`` at (x, y) is the wrong size to be a cube, or None.
+
+    One predicate for the pick path and the place path both, so a cube can
+    never be unpickable somewhere a place was offered.
+    """
+    expected = expected_cube_area_px2(x, y, calib)
+    if expected <= 0.0:
+        return None
+    ratio = area / expected
+    if ratio < PICK_AREA_LO:
+        return (
+            f"blob is {area:.0f}px2, under the {expected * PICK_AREA_LO:.0f}px2 "
+            f"pick floor at ({x:.0f},{y:.0f}) where a cube images "
+            f"{expected:.0f}px2 -- glare or an arm-paint fleck, not a cube"
+        )
+    if ratio > PICK_AREA_HI:
+        return (
+            f"blob is {area:.0f}px2, over the {expected * PICK_AREA_HI:.0f}px2 "
+            f"pick ceiling at ({x:.0f},{y:.0f}) where a cube images "
+            f"{expected:.0f}px2 -- the arm's own body, a smear, or two cubes "
+            f"run together, not a cube"
+        )
+    return None
+
+
 def joint_reachable(x: float, y: float, z: float) -> bool:
     """True when (x, y, z) passes envelope, closed-form IK, and soft limits.
 
@@ -303,6 +412,7 @@ def work_region_block_reason(
     z: float | None = None,
     lift_mm: float = PICK_LIFT_MM,
     require_camera: bool = True,
+    read_tolerance_mm: float = 0.0,
 ) -> str | None:
     """The first work-region gate (x, y) fails, in prose, or None.
 
@@ -310,6 +420,13 @@ def work_region_block_reason(
     whether the answer is None, so the two cannot drift into disagreeing
     definitions of the region -- the failure the marker-hull gate had when it
     lived in two files with two different allowances.
+
+    ``read_tolerance_mm`` widens the coverage test into a disc, for a caller
+    choosing a spot for a cube that is not there yet -- the cube will be read a
+    few mm off wherever it lands, and all of that has to stay in frame. It
+    defaults to 0 because the pick path asks about a cube it has *already*
+    detected, and holding that cube to where it might have been read instead
+    would refuse perfectly visible ones near the edge.
 
     ``require_camera=False`` drops the camera-coverage test and keeps every
     other one. The distinction is what the gate is *for*: reach, the keep-out,
@@ -350,6 +467,42 @@ def work_region_block_reason(
             "outside the camera frame -- an object placed here could not be "
             "seen again, so nothing could pick it up"
         )
+    if require_camera and read_tolerance_mm > 0.0:
+        # Coverage has to hold wherever the cube will be *read*, not only at the
+        # spot it is set down on. See CUBE_READ_TOLERANCE_MM.
+        for i in range(8):
+            a = 2.0 * math.pi * i / 8.0
+            if not camera_covers(
+                x + read_tolerance_mm * math.cos(a),
+                y + read_tolerance_mm * math.sin(a),
+                calib,
+            ):
+                return (
+                    f"within {read_tolerance_mm:.0f}mm of the edge of the camera "
+                    f"frame -- a cube set down here lands and reads far enough "
+                    f"off to fall outside it, so nothing could pick it up"
+                )
+    if require_camera:
+        # In frame is not the same as detected. detect_cubes discards a contour
+        # outside its absolute size limits before any pick logic sees it, and a
+        # cube's silhouette varies 3x across this table, so a slot can be fully
+        # in frame and still sit where the cube images off the end of that
+        # range. That is what stranded three of nine cubes per shuffle run on
+        # 2026-08-10 (measured: cubes on the five near-camera slots sat idle
+        # 18 carries on average against 4 elsewhere, p=0.002).
+        expected = expected_cube_area_px2(x, y, calib)
+        if expected * CUBE_YAW_AREA_SPREAD > MAX_BLOB_AREA:
+            return (
+                f"a cube here images ~{expected:.0f}px2, over the "
+                f"{MAX_BLOB_AREA:.0f}px2 the detector will keep -- it would be "
+                f"discarded as a smear and never picked up again"
+            )
+        if expected / CUBE_YAW_AREA_SPREAD < MIN_BLOB_AREA:
+            return (
+                f"a cube here images ~{expected:.0f}px2, under the "
+                f"{MIN_BLOB_AREA:.0f}px2 the detector will keep -- it would be "
+                f"discarded as glare and never picked up again"
+            )
     return None
 
 
@@ -361,10 +514,17 @@ def in_work_region(
     z: float | None = None,
     lift_mm: float = PICK_LIFT_MM,
     require_camera: bool = True,
+    read_tolerance_mm: float = 0.0,
 ) -> bool:
     """True when a pick or place may happen at (x, y). See the block above."""
     return work_region_block_reason(
-        x, y, calib, z=z, lift_mm=lift_mm, require_camera=require_camera
+        x,
+        y,
+        calib,
+        z=z,
+        lift_mm=lift_mm,
+        require_camera=require_camera,
+        read_tolerance_mm=read_tolerance_mm,
     ) is None
 
 
@@ -434,7 +594,12 @@ def free_placement_slots(
         # PLACEMENT_SLOTS sat in the detector's discard zone and were still
         # being offered as placeable=True, so a cube placed on one dropped
         # out of every later scan and had to be retrieved by hand.
-        if not in_work_region(sx, sy, calib):
+        # read_tolerance_mm: this is the autonomous-choice path, picking a spot
+        # for a cube that is not there yet, so coverage has to hold over the disc
+        # the cube will actually be read in.
+        if not in_work_region(
+            sx, sy, calib, read_tolerance_mm=CUBE_READ_TOLERANCE_MM
+        ):
             continue
         if any(dist_mm(sx, sy, m.x, m.y) < MARKER_PAPER_CLEARANCE_MM for m in markers):
             continue

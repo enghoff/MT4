@@ -14,7 +14,7 @@ from mt4_vision.detect import CubeDetection
 from mt4_vision.policy import plan_shuffle
 from mt4_vision.scene import Scene, verify_pick_place
 from mt4_vision.workspace import MarkerSlot, rebuild_workspace_state
-from rig import CALIB
+from rig import CALIB, cube_area_at
 
 
 MARKERS = [
@@ -26,7 +26,15 @@ MARKERS = [
 ]
 
 
-def cube(color: str, x: float, y: float, area: float = 450.0) -> CubeDetection:
+def cube(
+    color: str, x: float, y: float, area: float | None = None
+) -> CubeDetection:
+    """A detection of a real cube at (x, y), sized the way one there images.
+
+    Pass ``area`` only when the test is about size; see rig.cube_area_at.
+    """
+    if area is None:
+        area = cube_area_at(x, y)
     return CubeDetection(color=color, px=0.0, py=0.0, area=area, x=x, y=y)
 
 
@@ -156,7 +164,7 @@ def test_camera_park_adjacent_cube_is_pickable():
     two PLACEMENT_SLOTS entries."""
     from mt4_vision.scene import is_phantom_detection
 
-    near_park = cube("green", 193.0, -51.0, area=412.0)
+    near_park = cube("green", 193.0, -51.0)
     assert not is_phantom_detection(near_park, CALIB)
 
 
@@ -189,8 +197,8 @@ def test_off_desk_blob_filtered_as_phantom():
     # oblique mount, which is what this gate is for. (272,-188) is not such a
     # case: it sits outside the marker hull, but it is a perfectly good desk
     # location and a pick target.
-    phantom = cube("red", -100.0, 250.0, area=733.0)
-    real = cube("green", 177.2, 181.5, area=400.0)
+    phantom = cube("red", -100.0, 250.0)
+    real = cube("green", 177.2, 181.5)
     assert is_phantom_detection(phantom, CALIB)
     assert not is_phantom_detection(real, CALIB)
     kept = filter_phantoms([phantom, real], CALIB)
@@ -208,7 +216,33 @@ def test_far_desk_blob_is_a_pick_target_now():
     from mt4_vision.scene import is_phantom_detection
 
     for x, y in ((176.1, -213.6), (266.5, -52.7), (132.8, 272.0)):
-        assert not is_phantom_detection(cube("blue", x, y, area=2000.0), CALIB), (x, y)
+        assert not is_phantom_detection(cube("blue", x, y), CALIB), (x, y)
+
+
+def test_a_place_target_must_survive_being_read_a_little_off():
+    """Coverage at the slot centre is not coverage of the cube.
+
+    (270,0) passes camera_covers exactly; a cube placed there was read at
+    (272,-7) by the live detector, which does not, so it was in frame by the
+    slot's reckoning and out of frame by the cube's -- and nothing picked it up
+    again. A place target therefore has to hold coverage over the disc the cube
+    will really be read in, while a cube already detected is judged where it
+    actually reads (else visible cubes near the edge get refused).
+    """
+    from mt4_vision.workspace import (
+        CUBE_READ_TOLERANCE_MM,
+        free_placement_slots,
+        in_work_region,
+    )
+
+    assert in_work_region(270.0, 0.0, CALIB), "the centre itself is covered"
+    assert not in_work_region(
+        270.0, 0.0, CALIB, read_tolerance_mm=CUBE_READ_TOLERANCE_MM
+    ), "but not the disc a cube placed there would be read in"
+
+    offered = free_placement_slots(CALIB, [], [])
+    assert (270.0, 0.0) not in offered
+    assert (150.0, 100.0) in offered, "a mid-table slot is unaffected"
 
 
 def test_keepout_blob_filtered():
@@ -218,7 +252,7 @@ def test_keepout_blob_filtered():
     # (-19, 161) is not a case for this test: at r=162mm it is comfortably
     # outside the keep-out and a legitimate pick target, so the point below is
     # one actually inside the cylinder.
-    assert is_phantom_detection(cube("blue", 60.0, 60.0, area=400.0), CALIB)
+    assert is_phantom_detection(cube("blue", 60.0, 60.0), CALIB)
 
 
 def test_verify_pick_place_outcomes():

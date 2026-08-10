@@ -37,6 +37,7 @@ from mt4_vision.workspace import (
     PICK_CLEARANCE_MM,
     MarkerSlot,
     WorkspaceState,
+    cube_area_block_reason,
     cubes_with_robot_coords,
     dist_mm,
     in_work_region,
@@ -46,13 +47,15 @@ from mt4_vision.workspace import (
     work_region_block_reason,
 )
 
-# Real cube blobs at the measured scene-camera distance land ~2000-4000px^2
-# (on-pad red measured 2790 then 3627 on 2026-07-20 as pose/lighting
-# varied). Tighter than detect.py's floor so low-area glare/arm flecks
-# are not pick targets while still counting toward marker occupancy via
-# the raw detection list.
-PICK_MIN_AREA = 400.0
-PICK_MAX_AREA = 5000.0
+# A blob's size is judged against the silhouette a cube at that position should
+# present -- workspace.cube_area_block_reason. It used to be judged against two
+# fixed numbers, 400 and 5000px^2, fitted to cubes sitting on the markers. That
+# works only while every cube images the same size, and on this mount a cube
+# runs ~1900px^2 at the far corners against ~5800px^2 at the near slots. The
+# fixed ceiling therefore discarded real cubes near the camera as smears: three
+# of nine cubes per shuffle run ended up parked where nothing would pick them up
+# again, and because a discarded blob still counts toward slot clearance, each
+# one also blocked the spot it sat on.
 # A cube gripped at the capture pose hovers ~210mm over the table and
 # registers as a normal-looking detection near a predictable pixel; from
 # the raw list it leaks into marker occupancy / free-slot clearance and
@@ -269,7 +272,8 @@ def is_phantom_detection(cube: CubeDetection, calib: Calibration) -> bool:
 
     Two independent reasons, and the split matters. A blob can be the wrong
     SIZE to be a cube (glare fleck, the arm's body, a smear) -- that is a
-    statement about the blob. Or it can be somewhere the arm may not work --
+    statement about the blob, measured against the silhouette a cube at that
+    position should present. Or it can be somewhere the arm may not work --
     that is ``workspace.in_work_region``, and it is the same predicate a place
     target is held to, so a cube can never be pickable somewhere a place is
     refused or the other way round. The convex hull of the marker centres is
@@ -278,9 +282,10 @@ def is_phantom_detection(cube: CubeDetection, calib: Calibration) -> bool:
     """
     if cube.x is None or cube.y is None:
         return True
-    if cube.area < PICK_MIN_AREA or cube.area > PICK_MAX_AREA:
+    x, y = float(cube.x), float(cube.y)
+    if cube_area_block_reason(float(cube.area), x, y, calib) is not None:
         return True
-    return not in_work_region(float(cube.x), float(cube.y), calib)
+    return not in_work_region(x, y, calib)
 
 
 def filter_phantoms(

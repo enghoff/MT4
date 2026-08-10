@@ -40,16 +40,13 @@ from mt4_vision.motion import (
     YAW_PERIOD_SQUARE,
     Grasp,
 )
-from mt4_vision.scene import (
-    PICK_MAX_AREA,
-    PICK_MIN_AREA,
-    Scene,
-)
+from mt4_vision.scene import Scene
 from mt4_vision.workspace import (
     KEEPOUT_RADIUS_MM,
     MAX_REACH_MM,
     PICK_CLEARANCE_MM,
     MarkerSlot,
+    cube_area_block_reason,
     dist_mm,
     is_mp_reachable_xy,
     work_region_block_reason,
@@ -232,16 +229,9 @@ def pick_block_reason(cube: CubeDetection, scene: Scene) -> str | None:
     x, y = float(cube.x), float(cube.y)
     r = math.hypot(x, y)
 
-    if cube.area < PICK_MIN_AREA:
-        return (
-            f"blob is {cube.area:.0f}px2, under the {PICK_MIN_AREA:.0f}px2 pick "
-            f"floor -- glare or an arm-paint fleck, not a cube"
-        )
-    if cube.area > PICK_MAX_AREA:
-        return (
-            f"blob is {cube.area:.0f}px2, over the {PICK_MAX_AREA:.0f}px2 pick "
-            f"ceiling -- the arm's own body or a smear, not a cube"
-        )
+    wrong_size = cube_area_block_reason(float(cube.area), x, y, scene.calib)
+    if wrong_size is not None:
+        return wrong_size
     blocked = _reach_block_reason(x, y, scene.calib)
     if blocked is not None:
         return blocked

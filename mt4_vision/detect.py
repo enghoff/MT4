@@ -40,7 +40,15 @@ MIN_BLOB_AREA = 800.0
 # by keep-out / reach / work region (scene.is_phantom_detection). detect_cubes
 # sorts largest-first, so this cap still matters when an uncapped wall/arm
 # smear would otherwise outrank every cube.
-MAX_BLOB_AREA = 6000.0
+# Raised from 6000 on 2026-08-10. Real cubes on the near-camera slots measure
+# up to 5788px^2 (live detector, six yaws each on all 15 placement slots), only
+# 4% under the old cap -- a margin thin enough that a slightly bigger cube or a
+# shadowed edge would be dropped as a smear. This is a sanity cap on contour
+# size and nothing more; the question of whether a blob is cube-*sized* now has
+# a real answer, workspace.cube_area_block_reason, which compares it against the
+# silhouette a cube at that position should present. 9000 still rejects
+# arm-scale blobs by a wide margin.
+MAX_BLOB_AREA = 9000.0
 # Reject blobs whose bounding-box aspect is far from square (cubes are square
 # from above; this drops elongated glare streaks and desk-edge artifacts).
 MAX_ASPECT = 2.0

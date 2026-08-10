@@ -32,12 +32,15 @@ from mt4_vision.entities import (
 )
 from mt4_jog.joints import GRIPPER_S_CLOSED, GRIPPER_S_OPEN
 from mt4_vision.motion import YAW_PERIOD_LONG_AXIS, YAW_PERIOD_SQUARE
-from mt4_vision.scene import PICK_MAX_AREA, PICK_MIN_AREA, Scene, filter_phantoms
-from rig import CALIB
+from mt4_vision.scene import Scene, filter_phantoms
+from rig import CALIB, cube_area_at
 from mt4_vision.workspace import (
     MAX_REACH_MM,
     MarkerSlot,
+    PICK_AREA_HI,
+    PICK_AREA_LO,
     PICK_CLEARANCE_MM,
+    expected_cube_area_px2,
     rebuild_workspace_state,
 )
 
@@ -47,10 +50,15 @@ MARKERS = [
     MarkerSlot(2, 188.4, -161.3),
     MarkerSlot(3, 177.2, 181.5),
 ]
-GOOD_AREA = 2500.0
+def cube(
+    color: str, x: float, y: float, area: float | None = None
+) -> CubeDetection:
+    """A detection of a real cube at (x, y), sized the way one there images.
 
-
-def cube(color: str, x: float, y: float, area: float = GOOD_AREA) -> CubeDetection:
+    Pass ``area`` only when the test is about size; see rig.cube_area_at.
+    """
+    if area is None:
+        area = cube_area_at(x, y)
     return CubeDetection(
         color=color, px=100.0, py=200.0, area=area, x=x, y=y, yaw_deg=12.0
     )
@@ -174,11 +182,28 @@ def test_far_desk_cube_is_pickable_now() -> None:
 
 
 def test_reason_area_floor_and_ceiling() -> None:
-    s = scene([cube("green", 200.0, -60.0, area=PICK_MIN_AREA - 1)])
+    expected = expected_cube_area_px2(200.0, -60.0, CALIB)
+    s = scene([cube("green", 200.0, -60.0, area=expected * PICK_AREA_LO - 1.0)])
     r = pick_block_reason(s.raw_cubes[0], s)
     assert r and "pick floor" in r
-    s = scene([cube("green", 200.0, -60.0, area=PICK_MAX_AREA + 1)])
+    s = scene([cube("green", 200.0, -60.0, area=expected * PICK_AREA_HI + 1.0)])
     r = pick_block_reason(s.raw_cubes[0], s)
+    assert r and "pick ceiling" in r
+
+
+def test_the_area_gate_moves_with_the_camera_not_the_table() -> None:
+    """The same blob size is a cube in one place and not in another.
+
+    This is the whole point of the position-aware gate, and the case that used
+    to fail: 5200px^2 is a perfectly ordinary cube on the near-camera slots and
+    cannot be one out at the far markers. A fixed ceiling had to be wrong at one
+    end or the other, and being wrong near the camera stranded cubes there.
+    """
+    near = scene([cube("red", 250.0, 100.0, area=5200.0)])
+    assert pick_block_reason(near.raw_cubes[0], near) is None
+
+    far = scene([cube("red", 100.0, 280.0, area=5200.0)])
+    r = pick_block_reason(far.raw_cubes[0], far)
     assert r and "pick ceiling" in r
 
 

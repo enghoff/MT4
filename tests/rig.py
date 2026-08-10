@@ -22,7 +22,7 @@ slightly-shifted set work just as well, since markers do not gate anything.
 from __future__ import annotations
 
 from mt4_vision.calib import Calibration
-from mt4_vision.workspace import MarkerSlot
+from mt4_vision.workspace import MarkerSlot, expected_cube_area_px2
 
 # Measured desk edge x = -72.2mm plus the 25mm safety margin, closed off with
 # three nominal sides far outside a 350mm reach. See calibrate_table_edge.py.
@@ -68,6 +68,24 @@ def calibration(**overrides) -> Calibration:
 
 
 CALIB = calibration()
+
+# Detector blob area as a fraction of the geometric silhouette
+# expected_cube_area_px2 predicts: median 0.92 over 229 logged detections
+# spanning the whole table (two shuffle runs, 2026-08-10; the ratio ran
+# 0.78-1.04 with no drift across the 3x positional range).
+CUBE_AREA_FILL = 0.92
+
+
+def cube_area_at(x: float, y: float, calib: Calibration = CALIB) -> float:
+    """The blob area a real cube resting at (x, y) is detected with.
+
+    Test fixtures used to carry one hard-coded area for every position, which
+    is the claim that a cube looks the same size everywhere -- and that claim is
+    what the position-aware size gate exists to retire. A cube in a fixture
+    should be the size a cube at that spot really is, so a test about the
+    keep-out or the desk edge is not quietly also a test about area.
+    """
+    return expected_cube_area_px2(float(x), float(y), calib) * CUBE_AREA_FILL
 
 # Live marker layout (vision_calibration.json, 2026-07-21 refit).
 MARKERS = [
