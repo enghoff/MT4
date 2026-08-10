@@ -8,6 +8,7 @@ the planner works without touching the pick/place logic itself.
 from __future__ import annotations
 
 import math
+import os
 import sys
 import threading
 import time
@@ -391,6 +392,18 @@ class LiveFeed:
         self._recorder = (
             VideoRecorder(video_path=video_path, fps=fps) if video_path else None
         )
+        # Which instant each written frame belongs to -- see _note_frame.
+        # Opened only when a recording and MT4_FRAME_LOG are both present, so
+        # the default path allocates nothing and records identical pixels.
+        frame_log = os.environ.get("MT4_FRAME_LOG")
+        self._frames_written = 0
+        self._frame_log = (
+            open(frame_log, "w", encoding="utf-8", buffering=1)
+            if frame_log and video_path
+            else None
+        )
+        if self._frame_log is not None:
+            self._frame_log.write("frame,monotonic\n")
         self._live_preview = LivePreview() if show_preview else None
         self._status_lines: list[str] = []
         self._target: tuple[str, float, float] | None = None
@@ -464,6 +477,7 @@ class LiveFeed:
             )
             if self._recorder is not None:
                 self._recorder.write(annotated)
+                self._note_frame()
             if self._live_preview is not None:
                 try:
                     self._live_preview.show(annotated)
@@ -475,11 +489,36 @@ class LiveFeed:
             if remaining > 0:
                 time.sleep(remaining)
 
+    def _note_frame(self) -> None:
+        """Stamp each written frame with the instant it was written.
+
+        The file declares ``fps`` and the loop aims for it, but a tick that
+        overruns -- capture, detect and annotate all happen inside one -- is not
+        made up for: the sleep at the bottom takes the *remainder* of the period
+        and nothing repeats the canvas to fill a gap. So a slow stretch writes
+        fewer frames while still playing back at ``fps``, and video time runs
+        ahead of run time by however much the loop lagged, which varies through
+        a run. A 563 s run came out as a 263 s file, and recovering the mapping
+        afterwards meant tracking a cube's pixel height frame by frame.
+
+        Off by default and out of band -- an env var and a plain CSV, nothing
+        touching the canvas -- so a recording made with it is pixel-identical
+        and the detector sees exactly what it saw before. Join it to a log that
+        carries its own ``time.monotonic`` column.
+        """
+        if self._frame_log is None:
+            return
+        self._frame_log.write(f"{self._frames_written},{time.monotonic():.6f}\n")
+        self._frames_written += 1
+
     def close(self) -> None:
         self._stop.set()
         self._thread.join(timeout=2.0)
         if self._recorder is not None:
             self._recorder.close()
+        if self._frame_log is not None:
+            self._frame_log.close()
+            self._frame_log = None
         if self._live_preview is not None:
             self._live_preview.close()
 
