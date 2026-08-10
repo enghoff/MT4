@@ -105,19 +105,17 @@ CLEAR_MIN_RADIUS_MM = LANDING_MIN_RADIUS_MM
 # Settle after retreat before a fresh scene capture.
 CAMERA_SETTLE_S = 0.8
 SITE_CLEAR_ATTEMPTS = 6
-# Camera line-of-sight shadow behind the stack: raised stack tops map
-# (via the 1-cube cube-top homography) to phantom table cubes further from
-# the camera than the site. Ignore pick candidates in that corridor.
-# Measured 2026-07-21 on marker 3, level 4: true (179,180) -> phantom
-# ~(115,227) (~79mm along, ~8mm lateral). The phantom spreads laterally as
-# well as along as the stack grows -- field case 2026-07-24, marker 2 level
-# 6: a phantom at ~49mm lateral, past a fixed 45mm cutoff, slips through as a
-# real pick candidate. Both axes scale with stack height.
-STACK_SHADOW_LATERAL_MIN_MM = 45.0
-STACK_SHADOW_LATERAL_PER_LEVEL_MM = 10.0
-STACK_SHADOW_ALONG_MIN_MM = 25.0
-STACK_SHADOW_ALONG_PER_LEVEL_MM = 35.0
-STACK_SHADOW_ALONG_FLOOR_MM = 90.0
+# How far a detection may sit from `stack_phantom_track` and still be read as
+# the stack's own top cube rather than a cube on the table.
+#
+# The track is predicted geometrically, so this covers detection noise and the
+# unknown height *within* the top cube's face that its blob centroid lands at --
+# not a shape allowance. Every phantom on record falls within 8.2mm of it: the
+# two field cases below at 6.3 and 7.4mm, five simulated ones at 0.8-8.2mm. The
+# nearest thing that must NOT be caught is 145.6mm away (the marker-2 phantom
+# position judged against a single standing cube, where the stack top has not
+# yet moved out there). 30mm sits between with room on both sides.
+STACK_PHANTOM_RADIUS_MM = 30.0
 
 
 # A full circle, not a fan off the marker->cube bearing. Field case
@@ -237,21 +235,18 @@ def clear_aside_xy(
     calib: Calibration,
     *,
     markers: list[MarkerSlot] | None = None,
-    behind_u: tuple[float, float] | None = None,
-    shadow_levels: int = 8,
+    phantom_track: list[tuple[float, float]] | None = None,
 ) -> tuple[float, float] | None:
     """Push a cube away from the marker along marker→cube, with margin.
 
     Lands at ~CLEAR_PARK_MM from the site (not on a barely-outside free
     slot that vision will still read as "near site"). Tries a few angles
     and radii if the primary landing is blocked or unreachable. Prefers
-    landings that stay pickable (work region + not in stack camera shadow).
+    landings that stay pickable (work region + off the stack phantom's track).
     """
 
     def _shadowed(x: float, y: float) -> bool:
-        return behind_u is not None and in_stack_camera_shadow(
-            x, y, sx, sy, behind_u, stack_levels=shadow_levels,
-        )
+        return phantom_track is not None and is_stack_phantom(x, y, phantom_track)
 
     return push_aside_xy(
         sx, sy, cx, cy, occupied, calib,
@@ -269,8 +264,7 @@ def choose_park_slot(
     *,
     avoid: list[tuple[float, float]] | None = None,
     markers: list[MarkerSlot] | None = None,
-    behind_u: tuple[float, float] | None = None,
-    shadow_levels: int = 8,
+    phantom_track: list[tuple[float, float]] | None = None,
 ) -> tuple[float, float] | None:
     """Nearest free open-table slot well clear of the stack site.
 
@@ -280,9 +274,7 @@ def choose_park_slot(
     """
 
     def _shadowed(x: float, y: float) -> bool:
-        return behind_u is not None and in_stack_camera_shadow(
-            x, y, sx, sy, behind_u, stack_levels=shadow_levels,
-        )
+        return phantom_track is not None and is_stack_phantom(x, y, phantom_track)
 
     return nearest_landing(
         sx, sy, calib,
@@ -297,60 +289,69 @@ def choose_park_slot(
     )
 
 
-def stack_shadow_behind_unit(
-    calib, sx: float, sy: float
-) -> tuple[float, float] | None:
-    """Unit XY vector from the stack site away from the camera.
+def stack_phantom_track(
+    calib, sx: float, sy: float, stack_levels: int
+) -> list[tuple[float, float]] | None:
+    """Where a stack at (sx, sy) reads as table cubes, level by level.
 
-    Derived from table vs cube-top maps at the site: mapping the site's
-    table pixel through the cube-top homography shifts toward the camera;
-    the opposite direction is "behind the stack" along the camera LOS.
+    ``detect_cubes`` maps every blob through the cube-top map, which subtracts
+    the parallax of exactly *one* cube of height. A cube standing on top of a
+    column is higher than that, so the rest of the lift stays in and the cube is
+    reported as a table cube further from the camera than the site -- a phantom.
+    Taken as a pick target it sends the arm to bare desk.
+
+    Both halves of the prediction are already measured and sitting in the
+    calibration. ``robot_to_pixel`` projects a point at a known height through
+    the nadir and lens height ``calibrate_camera_nadir.py`` fit, and
+    ``pixel_to_robot(..., on_cube_top=True)`` reads a pixel back exactly the way
+    a cube is read. Composing them at each level's face height gives the track
+    the phantom walks up the desk as the column grows, in millimetres, with
+    nothing to tune.
+
+    It has to be computed rather than approximated, because the displacement
+    goes as ``h / (cam_height - h)`` and a nine-cube column is 180mm against a
+    lens 242mm up. Straight-line-per-level fits it near the bottom and then
+    falls behind without limit: on the simulated rig, four cubes standing put
+    the phantom 131mm out where 35mm-per-level allows 140, and five put it
+    196mm out where the same rule allows 175.
+
+    Returns the polyline from the table to the top of level ``stack_levels``, or
+    None when the calibration has no camera geometry to predict it with.
     """
-    if not calib.cube_top_homography:
+    if not calib.cam_xy_robot or not calib.cam_height_mm:
         return None
-    ht_inv = np.linalg.inv(np.array(calib.homography, dtype=np.float64))
-    v = ht_inv @ np.array([sx, sy, 1.0])
-    px, py = float(v[0] / v[2]), float(v[1] / v[2])
-    cx, cy = calib.pixel_to_robot(px, py, on_cube_top=True)
-    # cube-top reading of the table-site pixel sits toward the camera.
-    toward_cam_x, toward_cam_y = cx - sx, cy - sy
-    length = math.hypot(toward_cam_x, toward_cam_y)
-    if length < 1.0:
-        return None
-    return (-toward_cam_x / length, -toward_cam_y / length)
+    track: list[tuple[float, float]] = []
+    for level in range(stack_levels + 1):
+        height = level * float(calib.cube_height_mm)
+        # A column that reaches the lens images at infinity, and
+        # `robot_to_pixel` answers such a height by dropping the correction
+        # entirely -- which would put a phantom back at the site. End the track.
+        if float(calib.cam_height_mm) - height <= 1.0:
+            break
+        px, py = calib.robot_to_pixel(sx, sy, calib.table_z + height)
+        track.append(calib.pixel_to_robot(px, py, on_cube_top=True))
+    return track if len(track) >= 2 else None
 
 
-def in_stack_camera_shadow(
-    x: float,
-    y: float,
-    sx: float,
-    sy: float,
-    behind_u: tuple[float, float],
-    *,
-    stack_levels: int,
-) -> bool:
-    """True when (x, y) lies behind the stack along the camera LOS.
+def is_stack_phantom(x: float, y: float, track: list[tuple[float, float]]) -> bool:
+    """True when (x, y) is the stack's own top cube rather than a table cube.
 
-    A real cube there would be occluded by the stack; detections in this
-    corridor are almost always raised stack tops mis-mapped as table cubes.
+    The whole track is tested, not only the segment for the current height: a
+    point the column's top passed through on its way up is one the next scan
+    will read again, and a landing chosen there would be lost as soon as the
+    stack grew past it.
     """
-    dx, dy = x - sx, y - sy
-    ux, uy = behind_u
-    along = dx * ux + dy * uy
-    lateral = abs(dx * uy - dy * ux)
-    along_max = max(
-        STACK_SHADOW_ALONG_FLOOR_MM,
-        stack_levels * STACK_SHADOW_ALONG_PER_LEVEL_MM,
-    )
-    lateral_max = max(
-        STACK_SHADOW_LATERAL_MIN_MM,
-        stack_levels * STACK_SHADOW_LATERAL_PER_LEVEL_MM,
-    )
-    return (
-        along >= STACK_SHADOW_ALONG_MIN_MM
-        and along <= along_max
-        and lateral <= lateral_max
-    )
+    point = np.array([x, y], dtype=np.float64)
+    for start, end in zip(track, track[1:]):
+        a = np.array(start, dtype=np.float64)
+        segment = np.array(end, dtype=np.float64) - a
+        length2 = float(segment @ segment)
+        if length2 < 1e-9:
+            continue
+        t = min(1.0, max(0.0, float((point - a) @ segment) / length2))
+        if float(np.linalg.norm(point - (a + t * segment))) <= STACK_PHANTOM_RADIUS_MM:
+            return True
+    return False
 
 
 # A pick "succeeded" but a same-color cube still sits within this radius of
@@ -392,17 +393,17 @@ def stack_candidates(
 ) -> list[CubeDetection]:
     """Reachable pickable cubes outside the site keep-clear radius.
 
-    When the stack already has cubes, two more things drop out. Detections in
-    the camera line-of-sight shadow behind the site are stack-top phantoms,
-    not cubes. Cubes in the column's forearm shadow are real, but the arm
+    When the stack already has cubes, two more things drop out. Detections on
+    the stack's own phantom track are its top cube read as a table cube, not
+    cubes. Cubes in the column's forearm shadow are real, but the arm
     cannot reach over the standing column to grab them
     (``StackPlanner.column_shadow``) -- taking one as the next pick makes the
     approach transit fail with no route, so they are held back until the run
     ends or the operator moves them.
     """
-    behind_u = None
+    phantom_track = None
     if stack_levels > 0 and calib is not None:
-        behind_u = stack_shadow_behind_unit(calib, sx, sy)
+        phantom_track = stack_phantom_track(calib, sx, sy, stack_levels)
     past_column = (
         planner.column_shadow(stack_levels)
         if planner is not None
@@ -412,12 +413,8 @@ def stack_candidates(
     for c in scene.pickable(scene.cubes):
         if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
             continue
-        if (
-            behind_u is not None
-            and in_stack_camera_shadow(
-                float(c.x), float(c.y), sx, sy, behind_u,
-                stack_levels=stack_levels,
-            )
+        if phantom_track is not None and is_stack_phantom(
+            float(c.x), float(c.y), phantom_track
         ):
             continue
         if past_column(float(c.x), float(c.y)):
@@ -744,8 +741,10 @@ def main() -> int:
         watcher.start()
 
         all_markers = marker_slots_from_calibration(calib)
-        behind_u = stack_shadow_behind_unit(calib, sx, sy)
-        shadow_levels = max(1, int(target_levels))
+        # A landing has to stay off the phantom's track for the whole build, not
+        # just the height it is chosen at: the column's top walks up that track
+        # as it grows and would swallow a cube parked anywhere along it.
+        clear_track = stack_phantom_track(calib, sx, sy, max(1, int(target_levels)))
 
         # --- Clear cubes near the stack marker ---------------------------------
         if built > 0:
@@ -786,14 +785,12 @@ def main() -> int:
                 ]
                 dest = clear_aside_xy(
                     sx, sy, float(target.x), float(target.y), occupied, calib,
-                    markers=all_markers, behind_u=behind_u,
-                    shadow_levels=shadow_levels,
+                    markers=all_markers, phantom_track=clear_track,
                 )
                 if dest is None:
                     dest = choose_park_slot(
                         scene, sx, sy, calib, avoid=occupied,
-                        markers=all_markers, behind_u=behind_u,
-                        shadow_levels=shadow_levels,
+                        markers=all_markers, phantom_track=clear_track,
                     )
                 if dest is None:
                     print(
@@ -896,20 +893,18 @@ def main() -> int:
                     print(f"level {level}: hover height unreachable -- stopping")
                     break
 
-                # Drop stack-top phantoms behind the site along the camera LOS
-                # (they appear once level 1+ is built).
+                # Drop stack-top phantoms: the column's own top cube, read as a
+                # table cube further from the camera (they appear once level 1+
+                # is built).
                 shadowed = []
-                behind_u = (
-                    stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
+                phantom_track = (
+                    stack_phantom_track(calib, sx, sy, built) if built > 0 else None
                 )
-                if behind_u is not None:
+                if phantom_track is not None:
                     for c in scene.pickable(scene.cubes):
                         if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
                             continue
-                        if in_stack_camera_shadow(
-                            float(c.x), float(c.y), sx, sy, behind_u,
-                            stack_levels=built,
-                        ):
+                        if is_stack_phantom(float(c.x), float(c.y), phantom_track):
                             shadowed.append(c)
                 if shadowed:
                     print(

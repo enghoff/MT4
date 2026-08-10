@@ -12,9 +12,9 @@ if str(ROOT) not in sys.path:
 # The frozen rig, never the live calibration -- including for the camera-shadow
 # field cases below, which are the ones that most look like they want real
 # numbers. Two things they need are exactly what a live file may not have:
-# ``cube_top_homography``, without which ``stack_shadow_behind_unit`` returns
-# None and there is no corridor to assert about at all, and a camera nadir
-# matching the pose the case was recorded at, since the corridor is drawn from
+# the camera nadir and lens height, without which ``stack_phantom_track``
+# returns None and there is nothing to assert about at all, and a camera pose
+# matching the one the case was recorded at, since the track is projected from
 # it. Read live, these tests report the state of somebody's desk. See ``rig``.
 from rig import CALIB
 from stack_cubes import (
@@ -23,10 +23,10 @@ from stack_cubes import (
     choose_park_slot,
     clear_aside_xy,
     cubes_near_site,
-    in_stack_camera_shadow,
+    is_stack_phantom,
     release_z_for_level,
     stack_candidates,
-    stack_shadow_behind_unit,
+    stack_phantom_track,
 )
 
 
@@ -75,21 +75,16 @@ def test_clear_aside_stays_in_pick_hull():
     assert in_work_region(dest[0], dest[1], CALIB)
 
 
-def test_clear_aside_skips_stack_shadow_corridor():
+def test_clear_aside_skips_stack_phantom_track():
     calib = CALIB
     sx, sy = 178.7, 179.8
-    behind = stack_shadow_behind_unit(calib, sx, sy)
-    assert behind is not None
-    # Cube already in the behind corridor; landing must not stay there.
-    cx = sx + behind[0] * 40.0
-    cy = sy + behind[1] * 40.0
-    dest = clear_aside_xy(
-        sx, sy, cx, cy, [], calib, behind_u=behind, shadow_levels=8,
-    )
+    track = stack_phantom_track(calib, sx, sy, 8)
+    assert track is not None
+    # Cube already standing on the track; the landing must not stay on it.
+    cx, cy = track[2]
+    dest = clear_aside_xy(sx, sy, cx, cy, [], calib, phantom_track=track)
     assert dest is not None
-    assert not in_stack_camera_shadow(
-        dest[0], dest[1], sx, sy, behind, stack_levels=8,
-    )
+    assert not is_stack_phantom(dest[0], dest[1], track)
 
 
 def test_clear_aside_stays_out_of_arm_occlusion_strip():
@@ -150,19 +145,15 @@ def test_stack_candidates_hold_back_cubes_behind_the_standing_column():
     )
 
 
-def test_stack_shadow_rejects_marker3_phantom():
+def test_stack_phantom_rejects_marker3_phantom():
     """Field case 2026-07-21: stack (179,180) → phantom ~(115,227)."""
     calib = CALIB
     sx, sy = 178.7, 179.8
-    behind = stack_shadow_behind_unit(calib, sx, sy)
-    assert behind is not None
-    assert in_stack_camera_shadow(
-        115.0, 227.0, sx, sy, behind, stack_levels=4,
-    )
-    # A cube off to the side of the corridor must still be pickable.
-    assert not in_stack_camera_shadow(
-        280.0, 0.0, sx, sy, behind, stack_levels=4,
-    )
+    track = stack_phantom_track(calib, sx, sy, 4)
+    assert track is not None
+    assert is_stack_phantom(115.0, 227.0, track)
+    # A cube off to the side of the track must still be pickable.
+    assert not is_stack_phantom(280.0, 0.0, track)
     phantom = SimpleNamespace(x=115.0, y=227.0, color="green", yaw_deg=0.0)
     real = SimpleNamespace(x=250.0, y=96.0, color="red", yaw_deg=0.0)
     scene = SimpleNamespace(
@@ -176,19 +167,42 @@ def test_stack_shadow_rejects_marker3_phantom():
     assert real in cands
 
 
-def test_stack_shadow_lateral_widens_with_level():
+def test_stack_phantom_follows_the_column_up():
     """Field case 2026-07-24, marker 2 level 6: true site (161.9,-149.6),
-    phantom read at (4.4,-203.7) -- 49mm lateral, past a fixed 45mm corridor
-    width (calibrated from an 8mm lateral offset at level 4). The
-    tolerance must widen with stack height on both axes, not just along."""
+    phantom read at (4.4,-203.7). Where the phantom sits is set by how tall
+    the column is, so the same point is the stack top at one height and bare
+    desk at another -- a rule keyed to the site alone cannot tell them apart."""
     calib = CALIB
     sx, sy = 161.9, -149.6
-    behind = stack_shadow_behind_unit(calib, sx, sy)
-    assert behind is not None
-    assert in_stack_camera_shadow(4.4, -203.7, sx, sy, behind, stack_levels=6)
-    # At low levels the corridor stays narrow -- a cube this far laterally off
-    # the LOS at level 1 is a real, pickable cube.
-    assert not in_stack_camera_shadow(4.4, -203.7, sx, sy, behind, stack_levels=1)
+    assert is_stack_phantom(4.4, -203.7, stack_phantom_track(calib, sx, sy, 6))
+    # One cube standing puts the top nowhere near there, so the same reading
+    # is a real, pickable cube.
+    assert not is_stack_phantom(4.4, -203.7, stack_phantom_track(calib, sx, sy, 1))
+
+
+def test_stack_phantom_track_needs_measured_camera_geometry():
+    """No nadir or lens height, no prediction -- and no silent wrong answer."""
+    import dataclasses
+
+    blind = dataclasses.replace(CALIB, cam_xy_robot=None, cam_height_mm=None)
+    assert stack_phantom_track(blind, 161.9, -149.6, 6) is None
+
+
+def test_stack_phantom_track_outruns_a_linear_corridor():
+    """The displacement goes as h/(cam_height - h), so it pulls away from any
+    straight-line-per-level rule as the column grows. Field failure: four cubes
+    standing put the phantom 131mm out where 35mm-per-level allowed 140, five
+    put it 196mm out where the same rule allowed 175 and it slipped through."""
+    calib = CALIB
+    sx, sy = 161.9, -149.6
+    track = stack_phantom_track(calib, sx, sy, 8)
+    steps = [
+        math.dist(track[i], track[i + 1]) for i in range(len(track) - 1)
+    ]
+    # Each level moves the phantom further than the one below it.
+    assert all(b > a for a, b in zip(steps, steps[1:])), steps
+    # And by the top of the column it is moving several times faster.
+    assert steps[-1] > 3.0 * steps[0]
 
 
 def test_pick_missed_detects_shoved_cube():
