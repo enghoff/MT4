@@ -686,7 +686,7 @@ Measured ([QWEN3-VL.md § Decode throughput](QWEN3-VL.md)):
   and ~5–9 s per observation, and check the total against the 1664 window.
 - **Qwen and Grounding DINO do not co-run** on the 8GB card. Comparing grounding
   paths means switching services with
-  [services/switch_vision_service.sh](../services/switch_vision_service.sh).
+  [services/switch_service.sh](../services/switch_service.sh).
 
 ---
 
